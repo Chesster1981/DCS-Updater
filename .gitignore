@@ -1,0 +1,12 @@
+/build
+/DCS Norway Remote Update Control Panel.spec
+/DCS Norway Remote Updater Control Panel.spec
+/DCS Norway Remote Updater Node.spec
+/dcs_control_panel.log
+/dcs_node_config.json
+/dcs_node_updater.log
+/DCS_RU_Control.spec
+/DCS_RU_Node.spec
+/dist
+/master_config.json
+/Web Scraper.py
