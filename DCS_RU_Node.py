@@ -25,8 +25,8 @@ CONFIG_FILE = "dcs_node_config.json"
 DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
 
 # --- GITHUB AUTO-UPDATE CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "1.1"  # Set to match your active tag v1.0 exactly
-GITHUB_REPO = "DITT_GITHUB_BRUKERNAVN/DITT_REPO_NAVN"  # Replace with your actual GitHub repo
+CURRENT_NODE_VERSION = "1.0"  # Set to match your active tag v1.0 exactly
+GITHUB_REPO = "https://github.com/Chesster1981/DCS-Updater.git"  # Replace with your actual GitHub repo
 
 server_socket = None
 listener_thread = None
