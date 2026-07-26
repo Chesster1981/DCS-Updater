@@ -25,7 +25,7 @@ CONFIG_FILE = "dcs_node_config.json"
 DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
 
 # --- GITHUB AUTO-UPDATE CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "1.0"  # Set to match your active tag v1.0 exactly
+CURRENT_NODE_VERSION = "1.1"  # Set to match your active tag v1.0 exactly
 GITHUB_REPO = "DITT_GITHUB_BRUKERNAVN/DITT_REPO_NAVN"  # Replace with your actual GitHub repo
 
 server_socket = None
@@ -407,7 +407,6 @@ def show_settings_frame():
         ent_dcs.delete(0, tk.END); ent_dcs.insert(0, str(cfg.get("dcs_main_folder", r"D:\DCS")))
         ent_port.delete(0, tk.END); ent_port.insert(0, str(cfg.get("network_port", "1015")))
         
-        # Setter dropdown-menyen basert på lagrede sekunder i JSON
         saved_seconds = int(cfg.get("github_check_interval", 43200))
         if saved_seconds == 60: opt_update_var.set("Every 1 Minute (Testing)")
         elif saved_seconds == 3600: opt_update_var.set("Every 1 Hour")
@@ -423,12 +422,11 @@ def show_settings_frame():
         show_main_frame()
 
 def save_settings_to_file():
-    # Konverterer tekstvalget fra Dropdown-menyen om til sekunder for lagring
     menu_string = opt_update_var.get()
     if "1 Minute" in menu_string: seconds = 60
     elif "1 Hour" in menu_string: seconds = 3600
     elif "12 Hours" in menu_string: seconds = 43200
-    else: seconds = -1 # Slått helt av
+    else: seconds = -1
     
     current_settings = {
         "dcs_main_folder": ent_dcs.get(), 
@@ -459,7 +457,8 @@ def setup_tray_icon():
     tray_icon = pystray.Icon("dcs_node", img_asset, "DCS Norway Remote Updater Node", menu)
     threading.Thread(target=tray_icon.run, daemon=True).start()
 
-root = tk.Tk(); root.title("DCS Norway Remote Updater Node"); root.geometry("540x450"); root.configure(bg="#1C1C1F")
+# FIX: Dynamic insertion of the CURRENT_NODE_VERSION into the root window title matrix
+root = tk.Tk(); root.title(f"DCS Norway Remote Updater Node (v{CURRENT_NODE_VERSION})"); root.geometry("540x450"); root.configure(bg="#1C1C1F")
 try:
     icon_path = get_resource_path("logo.ico")
     if os.path.exists(icon_path): root.iconbitmap(icon_path)
@@ -474,6 +473,7 @@ tk.Button(left_column, text="🚀 RUN LOCAL UPDATE NOW", font=("Arial", 10, "bol
 
 right_column = tk.Frame(top_bar, bg="#1C1C1F"); right_column.pack(side="right", fill="y", anchor="ne")
 tk.Button(right_column, text="⚙️ Settings", font=("Arial", 9, "bold"), bg="#2D2D30", fg="white", padx=12, pady=4, command=show_settings_frame, relief="flat").pack(anchor="e")
+
 
 
 
