@@ -20,15 +20,15 @@ import pystray
 import urllib.request
 import urllib.error
 
+from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version, wrap_command
+
 CONFIG_FILE = "dcs_node_config.json"
 DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-# Remember to change commas (,) back to dots (.) in your text editor if needed
-CURRENT_NODE_VERSION = "1.7"
+CURRENT_NODE_VERSION = "2.0"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
-URL_DCS_UPDATES = "https://updates.digitalcombatsimulator.com/"
-URL_GITHUB_API  = "https://api.github.com/repos/"
+URL_GITHUB_API = "https://api.github.com/repos/"
 
 server_socket = None
 listener_thread = None
@@ -68,7 +68,8 @@ def handle_single_instance_takeover():
         test_sock.settimeout(1.5)
         test_sock.connect(('127.0.0.1', port))
         logging.info("[SYSTEM] Previous instance detected on port. Sending shutdown signal...")
-        test_sock.sendall(b"EXIT_NODE\n")
+        payload = wrap_command("EXIT_NODE", config.get("auth_token", ""))
+        test_sock.sendall(payload.encode("utf-8"))
         test_sock.close()
         time.sleep(2.0)
     except (ConnectionRefusedError, socket.timeout):
@@ -87,8 +88,10 @@ def load_node_settings():
         "dcs_main_folder": r"D:\DCS",
         "preserve_mission_scripting": True,
         "network_port": "1015",
+        "bind_address": "0.0.0.0",
+        "auth_token": "",
         "reboot_after_deployment": True,
-        "github_check_interval": 43200  
+        "github_check_interval": 43200,
     }
     if os.path.exists(absolute_config_path):
         try:
@@ -111,7 +114,6 @@ handle_single_instance_takeover()
 last_cloud_check_timestamp = 0.0
 last_github_node_check_timestamp = 0.0
 is_swapping = False  # NEW: Global safety flag to permanently freeze loops during updates
-URL_DCS_UPDATES = "https://digitalcombatsimulator.com"
 logging.info("[SYSTEM] Version parsing and deployment framework initialized.")
 
 def _execute_silent_node_binary_swap(download_url):
@@ -180,7 +182,7 @@ def _execute_silent_node_binary_swap(download_url):
 def check_for_github_node_updates_silent():
     if is_swapping: return  # Safety check
     try:
-        if "DITT_GITHUB_BRUKERNAVN" in GITHUB_REPO:
+        if "YOUR_GITHUB_USERNAME" in GITHUB_REPO:
             append_activity_log(" [SYSTEM] GitHub check skipped: Please set ⚠️ your GITHUB_REPO in Block 1!")
             return
         
@@ -245,25 +247,11 @@ def github_update_monitor_loop():
             last_github_node_check_timestamp = time.time()
 
 def _run_dcs_html_scraper_background():
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }
-        clean_scraper_url = URL_DCS_UPDATES.replace(",", ".")
-        req = urllib.request.Request(clean_scraper_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as response:
-            html_innhold = response.read().decode("utf-8")
-            renset_html = " ".join(html_innhold.split())
-            match = re.search(r"Latest stable version is\s*([\d\.]+)", renset_html)
-            if match:
-                node_state["latest_cloud_version"] = match.group(1).strip()
-                return
-            reserve_match = re.search(r"(\d+\.\d+\.\d+\.\d+)", renset_html)
-            if reserve_match:
-                node_state["latest_cloud_version"] = reserve_match.group(1).strip()
-    except Exception as e:
-        logging.error(f"[SCRAPER] Failed to scrape DCS update webpage: {e}")
+    version = scrape_dcs_latest_version(timeout=10.0)
+    if version:
+        node_state["latest_cloud_version"] = version
+    else:
+        logging.error("[SCRAPER] Failed to scrape DCS version from all known sources.")
 
 def get_dcs_versions_local():
     global last_cloud_check_timestamp, last_github_node_check_timestamp
@@ -356,9 +344,6 @@ def execute_deployment_pipeline():
             return
             
         append_activity_log("[PROCESS] Launching DCS_updater.exe with elevated credentials pipeline...")
-        
-        # FIX: We use PowerShell Start-Process with -Verb RunAs to force Windows to accept 
-        # the administrative tokens inherited from the Task Scheduler context layer.
         updater_path = os.path.join(bin_folder, "DCS_updater.exe")
         ps_cmd = f"Start-Process -FilePath '{updater_path}' -ArgumentList '--quiet update' -WorkingDirectory '{bin_folder}' -Verb RunAs -Wait"
         
@@ -391,87 +376,132 @@ def execute_deployment_pipeline():
         append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
         node_state["active_task"] = "Idle"
 
-def network_socket_listener(port):
+def network_socket_listener(port, bind_address="0.0.0.0"):
     global server_socket, is_listening
+    config = load_node_settings()
+    auth_token = str(config.get("auth_token", "")).strip()
+    bind_host = (bind_address or config.get("bind_address") or "0.0.0.0").strip()
+
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        server_socket.bind(('0.0.0.0', port))
+        server_socket.bind((bind_host, port))
         server_socket.listen(5)
         is_listening = True
-        append_activity_log(f" Listener active on port 📡 {port}...")
+        auth_note = "auth ON" if auth_token else "auth OFF (set auth_token in settings)"
+        append_activity_log(f" Listener active on {bind_host}:{port} ({auth_note})...")
+        if bind_host == "0.0.0.0":
+            append_activity_log(" [SECURITY] Bound to all interfaces. Prefer a LAN IP or firewall lock-down.")
     except Exception as e:
-        append_activity_log(f" ERROR: Could not bind network listener to ❌ port {port}: {e}")
+        append_activity_log(f" ERROR: Could not bind network listener to ❌ {bind_host}:{port}: {e}")
         is_listening = False
         return
-        
+
     while is_listening:
         try:
             conn, addr = server_socket.accept()
-            if not is_listening: break
-            data = conn.recv(1024)
-            if not data: conn.close(); continue
-            message = data.decode('utf-8').strip()
-            
-            if "PING_STATUS" in message:
-                inst_v, cloud_v = get_dcs_versions_local()
-                response = {
-                    "status": "ACK", 
-                    "installed_version": inst_v, 
-                    "latest_cloud_version": cloud_v, 
-                    "active_task": node_state["active_task"],
-                    "node_version": CURRENT_NODE_VERSION
-                }
-                conn.send((json.dumps(response) + "\n").encode('utf-8'))
-                conn.close()
-            elif "TRIGGER_DCS_UPDATE" in message:
-                if node_state["active_task"] == "Idle":
-                    response = {"status": "OK_STARTING"}
-                    conn.send((json.dumps(response) + "\n").encode('utf-8'))
+            if not is_listening:
+                break
+
+            try:
+                # Reload token so settings changes apply without full restart of process
+                live_token = str(load_node_settings().get("auth_token", "")).strip()
+                data = conn.recv(1024)
+                if not data:
                     conn.close()
-                    append_activity_log(" Remote signal authorized! Starting 🚀 update...")
-                    threading.Thread(target=execute_deployment_pipeline, daemon=True).start()
+                    continue
+                raw_message = data.decode("utf-8").strip()
+                command, authorized = parse_authenticated_command(raw_message, live_token)
+
+                if not authorized or not command:
+                    append_activity_log(f" [SECURITY] Rejected unauthorized command from {addr[0]}")
+                    conn.send((json.dumps({"status": "UNAUTHORIZED"}) + "\n").encode("utf-8"))
+                    conn.close()
+                    continue
+
+                if command == "PING_STATUS":
+                    inst_v, cloud_v = get_dcs_versions_local()
+                    response = {
+                        "status": "ACK",
+                        "installed_version": inst_v,
+                        "latest_cloud_version": cloud_v,
+                        "active_task": node_state["active_task"],
+                        "node_version": CURRENT_NODE_VERSION,
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                elif command == "TRIGGER_DCS_UPDATE":
+                    if node_state["active_task"] == "Idle":
+                        response = {"status": "OK_STARTING"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log(" Remote signal authorized! Starting 🚀 update...")
+                        threading.Thread(target=execute_deployment_pipeline, daemon=True).start()
+                    else:
+                        response = {"status": "REJECTED_BUSY", "task": node_state["active_task"]}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                elif command == "EXIT_NODE":
+                    # Local takeover only: require loopback when auth is enabled
+                    if live_token and addr[0] not in ("127.0.0.1", "::1"):
+                        conn.send((json.dumps({"status": "UNAUTHORIZED"}) + "\n").encode("utf-8"))
+                        conn.close()
+                        continue
+                    append_activity_log(" Remote exit commanded by newer takeover 🛑 node instance.")
+                    conn.send(b"ACK_EXIT\n")
+                    conn.close()
+                    is_listening = False
+                    if server_socket:
+                        server_socket.close()
+                    if tray_icon:
+                        tray_icon.stop()
+                    root.after(0, root.destroy)
+                    sys.exit(0)
                 else:
-                    response = {"status": "REJECTED_BUSY", "task": node_state["active_task"]}
-                    conn.send((json.dumps(response) + "\n").encode('utf-8'))
+                    conn.send(b"UNKNOWN_COMMAND\n")
                     conn.close()
-            elif "EXIT_NODE" in message:
-                append_activity_log(" Remote exit commanded by newer takeover 🛑 node instance.")
-                conn.send(b"ACK_EXIT\n")
-                conn.close()
-                is_listening = False
-                if server_socket: server_socket.close()
-                if tray_icon: tray_icon.stop()
-                root.after(0, root.destroy)
-                sys.exit(0)
-            else:
-                conn.send(b"UNKNOWN_COMMAND\n")
-                conn.close()
-        except:
+            except Exception as inner_err:
+                logging.error(f"Active transaction broken mid-stream: {inner_err}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+        except Exception as outer_err:
+            logging.error(f"Critical socket acceptor loop crash: {outer_err}")
             break
+
 
 
 # =========================================================================
 # BLOCK 4 OF 6: USER INTERACTION MESSAGES, FILE BROWSER & SYSTEM TRAY ENGINE
 # =========================================================================
-def start_or_restart_listener(port_str=None):
+def start_or_restart_listener(port_str=None, bind_address=None):
     global server_socket, is_listening, listener_thread
+    config = load_node_settings()
     if port_str is None:
-        config = load_node_settings()
         port_str = config.get("network_port", "1015")
-    try: 
-        ny_port = int(port_str.strip())
-    except ValueError: 
+    if bind_address is None:
+        bind_address = config.get("bind_address", "0.0.0.0")
+    try:
+        new_port = int(str(port_str).strip())
+    except ValueError:
         return
-        
+
     if is_listening and server_socket:
         is_listening = False
-        try: server_socket.close()
-        except: pass
+        try:
+            server_socket.close()
+        except Exception:
+            pass
         append_activity_log(" Previous listener terminated. 🛑")
-        
+
     time.sleep(0.3)
-    listener_thread = threading.Thread(target=network_socket_listener, args=(ny_port,), daemon=True)
+    listener_thread = threading.Thread(
+        target=network_socket_listener,
+        args=(new_port, str(bind_address).strip() or "0.0.0.0"),
+        daemon=True,
+    )
     listener_thread.start()
 
 def browse_dcs_folder(entry_field):
@@ -489,6 +519,21 @@ def trigger_local_update():
     if messagebox.askyesno("Confirm", "Do you want to run the update process locally now?"):
         threading.Thread(target=execute_deployment_pipeline, daemon=True).start()
 
+def force_github_update_check():
+    """NEW: Forces an immediate GitHub update check from the settings panel."""
+    global last_github_node_check_timestamp
+    if is_swapping:
+        messagebox.showwarning("Busy", "A node update sequence is already active.")
+        return
+    
+    append_activity_log("\n[SYSTEM] Manual GitHub update check requested by operator...")
+    # Reset the loop timestamp so the background thread alignment stays correct
+    last_github_node_check_timestamp = time.time()
+    
+    # Run the check in a separate background thread to keep the UI perfectly fluid
+    threading.Thread(target=check_for_github_node_updates_silent, daemon=True).start()
+    messagebox.showinfo("Update Check", "GitHub update check initiated in the background.\nCheck the activity log for details.")
+
 def show_main_frame(): 
     frame_settings.pack_forget()
     frame_main.pack(fill="both", expand=True)
@@ -501,9 +546,12 @@ def show_settings_frame():
         ent_dcs.insert(0, str(cfg.get("dcs_main_folder", r"D:\DCS")))
         ent_port.delete(0, tk.END)
         ent_port.insert(0, str(cfg.get("network_port", "1015")))
-        
+        ent_bind.delete(0, tk.END)
+        ent_bind.insert(0, str(cfg.get("bind_address", "0.0.0.0")))
+        ent_auth.delete(0, tk.END)
+        ent_auth.insert(0, str(cfg.get("auth_token", "")))
+
         saved_seconds = int(cfg.get("github_check_interval", 43200))
-        # Updated interval mapping context to match the 10-minute threshold (600 seconds)
         if saved_seconds == 600: opt_update_var.set("Every 10 minutes")
         elif saved_seconds == 3600: opt_update_var.set("Every 1 Hour")
         elif saved_seconds == 43200: opt_update_var.set("Every 12 Hours")
@@ -519,24 +567,25 @@ def show_settings_frame():
 
 def save_settings_to_file():
     menu_string = opt_update_var.get()
-    # Mapped "Every 10 minutes" text context string lookup to exactly 600 seconds
     if "10 minutes" in menu_string: seconds = 600
     elif "1 Hour" in menu_string: seconds = 3600
     elif "12 Hours" in menu_string: seconds = 43200
     else: seconds = -1
     
     current_settings = {
-        "dcs_main_folder": ent_dcs.get(), 
-        "preserve_mission_scripting": v_preserve.get(), 
-        "network_port": ent_port.get(), 
+        "dcs_main_folder": ent_dcs.get(),
+        "preserve_mission_scripting": v_preserve.get(),
+        "network_port": ent_port.get(),
+        "bind_address": ent_bind.get().strip() or "0.0.0.0",
+        "auth_token": ent_auth.get().strip(),
         "reboot_after_deployment": v_reboot.get(),
-        "github_check_interval": seconds
+        "github_check_interval": seconds,
     }
     absolute_config_path = os.path.join(application_path, CONFIG_FILE)
-    with open(absolute_config_path, "w", encoding="utf-8") as f: 
+    with open(absolute_config_path, "w", encoding="utf-8") as f:
         json.dump(current_settings, f, indent=4, ensure_ascii=False)
-        
-    start_or_restart_listener(current_settings["network_port"])
+
+    start_or_restart_listener(current_settings["network_port"], current_settings["bind_address"])
     show_main_frame()
 
 def create_tray_image():
@@ -563,7 +612,7 @@ def setup_tray_icon():
 # =========================================================================
 root = tk.Tk()
 root.title(f"DCS Norway Remote Updater Node (v{CURRENT_NODE_VERSION})")
-root.geometry("540x450")
+root.geometry("540x520")
 root.configure(bg="#1C1C1F")
 
 try:
@@ -624,17 +673,40 @@ tk.Label(grid_f, text="Listening Port:", fg="white", bg="#1C1C1F").grid(row=1, c
 ent_port = tk.Entry(grid_f, width=12, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1)
 ent_port.grid(row=1, column=1, sticky="w", pady=6, padx=5)
 
+tk.Label(grid_f, text="Bind Address:", fg="white", bg="#1C1C1F").grid(row=2, column=0, sticky="w", pady=6)
+ent_bind = tk.Entry(grid_f, width=18, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1)
+ent_bind.grid(row=2, column=1, sticky="w", pady=6, padx=5)
+tk.Label(grid_f, text="LAN IP (not 0.0.0.0)", fg="#8E8E93", bg="#1C1C1F", font=("Arial", 8)).grid(row=2, column=2, sticky="w")
+
+tk.Label(grid_f, text="Auth Token:", fg="white", bg="#1C1C1F").grid(row=3, column=0, sticky="w", pady=6)
+ent_auth = tk.Entry(grid_f, width=28, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1, show="*")
+ent_auth.grid(row=3, column=1, columnspan=2, sticky="w", pady=6, padx=5)
+
 tk.Label(frame_settings, text="Check for GitHub app updates:", fg="white", bg="#1C1C1F").pack(anchor="w", pady=(10, 2))
 
 opt_update_var = tk.StringVar()
-# Replaced "Every 5 Minutes (Testing)" dropdown option completely with "Every 10 minutes"
 opt_update_menu = tk.OptionMenu(frame_settings, opt_update_var, "Every 10 minutes", "Every 1 Hour", "Every 12 Hours", "Disabled")
 opt_update_menu.configure(bg="#252529", fg="white", activebackground="#252529", activeforeground="white", relief="flat", highlightthickness=0)
 opt_update_menu["menu"].configure(bg="#252529", fg="white", activebackground="#0A84FF", activeforeground="white")
 opt_update_menu.pack(fill="x", pady=2)
 
+# NEW: Manual override action button configured directly underneath the interval drop-down matrix
+btn_force_update = tk.Button(
+    frame_settings, 
+    text=" 🔄 Check for App Updates Now ", 
+    font=("Arial", 9, "bold"), 
+    bg="#1A5A99", 
+    fg="white", 
+    padx=10, 
+    pady=5, 
+    command=force_github_update_check, 
+    relief="flat", 
+    cursor="hand2"
+)
+btn_force_update.pack(anchor="w", pady=(5, 10))
+
 v_preserve = tk.BooleanVar()
-tk.Checkbutton(frame_settings, text="Preserve current MissionScripting.lua?", variable=v_preserve, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=(15, 5))
+tk.Checkbutton(frame_settings, text="Preserve current MissionScripting.lua?", variable=v_preserve, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=(5, 5))
 
 v_reboot = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Reboot Windows automatically after update completes", variable=v_reboot, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
@@ -654,6 +726,7 @@ threading.Thread(target=github_update_monitor_loop, daemon=True).start()
 
 root.after(100, lambda: root.withdraw())
 root.mainloop()
+
 
 
 

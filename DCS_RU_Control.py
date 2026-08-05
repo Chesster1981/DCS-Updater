@@ -27,6 +27,8 @@ def get_resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+from dcs_ru_common import load_master_config, save_master_config, wrap_command
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] (%(threadName)s) %(message)s',
@@ -37,9 +39,9 @@ logging.basicConfig(
 )
 
 DEFAULT_TCP_PORT = 1015
-SOCKET_TIMEOUT = 4.0          
-PING_INTERVAL = 10.0          
-DEPLOY_CHECK_INTERVAL = 3.0   
+SOCKET_TIMEOUT = 4.0
+PING_INTERVAL = 10.0
+DEPLOY_CHECK_INTERVAL = 3.0
 CONFIG_FILE = "master_config.json"
 
 STYLE_BG_DARK      = "#1C1C1F" 
@@ -75,38 +77,35 @@ global_signals = ClusterSignals()
 global_servers = []
 is_deployment_running = False
 cached_latest_cloud_version = "Fetching..."
+cached_auth_token = ""
+cached_discord_meta = {"panel_channel_id": None, "panel_message_id": None}
+
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if "servers" in data and isinstance(data["servers"], list):
-                    return data
-        except Exception as e:
-            logging.error(f"Could not read config file: {e}")
-    empty_profile = {"servers": []}
-    save_config(empty_profile)
-    return empty_profile
+    data = load_master_config(CONFIG_FILE)
+    return data
 
-def save_config(config_data):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config_data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        logging.error(f"Could not save config file: {e}")
 
 def save_config_to_file():
-    save_config({"servers": global_servers})
+    global cached_auth_token, cached_discord_meta
+    save_master_config(
+        {
+            "auth_token": cached_auth_token,
+            "servers": global_servers,
+            "discord": cached_discord_meta,
+        },
+        CONFIG_FILE,
+    )
+
 
 def send_socket_command(ip, port, command_str):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(SOCKET_TIMEOUT)
         sock.connect((ip, int(port)))
-        payload = command_str if command_str.endswith("\n") else command_str + "\n"
-        sock.sendall(payload.encode('utf-8'))
-        response_data = sock.recv(4096).decode('utf-8')
+        payload = wrap_command(command_str, cached_auth_token)
+        sock.sendall(payload.encode("utf-8"))
+        response_data = sock.recv(4096).decode("utf-8")
         sock.close()
         return response_data.strip()
     except Exception as e:
@@ -217,6 +216,18 @@ class MainWindow(QMainWindow):
             self.admin_layout.addWidget(btn)
         self.actions_row_layout.addLayout(self.admin_layout)
         self.actions_row_layout.addStretch()
+
+        self.lbl_auth = QLabel("Shared Auth Token:")
+        self.lbl_auth.setStyleSheet(f"color: {STYLE_TEXT_MUTED};")
+        self.ent_auth = QLineEdit()
+        self.ent_auth.setEchoMode(QLineEdit.Password)
+        self.ent_auth.setPlaceholderText("Same token as on every Node")
+        self.ent_auth.setText(cached_auth_token)
+        self.ent_auth.setFixedWidth(220)
+        self.ent_auth.setStyleSheet(f"background-color: {STYLE_BG_CELL}; color: white; border: 1px solid #2C2C30; padding: 4px; border-radius: 3px;")
+        self.ent_auth.editingFinished.connect(self.save_auth_token)
+        self.actions_row_layout.addWidget(self.lbl_auth)
+        self.actions_row_layout.addWidget(self.ent_auth)
         self.main_layout.addLayout(self.actions_row_layout)
         
         self.deploy_row_layout = QHBoxLayout()
@@ -247,8 +258,14 @@ class MainWindow(QMainWindow):
         self.button_deploy.clicked.connect(self.confirm_and_deploy)
         self.load_table_data()
 
-    def handle_row_click(self, item): 
+    def handle_row_click(self, item):
         self.selected_row_index = item.row()
+
+    def save_auth_token(self):
+        global cached_auth_token
+        cached_auth_token = self.ent_auth.text().strip()
+        save_config_to_file()
+        global_signals.append_log.emit("Shared auth token saved to master_config.json")
 
 # ==============================================================================
 # PART 4 OF 5: DATA GENERATION CONTEXTS, DIALOG MATRIX LAYOUTS & CRUD INTERCEPTS
@@ -484,12 +501,22 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
-    
+
     config_data = load_config()
     global_servers = config_data.get("servers", [])
-    
+    cached_auth_token = config_data.get("auth_token", "")
+    cached_discord_meta = config_data.get("discord") or {
+        "panel_channel_id": None,
+        "panel_message_id": None,
+    }
+    if not cached_auth_token:
+        logging.warning(
+            "auth_token is empty in master_config.json — TCP commands are unauthenticated. "
+            "Set the same token on Control/Bot and every Node."
+        )
+
     window = MainWindow()
-    window.show() 
-    
+    window.show()
+
     threading.Thread(target=automatic_status_monitor, args=(window,), daemon=True).start()
     sys.exit(app.exec())

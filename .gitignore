@@ -10,3 +10,5 @@
 /dist
 /master_config.json
 /Web Scraper.py
+.env
+*.log
