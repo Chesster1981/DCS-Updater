@@ -98,6 +98,40 @@ def save_config_to_file():
     )
 
 
+def parse_socket_response(answer):
+    """
+    Parse a node TCP reply.
+    Returns: status, installed_ver, cloud_ver, active_task, node_ver
+    status is ONLINE, UNAUTHORIZED, or OFFLINE.
+    """
+    if not answer:
+        return "OFFLINE", "UNKNOWN", "Unknown", "Idle", ""
+
+    try:
+        if answer.startswith("{"):
+            data = json.loads(answer)
+            if data.get("status") == "UNAUTHORIZED":
+                return "UNAUTHORIZED", "BAD TOKEN", "—", "Check auth_token", ""
+            return (
+                "ONLINE",
+                data.get("installed_version", "Unknown"),
+                data.get("latest_cloud_version", "Unknown"),
+                data.get("active_task", "Idle"),
+                data.get("node_version", "1.0"),
+            )
+        parts = answer.split(":")
+        return (
+            "ONLINE",
+            parts[1].strip() if len(parts) > 1 else "Unknown",
+            parts[2].strip() if len(parts) > 2 else "Unknown",
+            "Idle",
+            "1.0",
+        )
+    except Exception as err:
+        logging.error("Error parsing network response: %s", err)
+        return "OFFLINE", "UNKNOWN", "Unknown", "Idle", ""
+
+
 def send_socket_command(ip, port, command_str):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -116,28 +150,10 @@ def test_single_system_background(index, ip, port, window_ref=None):
     global is_deployment_running
     row_id_str = str(index)
     answer = send_socket_command(ip, port, "PING_STATUS")
-    if answer:
-        try:
-            if answer.startswith("{"):
-                response_json = json.loads(answer)
-                local_ver = response_json.get("installed_version", "Unknown")
-                cloud_ver = response_json.get("latest_cloud_version", "Unknown")
-                active_task = response_json.get("active_task", "Idle")
-                node_ver = response_json.get("node_version", "1.0")
-            else:
-                parts = answer.split(":")
-                local_ver = parts.strip() if len(parts) > 1 else "Unknown"
-                cloud_ver = parts.strip() if len(parts) > 2 else "Unknown"
-                active_task = "Idle"
-                node_ver = "1.0"
-            if cloud_ver and cloud_ver != "Unknown" and cloud_ver != "Fetching...":
-                global_signals.cloud_version_updated.emit(cloud_ver)
-            global_signals.node_updated.emit(row_id_str, "ONLINE", local_ver, active_task, node_ver)
-        except Exception as err:
-            logging.error(f"Error parsing network response from {ip}: {err}")
-            global_signals.node_updated.emit(row_id_str, "OFFLINE", "UNKNOWN", "Idle", "")
-    else:
-        global_signals.node_updated.emit(row_id_str, "OFFLINE", "UNKNOWN", "Idle", "")
+    status, local_ver, cloud_ver, active_task, node_ver = parse_socket_response(answer)
+    if status == "ONLINE" and cloud_ver not in ("Unknown", "Fetching..."):
+        global_signals.cloud_version_updated.emit(cloud_ver)
+    global_signals.node_updated.emit(row_id_str, status, local_ver, active_task, node_ver)
 
 def automatic_status_monitor(window_ref=None):
     while True:
@@ -221,13 +237,17 @@ class MainWindow(QMainWindow):
         self.lbl_auth.setStyleSheet(f"color: {STYLE_TEXT_MUTED};")
         self.ent_auth = QLineEdit()
         self.ent_auth.setEchoMode(QLineEdit.Password)
-        self.ent_auth.setPlaceholderText("Same token as on every Node")
+        self.ent_auth.setPlaceholderText("Same token as on every Node — saved to master_config.json")
         self.ent_auth.setText(cached_auth_token)
-        self.ent_auth.setFixedWidth(220)
+        self.ent_auth.setFixedWidth(280)
         self.ent_auth.setStyleSheet(f"background-color: {STYLE_BG_CELL}; color: white; border: 1px solid #2C2C30; padding: 4px; border-radius: 3px;")
+        self.btn_save_auth = QPushButton("Save Token")
+        self.btn_save_auth.setStyleSheet(f"background-color: {STYLE_BTN_EDIT}; color: white; font-weight: bold; padding: 4px 10px; border: none; border-radius: 3px;")
+        self.btn_save_auth.clicked.connect(self.save_auth_token)
         self.ent_auth.editingFinished.connect(self.save_auth_token)
         self.actions_row_layout.addWidget(self.lbl_auth)
         self.actions_row_layout.addWidget(self.ent_auth)
+        self.actions_row_layout.addWidget(self.btn_save_auth)
         self.main_layout.addLayout(self.actions_row_layout)
         
         self.deploy_row_layout = QHBoxLayout()
@@ -266,6 +286,13 @@ class MainWindow(QMainWindow):
         cached_auth_token = self.ent_auth.text().strip()
         save_config_to_file()
         global_signals.append_log.emit("Shared auth token saved to master_config.json")
+        for i in range(self.table.rowCount()):
+            s = global_servers[i]
+            threading.Thread(
+                target=test_single_system_background,
+                args=(i, s["ip"], s["port"], self),
+                daemon=True,
+            ).start()
 
 # ==============================================================================
 # PART 4 OF 5: DATA GENERATION CONTEXTS, DIALOG MATRIX LAYOUTS & CRUD INTERCEPTS
@@ -349,7 +376,12 @@ class MainWindow(QMainWindow):
         if sc:
             lf, st = sc.findChild(QFrame, "status_lamp"), sc.findChild(QLabel, "status_text")
             if lf and st:
-                c = STYLE_STATUS_GREEN if status == "ONLINE" else STYLE_STATUS_RED
+                if status == "ONLINE":
+                    c = STYLE_STATUS_GREEN
+                elif status == "UNAUTHORIZED":
+                    c = STYLE_STATUS_WARN
+                else:
+                    c = STYLE_STATUS_RED
                 lf.setStyleSheet(f"background-color: {c}; border-radius: 8px;")
                 st.setText(status if active_task == "Idle" else f"{status} ({active_task})")
                 st.setStyleSheet(f"color: {c}; font-weight: bold; background: transparent;")
@@ -360,8 +392,10 @@ class MainWindow(QMainWindow):
             if lbl:
                 inst_clean = str(installed_ver).strip()
                 cloud_clean = str(cached_latest_cloud_version).strip()
-                
-                if inst_clean in ["UNKNOWN", "FETCHING..."]:
+
+                if status == "UNAUTHORIZED":
+                    cv = STYLE_STATUS_WARN
+                elif inst_clean in ["UNKNOWN", "FETCHING...", "BAD TOKEN"]:
                     cv = STYLE_STATUS_WARN
                 elif cloud_clean in ["Fetching...", "Unknown"]:
                     cv = STYLE_STATUS_GREEN
@@ -436,6 +470,17 @@ class MainWindow(QMainWindow):
             
             try:
                 ans = send_socket_command(ip, p, "TRIGGER_DCS_UPDATE")
+                if ans and ans.startswith("{"):
+                    res_json = json.loads(ans)
+                    if res_json.get("status") == "UNAUTHORIZED":
+                        global_signals.append_log.emit(
+                            f" [ 🔐 {n}] Unauthorized — set the same auth_token in Control Panel and on this Node."
+                        )
+                        global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                        continue
+                    if res_json.get("status") == "REJECTED_BUSY":
+                        global_signals.append_log.emit(f" [ ⚠️ {n}] Node busy: {res_json.get('task', 'unknown')}")
+                        continue
                 if ans and "OK_STARTING" in ans:
                     global_signals.append_log.emit(f" [ ✅ {n}] Update triggered. Monitoring bandwidth usage...")
                     
@@ -448,6 +493,10 @@ class MainWindow(QMainWindow):
                             chk = send_socket_command(ip, p, "PING_STATUS")
                             if chk and chk.startswith("{"):
                                 response_json = json.loads(chk)
+                                if response_json.get("status") == "UNAUTHORIZED":
+                                    global_signals.append_log.emit(f" [ 🔐 {n}] Unauthorized during monitor.")
+                                    global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                                    break
                                 local_task = response_json.get("active_task", "Idle")
                                 local_ver = response_json.get("installed_version", "Unknown")
                                 node_ver = response_json.get("node_version", "1.0")
@@ -483,9 +532,9 @@ class MainWindow(QMainWindow):
                 global_signals.append_log.emit(f" [ ❌ {n}] Sequential step failed: {e}")
             finally:
                 final_chk = send_socket_command(ip, p, "PING_STATUS")
-                if final_chk and final_chk.startswith("{"):
-                    res = json.loads(final_chk)
-                    global_signals.node_updated.emit(str(idx), "ONLINE", res.get("installed_version", "Unknown"), res.get("active_task", "Idle"), res.get("node_version", "1.0"))
+                if final_chk:
+                    status, inst, _, task, node_ver = parse_socket_response(final_chk)
+                    global_signals.node_updated.emit(str(idx), status, inst, task, node_ver)
                 else:
                     global_signals.node_updated.emit(str(idx), "OFFLINE", "FETCHING...", "Rebooting", "")
                     
