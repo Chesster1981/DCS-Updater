@@ -26,7 +26,7 @@ CONFIG_FILE = "dcs_node_config.json"
 DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.0"
+CURRENT_NODE_VERSION = "2.0.1"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
