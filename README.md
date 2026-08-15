@@ -83,7 +83,7 @@ In Discord: `/dcs-panel-init` pins the live panel. Channel/message IDs are store
 
 | Command | Response |
 |---------|----------|
-| `PING_STATUS` | JSON with version, `active_task`, `node_version` |
+| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_running` |
 | `TRIGGER_DCS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `UNAUTHORIZED` |
 | `EXIT_NODE` | `ACK_EXIT` (localhost + auth when a token is set) |
 

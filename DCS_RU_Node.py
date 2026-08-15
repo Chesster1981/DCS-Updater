@@ -23,10 +23,9 @@ import urllib.error
 from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version, wrap_command
 
 CONFIG_FILE = "dcs_node_config.json"
-DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.0.1"
+CURRENT_NODE_VERSION = "2.1"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -35,11 +34,16 @@ listener_thread = None
 is_listening = False
 tray_icon = None
 
+DCS_SERVER_PROCESS = "DCS_server.exe"
+DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
+WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
+
 node_state = {
     "installed_version": "Unknown",
     "latest_cloud_version": "Unknown",
     "active_task": "Idle",
-    "is_running": True
+    "is_running": True,
+    "dcs_running": False,
 }
 
 appdata_dir = os.environ.get('APPDATA')
@@ -92,6 +96,9 @@ def load_node_settings():
         "auth_token": "",
         "reboot_after_deployment": True,
         "github_check_interval": 43200,
+        "watchdog_enabled": True,
+        "watchdog_interval_seconds": WATCHDOG_DEFAULT_INTERVAL,
+        "auto_restart_dcs": True,
     }
     if os.path.exists(absolute_config_path):
         try:
@@ -285,9 +292,106 @@ def check_active_processes_running():
         for prog in DCS_PROCESSES:
             if prog.lower() in output.lower():
                 return True
-    except:
+    except Exception:
         pass
     return False
+
+
+def is_dcs_server_running():
+    """True when the dedicated DCS World server process is alive."""
+    try:
+        output = subprocess.check_output("tasklist", shell=True, text=True, errors="ignore")
+        return DCS_SERVER_PROCESS.lower() in output.lower()
+    except Exception:
+        return False
+
+
+def refresh_dcs_running_state():
+    running = is_dcs_server_running()
+    node_state["dcs_running"] = running
+    return running
+
+
+def start_dcs_server_process():
+    """Launch DCS_server.exe from the configured DCS bin folder."""
+    config = load_node_settings()
+    main_folder = config.get("dcs_main_folder", "").strip()
+    bin_folder = os.path.join(main_folder, "bin")
+    exe_path = os.path.join(bin_folder, DCS_SERVER_PROCESS)
+
+    if not os.path.exists(exe_path):
+        append_activity_log(f" [WATCHDOG] ERROR: {DCS_SERVER_PROCESS} not found at ❌ {exe_path}")
+        return False
+
+    try:
+        append_activity_log(f"[WATCHDOG] Starting {DCS_SERVER_PROCESS} from {bin_folder}...")
+        ps_cmd = (
+            f"Start-Process -FilePath '{exe_path}' "
+            f"-WorkingDirectory '{bin_folder}'"
+        )
+        subprocess.Popen(
+            ["powershell", "-Command", ps_cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception as e:
+        append_activity_log(f" [WATCHDOG] Failed to start DCS server: ❌ {e}")
+        logging.error("DCS server restart failed: %s", e)
+        return False
+
+
+def dcs_watchdog_loop():
+    """Every N seconds: verify DCS_server.exe; auto-restart if crashed/stopped."""
+    time.sleep(30)  # allow boot / first login before first check
+    while True:
+        try:
+            if is_swapping:
+                time.sleep(5)
+                continue
+
+            cfg = load_node_settings()
+            enabled = bool(cfg.get("watchdog_enabled", True))
+            interval = int(cfg.get("watchdog_interval_seconds", WATCHDOG_DEFAULT_INTERVAL))
+            if interval < 60:
+                interval = 60
+
+            if not enabled:
+                time.sleep(interval)
+                continue
+
+            if node_state["active_task"] not in ("Idle",):
+                append_activity_log(
+                    f"[WATCHDOG] Skipping check — node busy ({node_state['active_task']})."
+                )
+                time.sleep(interval)
+                continue
+
+            running = refresh_dcs_running_state()
+            if running:
+                append_activity_log(f"[WATCHDOG] {DCS_SERVER_PROCESS} is running ✅")
+            else:
+                append_activity_log(f"[WATCHDOG] {DCS_SERVER_PROCESS} is NOT running.")
+                if bool(cfg.get("auto_restart_dcs", True)):
+                    node_state["active_task"] = "Restarting DCS"
+                    started = start_dcs_server_process()
+                    if started:
+                        time.sleep(15)
+                        if refresh_dcs_running_state():
+                            append_activity_log("[WATCHDOG] DCS server restart verified ✅")
+                        else:
+                            append_activity_log(
+                                "[WATCHDOG] Restart launched but process not detected yet ⚠️"
+                            )
+                    node_state["active_task"] = "Idle"
+                else:
+                    append_activity_log("[WATCHDOG] Auto-restart disabled in settings.")
+
+            time.sleep(interval)
+        except Exception as e:
+            logging.error("Watchdog loop error: %s", e)
+            time.sleep(60)
+
 
 def force_kill_core_dcs():
     append_activity_log("[PROCESS] Requesting termination of core DCS processes...")
@@ -421,12 +525,14 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
 
                 if command == "PING_STATUS":
                     inst_v, cloud_v = get_dcs_versions_local()
+                    dcs_alive = refresh_dcs_running_state()
                     response = {
                         "status": "ACK",
                         "installed_version": inst_v,
                         "latest_cloud_version": cloud_v,
                         "active_task": node_state["active_task"],
                         "node_version": CURRENT_NODE_VERSION,
+                        "dcs_running": dcs_alive,
                     }
                     conn.send((json.dumps(response) + "\n").encode("utf-8"))
                     conn.close()
@@ -559,6 +665,8 @@ def show_settings_frame():
         
         v_preserve.set(bool(cfg.get("preserve_mission_scripting", True)))
         v_reboot.set(bool(cfg.get("reboot_after_deployment", True)))
+        v_watchdog.set(bool(cfg.get("watchdog_enabled", True)))
+        v_auto_restart.set(bool(cfg.get("auto_restart_dcs", True)))
         frame_settings.pack(fill="both", expand=True, padx=15, pady=10)
     except Exception as err:
         logging.error(f"UI settings frame assembly crashed: {err}")
@@ -580,6 +688,9 @@ def save_settings_to_file():
         "auth_token": ent_auth.get().strip(),
         "reboot_after_deployment": v_reboot.get(),
         "github_check_interval": seconds,
+        "watchdog_enabled": v_watchdog.get(),
+        "watchdog_interval_seconds": WATCHDOG_DEFAULT_INTERVAL,
+        "auto_restart_dcs": v_auto_restart.get(),
     }
     absolute_config_path = os.path.join(application_path, CONFIG_FILE)
     with open(absolute_config_path, "w", encoding="utf-8") as f:
@@ -612,7 +723,7 @@ def setup_tray_icon():
 # =========================================================================
 root = tk.Tk()
 root.title(f"DCS Norway Remote Updater Node (v{CURRENT_NODE_VERSION})")
-root.geometry("540x520")
+root.geometry("540x580")
 root.configure(bg="#1C1C1F")
 
 try:
@@ -711,6 +822,12 @@ tk.Checkbutton(frame_settings, text="Preserve current MissionScripting.lua?", va
 v_reboot = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Reboot Windows automatically after update completes", variable=v_reboot, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
+v_watchdog = tk.BooleanVar()
+tk.Checkbutton(frame_settings, text="Watch DCS_server.exe every 5 minutes", variable=v_watchdog, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+
+v_auto_restart = tk.BooleanVar()
+tk.Checkbutton(frame_settings, text="Auto-restart DCS server if it stopped/crashed", variable=v_auto_restart, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+
 btn_tray = tk.Frame(frame_settings, bg="#1C1C1F")
 btn_tray.pack(pady=15)
 
@@ -723,6 +840,8 @@ setup_tray_icon()
 get_dcs_versions_local()
 
 threading.Thread(target=github_update_monitor_loop, daemon=True).start()
+threading.Thread(target=dcs_watchdog_loop, daemon=True).start()
+refresh_dcs_running_state()
 
 root.after(100, lambda: root.withdraw())
 root.mainloop()

@@ -315,19 +315,29 @@ class LiveControlPanelView(discord.ui.View):
                     else:
                         installed_ver = res.get("installed_version", "Unknown")
                         latest_ver = res.get("latest_cloud_version", installed_ver)
+                        dcs_running = res.get("dcs_running", True)
+                        active_task = res.get("active_task", "Idle")
 
-                        if str(installed_ver).strip() != str(latest_ver).strip() and latest_ver != "Unknown":
+                        if dcs_running is False:
+                            status_text = "DCS DOWN"
+                            ver_info = f"{installed_ver}"
+                            icon = "🛑"
+                            task_info = (
+                                "Restarting..."
+                                if active_task == "Restarting DCS"
+                                else "DCS_server.exe stopped"
+                            )
+                        elif str(installed_ver).strip() != str(latest_ver).strip() and latest_ver != "Unknown":
                             status_text = "UPDATE READY"
                             ver_info = f"{installed_ver}"
                             icon = "⚠️"
                             is_outdated = True
+                            task_info = "Ready" if active_task == "Idle" else active_task
                         else:
                             status_text = "UP TO DATE"
                             ver_info = f"{installed_ver}"
                             icon = "🟢"
-
-                        active_task = res.get("active_task", "Idle")
-                        task_info = "Ready" if active_task == "Idle" else active_task
+                            task_info = "Ready" if active_task == "Idle" else active_task
                 except Exception:
                     status_text = "OFFLINE"
                     icon = "🔴"

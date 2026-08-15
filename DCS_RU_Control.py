@@ -102,7 +102,7 @@ def parse_socket_response(answer):
     """
     Parse a node TCP reply.
     Returns: status, installed_ver, cloud_ver, active_task, node_ver
-    status is ONLINE, UNAUTHORIZED, or OFFLINE.
+    status is ONLINE, DCS DOWN, UNAUTHORIZED, or OFFLINE.
     """
     if not answer:
         return "OFFLINE", "UNKNOWN", "Unknown", "Idle", ""
@@ -112,11 +112,21 @@ def parse_socket_response(answer):
             data = json.loads(answer)
             if data.get("status") == "UNAUTHORIZED":
                 return "UNAUTHORIZED", "BAD TOKEN", "—", "Check auth_token", ""
+            dcs_running = data.get("dcs_running", True)
+            active_task = data.get("active_task", "Idle")
+            if dcs_running is False and active_task in ("Idle", "Restarting DCS"):
+                status = "DCS DOWN"
+                if active_task == "Restarting DCS":
+                    active_task = "Restarting DCS"
+                else:
+                    active_task = "DCS_server.exe not running"
+            else:
+                status = "ONLINE"
             return (
-                "ONLINE",
+                status,
                 data.get("installed_version", "Unknown"),
                 data.get("latest_cloud_version", "Unknown"),
-                data.get("active_task", "Idle"),
+                active_task,
                 data.get("node_version", "1.0"),
             )
         parts = answer.split(":")
@@ -152,6 +162,9 @@ def test_single_system_background(index, ip, port, window_ref=None):
     answer = send_socket_command(ip, port, "PING_STATUS")
     status, local_ver, cloud_ver, active_task, node_ver = parse_socket_response(answer)
     if status == "ONLINE" and cloud_ver not in ("Unknown", "Fetching..."):
+        global_signals.cloud_version_updated.emit(cloud_ver)
+    # Still accept cloud version when DCS is down — node agent is alive
+    if status == "DCS DOWN" and cloud_ver not in ("Unknown", "Fetching..."):
         global_signals.cloud_version_updated.emit(cloud_ver)
     global_signals.node_updated.emit(row_id_str, status, local_ver, active_task, node_ver)
 
@@ -366,7 +379,7 @@ class MainWindow(QMainWindow):
         if idx >= self.table.rowCount(): return
         
         base_name = global_servers[idx]["name"]
-        if status == "ONLINE" and node_ver:
+        if status in ("ONLINE", "DCS DOWN") and node_ver:
             display_name = f"{base_name} (Node v{node_ver})"
         else:
             display_name = base_name
@@ -378,12 +391,18 @@ class MainWindow(QMainWindow):
             if lf and st:
                 if status == "ONLINE":
                     c = STYLE_STATUS_GREEN
+                    label = status if active_task == "Idle" else f"{status} ({active_task})"
+                elif status == "DCS DOWN":
+                    c = STYLE_STATUS_WARN
+                    label = "DCS DOWN" if active_task in ("Idle", "DCS_server.exe not running") else f"DCS DOWN ({active_task})"
                 elif status == "UNAUTHORIZED":
                     c = STYLE_STATUS_WARN
+                    label = status if active_task == "Idle" else f"{status} ({active_task})"
                 else:
                     c = STYLE_STATUS_RED
+                    label = status if active_task == "Idle" else f"{status} ({active_task})"
                 lf.setStyleSheet(f"background-color: {c}; border-radius: 8px;")
-                st.setText(status if active_task == "Idle" else f"{status} ({active_task})")
+                st.setText(label)
                 st.setStyleSheet(f"color: {c}; font-weight: bold; background: transparent;")
                 
         vc = self.table.cellWidget(idx, 4)
@@ -394,6 +413,8 @@ class MainWindow(QMainWindow):
                 cloud_clean = str(cached_latest_cloud_version).strip()
 
                 if status == "UNAUTHORIZED":
+                    cv = STYLE_STATUS_WARN
+                elif status == "DCS DOWN":
                     cv = STYLE_STATUS_WARN
                 elif inst_clean in ["UNKNOWN", "FETCHING...", "BAD TOKEN"]:
                     cv = STYLE_STATUS_WARN
