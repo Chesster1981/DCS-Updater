@@ -411,11 +411,31 @@ class MainWindow(QMainWindow):
 
         # Version strings like 2.9.28.26385 + header padding
         min_ver_width = 160
-        # Lamp + longest status e.g. "DCS DOWN (DCS_server.exe not running)"
-        min_status_width = 290
-        for col, minimum in ((4, min_ver_width), (5, min_ver_width), (6, min_status_width)):
+        for col, minimum in ((4, min_ver_width), (5, min_ver_width)):
             self.table.setColumnWidth(col, max(self.table.columnWidth(col), minimum))
             header.setSectionResizeMode(col, QHeaderView.Fixed)
+
+        self.apply_live_status_column_width()
+
+    def apply_live_status_column_width(self):
+        """Fit Live Status to current labels (ONLINE is compact; long text gets a modest cap)."""
+        header = self.table.horizontalHeader()
+        status_width = 120  # lamp + "ONLINE" + margin
+        for row in range(self.table.rowCount()):
+            sc = self.table.cellWidget(row, 6)
+            if sc is None:
+                continue
+            hint = sc.sizeHint().width()
+            if hint > 0:
+                status_width = max(status_width, hint + 16)
+            st = sc.findChild(QLabel, "status_text")
+            if st is not None:
+                # Font metrics are more reliable than sizeHint for bold labels
+                text_w = st.fontMetrics().horizontalAdvance(st.text())
+                status_width = max(status_width, text_w + 16 + 16 + 10 + 16)  # pad + lamp + spacing
+        status_width = min(status_width, 180)
+        self.table.setColumnWidth(6, status_width)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
 
 # ==============================================================================
 # PART 5 OF 5: THREAD-SAFE SLOTS, EXPLICIT STRING IDENTITY MATCHERS & MAIN LOOPS
@@ -441,15 +461,19 @@ class MainWindow(QMainWindow):
                     label = status if active_task == "Idle" else f"{status} ({active_task})"
                 elif status == "DCS DOWN":
                     c = STYLE_STATUS_WARN
-                    label = "DCS DOWN" if active_task in ("Idle", "DCS_server.exe not running") else f"DCS DOWN ({active_task})"
+                    # Keep column compact; details go in tooltip
+                    label = "DCS DOWN"
                 elif status == "UNAUTHORIZED":
                     c = STYLE_STATUS_WARN
-                    label = status if active_task == "Idle" else f"{status} ({active_task})"
+                    label = "UNAUTHORIZED"
                 else:
                     c = STYLE_STATUS_RED
                     label = status if active_task == "Idle" else f"{status} ({active_task})"
                 lf.setStyleSheet(f"background-color: {c}; border-radius: 8px;")
                 st.setText(label)
+                tip = active_task if active_task not in ("Idle",) else status
+                st.setToolTip(tip)
+                sc.setToolTip(tip)
                 st.setStyleSheet(f"color: {c}; font-weight: bold; background: transparent;")
                 
         vc = self.table.cellWidget(idx, 4)
@@ -477,6 +501,7 @@ class MainWindow(QMainWindow):
 
         # Keep Server Name fitted to longest "Name (Node vX.Y.Z)" after live updates
         self.table.resizeColumnToContents(1)
+        self.apply_live_status_column_width()
 
     @Slot(str)
     def slot_cloud_version_updated(self, version_str):
