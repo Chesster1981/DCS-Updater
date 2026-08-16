@@ -39,15 +39,27 @@ class DCSClusterBot(commands.Bot):
         self.cached_dcs_version = "Unknown"
         self.last_cache_time = 0
         self.auth_token = ""
+        self._restoring_panel = False
 
     def load_cluster_config(self):
         data = load_master_config(self.config_path)
         self.auth_token = str(data.get("auth_token") or "")
         discord_meta = data.get("discord") or {}
-        if discord_meta.get("panel_channel_id") and not self.panel_channel_id:
-            self.panel_channel_id = discord_meta.get("panel_channel_id")
-        if discord_meta.get("panel_message_id") and not self.panel_message_id:
-            self.panel_message_id = discord_meta.get("panel_message_id")
+
+        def _as_id(value):
+            if value is None or value == "":
+                return None
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        channel_id = _as_id(discord_meta.get("panel_channel_id"))
+        message_id = _as_id(discord_meta.get("panel_message_id"))
+        if channel_id and not self.panel_channel_id:
+            self.panel_channel_id = channel_id
+        if message_id and not self.panel_message_id:
+            self.panel_message_id = message_id
         return data
 
     def load_cluster_nodes(self):
@@ -60,7 +72,6 @@ class DCSClusterBot(commands.Bot):
             "panel_channel_id": self.panel_channel_id,
             "panel_message_id": self.panel_message_id,
         }
-        # Preserve auth_token + servers from disk
         save_master_config(data, self.config_path)
         logger.info(
             "Persisted Discord panel IDs (channel=%s message=%s)",
@@ -113,23 +124,87 @@ class DCSClusterBot(commands.Bot):
         self.queue_processor_loop.start()
         self.persistent_panel_refresh_loop.start()
         self.load_cluster_config()
-        logger.info("Discord Bot v1.1 running. Unified config + auth ready.")
+        logger.info("Discord Bot v1.2 running. Auto panel restore enabled.")
 
     async def on_ready(self):
         logger.info("Logged in as %s", self.user)
-        # Restore persistent panel after restart if IDs were saved
-        if self.panel_channel_id and self.panel_message_id and not self.active_panel_view:
+        # Defer slightly so guild/channel cache is warm after PC reboot
+        await asyncio.sleep(2)
+        await self.restore_or_recreate_panel()
+
+    async def get_panel_channel(self):
+        if not self.panel_channel_id:
+            return None
+        channel = self.get_channel(int(self.panel_channel_id))
+        if channel is None:
+            channel = await self.fetch_channel(int(self.panel_channel_id))
+        return channel
+
+    async def restore_or_recreate_panel(self):
+        """
+        After bot/PC restart: reattach to the saved panel message.
+        If the message is gone or uneditable, recreate the panel in the same channel.
+        """
+        if self._restoring_panel:
+            return
+        self._restoring_panel = True
+        try:
+            self.load_cluster_config()
+            if not self.panel_channel_id:
+                logger.info(
+                    "No saved panel_channel_id — run /dcs-panel-init once to enable auto-restore."
+                )
+                return
+
+            view = LiveControlPanelView(self)
+            self.add_view(view)
+            self.active_panel_view = view
+
+            for attempt in range(1, 4):
+                try:
+                    channel = await self.get_panel_channel()
+                    if channel is None:
+                        raise RuntimeError("panel channel not found")
+
+                    if self.panel_message_id:
+                        message = await channel.fetch_message(int(self.panel_message_id))
+                        new_embed = await view.generate_embed(guild=channel.guild)
+                        await message.edit(embed=new_embed, view=view)
+                        logger.info(
+                            "Restored persistent panel (attempt %s) message=%s",
+                            attempt,
+                            self.panel_message_id,
+                        )
+                        return
+
+                    raise RuntimeError("no panel_message_id saved")
+                except Exception as e:
+                    logger.warning("Panel restore attempt %s failed: %s", attempt, e)
+                    await asyncio.sleep(2 * attempt)
+
             try:
-                channel = self.get_channel(int(self.panel_channel_id))
+                channel = await self.get_panel_channel()
                 if channel is None:
-                    channel = await self.fetch_channel(int(self.panel_channel_id))
-                view = LiveControlPanelView(self)
-                self.add_view(view)
+                    logger.error(
+                        "Cannot recreate panel — channel %s unavailable", self.panel_channel_id
+                    )
+                    return
+
+                logger.info(
+                    "Recreating Discord panel automatically in channel %s", self.panel_channel_id
+                )
+                await self.purge_old_bot_messages(channel)
+                embed = await view.generate_embed(guild=channel.guild)
+                message = await channel.send(embed=embed, view=view)
+                self.panel_message_id = message.id
+                self.panel_channel_id = channel.id
                 self.active_panel_view = view
-                await view.refresh_panel()
-                logger.info("Restored persistent panel from saved message ID %s", self.panel_message_id)
+                self.persist_panel_ids()
+                logger.info("Auto-recreated panel message ID: %s", message.id)
             except Exception as e:
-                logger.error("Could not restore persistent panel: %s", e)
+                logger.error("Automatic panel recreate failed: %s", e)
+        finally:
+            self._restoring_panel = False
 
     async def purge_old_bot_messages(self, channel):
         try:
@@ -381,6 +456,7 @@ class LiveControlPanelView(discord.ui.View):
                 max_values=len(options),
                 options=options,
                 row=1,
+                custom_id="dcs_panel:select",
             )
             self.select_menu.callback = self.select_menu_callback
             self.add_item(self.select_menu)
@@ -411,15 +487,31 @@ class LiveControlPanelView(discord.ui.View):
                 message = await channel.fetch_message(int(self.bot.panel_message_id))
                 new_embed = await self.generate_embed(guild=channel.guild)
                 await message.edit(embed=new_embed, view=self)
+                return True
             except Exception as e:
                 logger.error("Failed to auto-edit persistent message frame: %s", e)
+                return False
+        return False
 
-    @discord.ui.button(label="🔄 Refresh Server Status", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(
+        label="🔄 Refresh Server Status",
+        style=discord.ButtonStyle.primary,
+        row=0,
+        custom_id="dcs_panel:refresh",
+    )
     async def btn_refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await self.refresh_panel()
+        ok = await self.refresh_panel()
+        if not ok:
+            await self.bot.restore_or_recreate_panel()
 
-    @discord.ui.button(label="🚀 Execute Selected Updates", style=discord.ButtonStyle.secondary, row=0, disabled=True)
+    @discord.ui.button(
+        label="🚀 Execute Selected Updates",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+        disabled=True,
+        custom_id="dcs_panel:deploy",
+    )
     async def btn_deploy_selected(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
 
@@ -454,6 +546,7 @@ async def dcs_panel_init(interaction: discord.Interaction):
     await bot.purge_old_bot_messages(interaction.channel)
 
     view = LiveControlPanelView(bot)
+    bot.add_view(view)
     embed = await view.generate_embed(guild=interaction.guild)
 
     message = await interaction.followup.send(embed=embed, view=view)
