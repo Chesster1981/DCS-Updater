@@ -44,7 +44,7 @@ def get_resource_path(relative_path):
 
 from dcs_ru_common import load_master_config, save_master_config, wrap_command, scrape_dcs_latest_version
 
-CONTROL_PANEL_VERSION = "2.1.10"
+CONTROL_PANEL_VERSION = "2.1.11"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
@@ -93,6 +93,11 @@ class ClusterSignals(QObject):
     append_log = Signal(str)
     deployment_state_changed = Signal(bool)
     timeout_triggered = Signal(str, object)
+    # Marshals Control Panel GitHub check results onto the GUI thread
+    control_update_check_finished = Signal(str, str)  # latest_version, download_url ("" if none)
+    control_update_check_failed = Signal(str)
+    control_update_swap_started = Signal()  # close window after update bat is launched
+    control_update_not_frozen = Signal(str)  # download_url for manual install hint
 
 global_signals = ClusterSignals()
 global_servers = []
@@ -349,6 +354,10 @@ class MainWindow(QMainWindow):
         global_signals.cloud_version_updated.connect(self.slot_cloud_version_updated)
         global_signals.append_log.connect(self.slot_append_log)
         global_signals.deployment_state_changed.connect(self.slot_deployment_state_changed)
+        global_signals.control_update_check_finished.connect(self._finish_update_check)
+        global_signals.control_update_check_failed.connect(self._fail_update_check)
+        global_signals.control_update_swap_started.connect(self.close)
+        global_signals.control_update_not_frozen.connect(self._show_not_frozen_update_hint)
         
         self.selected_row_index = None
         self.btn_add.clicked.connect(lambda: self.show_form_dialog(edit_mode=False))
@@ -378,6 +387,17 @@ class MainWindow(QMainWindow):
         self.btn_check_updates.setEnabled(False)
         global_signals.append_log.emit("[SYSTEM] Manual update check started…")
         threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    @staticmethod
+    def _version_tuple(version_str: str):
+        parts = []
+        for chunk in str(version_str or "").strip().lstrip("vV").split("."):
+            try:
+                parts.append(int(chunk))
+            except ValueError:
+                digits = "".join(ch for ch in chunk if ch.isdigit())
+                parts.append(int(digits) if digits else 0)
+        return tuple(parts) if parts else (0,)
 
     def _check_for_updates_worker(self):
         import urllib.request
@@ -415,23 +435,37 @@ class MainWindow(QMainWindow):
             global_signals.append_log.emit(
                 f"[SYSTEM] Control Panel v{CONTROL_PANEL_VERSION} | GitHub latest v{latest or '?'}"
             )
-            download_url = None
+            download_url = ""
             for asset in data.get("assets", []):
                 name = str(asset.get("name", "")).lower()
                 if "remote.updater.control.panel.exe" in name:
-                    download_url = asset.get("browser_download_url")
+                    download_url = str(asset.get("browser_download_url") or "")
                     break
-            QTimer.singleShot(0, lambda: self._finish_update_check(latest, download_url))
+            global_signals.control_update_check_finished.emit(latest, download_url)
         except Exception as e:
             global_signals.append_log.emit(f"[SYSTEM] GitHub check failed: {e}")
-            QTimer.singleShot(0, lambda: self.btn_check_updates.setEnabled(True))
+            global_signals.control_update_check_failed.emit(str(e))
 
-    def _finish_update_check(self, latest: str, download_url):
+    @Slot(str)
+    def _fail_update_check(self, error: str):
+        self.btn_check_updates.setEnabled(True)
+        QMessageBox.warning(
+            self,
+            "Update Check Failed",
+            f"Could not check GitHub for Control Panel updates.\n\n{error}",
+        )
+
+    @Slot(str, str)
+    def _finish_update_check(self, latest: str, download_url: str):
         self.btn_check_updates.setEnabled(True)
         if not latest:
             QMessageBox.warning(self, "Update Check", "Could not read latest GitHub release tag.")
             return
-        if latest == CONTROL_PANEL_VERSION:
+
+        local_v = self._version_tuple(CONTROL_PANEL_VERSION)
+        remote_v = self._version_tuple(latest)
+
+        if remote_v == local_v:
             QMessageBox.information(
                 self,
                 "Update Check",
@@ -439,22 +473,40 @@ class MainWindow(QMainWindow):
                 "Node status and ED version were refreshed.",
             )
             return
+
+        if remote_v < local_v:
+            QMessageBox.information(
+                self,
+                "Update Check",
+                f"You are on v{CONTROL_PANEL_VERSION}, which is newer than GitHub v{latest}.\n"
+                "Node status and ED version were refreshed.",
+            )
+            return
+
         if not download_url:
             QMessageBox.information(
                 self,
                 "Update Check",
-                f"GitHub has v{latest}, but no Control Panel asset was found.\n"
+                f"GitHub has v{latest}, but no Control Panel .exe asset was found.\n"
                 f"You are on v{CONTROL_PANEL_VERSION}.",
             )
             return
+
         reply = QMessageBox.question(
             self,
             "Update Available",
             f"A newer Control Panel is available: v{latest}\n"
             f"(you have v{CONTROL_PANEL_VERSION})\n\n"
-            "Download and install now?",
+            "Download and install now?\n"
+            "The Control Panel will close, update, and reopen.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
         )
         if reply == QMessageBox.Yes:
+            self.btn_check_updates.setEnabled(False)
+            global_signals.append_log.emit(
+                f"[SYSTEM] Operator accepted update to v{latest}. Downloading…"
+            )
             threading.Thread(
                 target=self._swap_control_panel_binary,
                 args=(download_url,),
@@ -469,15 +521,7 @@ class MainWindow(QMainWindow):
             global_signals.append_log.emit(
                 "[SYSTEM] App update swap only works from the compiled .exe (not python script)."
             )
-            QTimer.singleShot(
-                0,
-                lambda: QMessageBox.information(
-                    self,
-                    "Update",
-                    "Run the compiled Control Panel .exe to install updates automatically.\n"
-                    f"Download manually:\n{download_url}",
-                ),
-            )
+            global_signals.control_update_not_frozen.emit(download_url)
             return
 
         current_exe = os.path.abspath(sys.executable)
@@ -503,7 +547,7 @@ class MainWindow(QMainWindow):
             f.write(":del_loop\n")
             f.write('if exist "%EXE_PATH%" (\n')
             f.write('    del /f /q "%EXE_PATH%" >nul 2>&1\n')
-            f.write("    timeout /t 1 /nobreak > nul\n")
+            f.write("    timeout /t 1 /nobreak > nul\n')
             f.write("    goto del_loop\n")
             f.write(")\n")
             f.write('curl.exe -L --fail --retry 3 -o "%EXE_PATH%" "%DOWNLOAD_URL%"\n')
@@ -521,7 +565,17 @@ class MainWindow(QMainWindow):
             f.write("exit\n")
 
         subprocess.Popen(f'cmd.exe /c start /b "" "{bat_path}"', shell=True)
-        QTimer.singleShot(0, self.close)
+        global_signals.control_update_swap_started.emit()
+
+    @Slot(str)
+    def _show_not_frozen_update_hint(self, download_url: str):
+        self.btn_check_updates.setEnabled(True)
+        QMessageBox.information(
+            self,
+            "Update",
+            "Run the compiled Control Panel .exe to install updates automatically.\n"
+            f"Download manually:\n{download_url}",
+        )
 
     # ==============================================================================
     # PART 4 OF 5: DATA GENERATION CONTEXTS, DIALOG MATRIX LAYOUTS & CRUD INTERCEPTS
