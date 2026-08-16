@@ -20,12 +20,20 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont, QPixmap, QIcon
 
 def get_resource_path(relative_path):
-    try:
-        # PyInstaller unpacks files to sys._MEIPASS at runtime in --onefile mode
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+    """Resolve bundled assets (PyInstaller) or next to the script/exe."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, relative_path))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), relative_path))
+    else:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path))
+        candidates.append(os.path.join(os.path.abspath("."), relative_path))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0] if candidates else relative_path
 
 from dcs_ru_common import load_master_config, save_master_config, wrap_command
 

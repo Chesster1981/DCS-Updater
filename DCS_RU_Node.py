@@ -25,7 +25,7 @@ from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.3"
+CURRENT_NODE_VERSION = "2.1.4"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -80,11 +80,20 @@ def handle_single_instance_takeover():
         pass
 
 def get_resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+    """Resolve bundled assets (PyInstaller) or next to the script/exe."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(meipass, relative_path))
+        candidates.append(os.path.join(os.path.dirname(sys.executable), relative_path))
+    else:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path))
+        candidates.append(os.path.join(os.path.abspath("."), relative_path))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0] if candidates else relative_path
 
 def load_node_settings():
     absolute_config_path = os.path.join(application_path, CONFIG_FILE)
