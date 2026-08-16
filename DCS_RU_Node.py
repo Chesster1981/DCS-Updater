@@ -25,7 +25,7 @@ from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.4"
+CURRENT_NODE_VERSION = "2.1.5"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -138,47 +138,57 @@ def _execute_silent_node_binary_swap(download_url):
     
     try:
         append_activity_log("[SYSTEM] Forking the successful separate update process...")
-        if getattr(sys, 'frozen', False):
+        if getattr(sys, "frozen", False):
             current_exe = os.path.abspath(sys.executable)
         else:
-            current_exe = os.path.abspath(sys.argv)
-            
+            current_exe = os.path.abspath(sys.argv[0])
+
         bat_path = os.path.join(application_path, "update_node.bat")
         exe_name = os.path.basename(current_exe)
-        
+        exe_dir = os.path.dirname(current_exe)
         clean_url = download_url.replace(",", ".")
-        
+
+        # Always swap the running exe in-place (absolute paths). Relative names
+        # previously wrote into %APPDATA% / wrong CWD and left the real install untouched.
         with open(bat_path, "w", encoding="utf-8") as f:
-            f.write('@echo off\n')
-            f.write('setlocal enabledelayedexpansion\n')
+            f.write("@echo off\n")
+            f.write("setlocal\n")
+            f.write(f'set "EXE_PATH={current_exe}"\n')
+            f.write(f'set "EXE_DIR={exe_dir}"\n')
             f.write(f'set "EXE_NAME={exe_name}"\n')
             f.write(f'set "DOWNLOAD_URL={clean_url}"\n')
-            f.write('echo [1/5] Terminating active Node execution handles...\n')
-            f.write('taskkill /f /im "!EXE_NAME!" >nul 2>&1\n')
-            f.write('echo [2/5] Awaiting standard thread file handle release...\n')
-            f.write('timeout /t 3 /nobreak > nul\n')
-            f.write(':del_loop\n')
-            f.write('if exist "!EXE_NAME!" (\n')
-            f.write('    echo     Attempting legacy executable purge routing...\n')
-            f.write('    del /f /q "!EXE_NAME!" >nul 2>&1\n')
-            f.write('    timeout /t 1 /nobreak > nul\n')
-            f.write('    goto del_loop\n')
-            f.write(')\n')
-            f.write('echo [3/5] Active executable file unlocked and purged successfully.\n')
-            f.write('echo [4/5] Pulling upgraded architecture package from GitHub CDN...\n')
-            f.write('powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri \'%DOWNLOAD_URL%\' -OutFile \'!EXE_NAME!\' -MaximumRedirection 5"\n')
-            f.write('if not exist "!EXE_NAME!" (\n')
-            f.write('    echo [X] CRITICAL ERROR: Package sync operation failed!\n')
-            f.write('    pause\n')
-            f.write('    exit /b\n')
-            f.write(')\n')
-            f.write('echo [5/5] Launching newly deployed service runtime architecture...\n')
-            f.write('start "" "!EXE_NAME!"\n')
-            f.write('echo === DEPLOYMENT AND SWAP SEQUENCE SUCCESSFUL ===\n')
-            f.write('timeout /t 2 /nobreak > nul\n')
+            f.write('cd /d "%EXE_DIR%"\n')
+            f.write("echo [1/5] Terminating active Node execution handles...\n")
+            f.write('taskkill /f /im "%EXE_NAME%" >nul 2>&1\n')
+            f.write("echo [2/5] Awaiting file handle release...\n")
+            f.write("timeout /t 3 /nobreak > nul\n")
+            f.write(":del_loop\n")
+            f.write('if exist "%EXE_PATH%" (\n')
+            f.write('    del /f /q "%EXE_PATH%" >nul 2>&1\n')
+            f.write("    timeout /t 1 /nobreak > nul\n")
+            f.write("    goto del_loop\n")
+            f.write(")\n")
+            f.write("echo [3/5] Old executable removed.\n")
+            f.write("echo [4/5] Downloading update from GitHub...\n")
+            f.write('curl.exe -L --fail --retry 3 -o "%EXE_PATH%" "%DOWNLOAD_URL%"\n')
+            f.write("if errorlevel 1 (\n")
+            f.write(
+                "    powershell -NoProfile -Command "
+                "\"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+                "Invoke-WebRequest -Uri '%DOWNLOAD_URL%' -OutFile '%EXE_PATH%' -MaximumRedirection 5\"\n"
+            )
+            f.write(")\n")
+            f.write('if not exist "%EXE_PATH%" (\n')
+            f.write("    echo [X] CRITICAL ERROR: Download failed!\n")
+            f.write("    pause\n")
+            f.write("    exit /b 1\n")
+            f.write(")\n")
+            f.write("echo [5/5] Starting updated Node...\n")
+            f.write('start "" "%EXE_PATH%"\n')
+            f.write("timeout /t 2 /nobreak > nul\n")
             f.write('del "%~f0"\n')
-            f.write('exit\n')
-            
+            f.write("exit\n")
+
         subprocess.Popen(f'cmd.exe /c start /b "" "{bat_path}"', shell=True)
         
         global is_listening, server_socket, tray_icon
@@ -789,12 +799,15 @@ try:
         img_scaled = img_raw.resize((88, 88), Image.Resampling.LANCZOS)
         # Composite onto app background so alpha looks correct in Tk
         bg = Image.new("RGBA", img_scaled.size, (28, 28, 31, 255))
-        img_comp = Image.alpha_composite(bg, img_scaled)
+        img_comp = Image.alpha_composite(bg, img_scaled).convert("RGB")
         img_logo = ImageTk.PhotoImage(img_comp)
         lbl_logo.configure(image=img_logo)
         lbl_logo.image = img_logo
-except Exception:
-    pass
+        logging.info("[UI] Header logo loaded from %s", logo_path)
+    else:
+        logging.warning("[UI] Logo.png not found via get_resource_path")
+except Exception as e:
+    logging.error("[UI] Failed to load header logo: %s", e)
 
 # Right: Settings on top, green Run Local Update below
 right_column = tk.Frame(top_bar, bg="#1C1C1F")
