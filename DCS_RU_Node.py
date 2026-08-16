@@ -31,7 +31,7 @@ from brand_assets import (
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.12"
+CURRENT_NODE_VERSION = "2.1.13"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -647,7 +647,7 @@ def append_activity_log(text):
         log_window.see(tk.END)
 
 def trigger_local_update():
-    if messagebox.askyesno("Confirm", "Do you want to run the update process locally now?"):
+    if messagebox.askyesno("Confirm", "Update DCS on this machine now?"):
         threading.Thread(target=execute_deployment_pipeline, daemon=True).start()
 
 def force_github_update_check():
@@ -812,7 +812,7 @@ try:
 except Exception as e:
     logging.error("[UI] Failed to load embedded header logo: %s", e)
 
-# Right: Settings on top, green Run Local Update below
+# Right: Settings on top, green Update DCS Now below
 right_column = tk.Frame(top_bar, bg="#1C1C1F")
 right_column.pack(side="right", fill="y", anchor="ne")
 
@@ -833,7 +833,7 @@ tk.Button(
 
 btn_local_update = tk.Button(
     right_column,
-    text=" 🚀 RUN LOCAL UPDATE NOW",
+    text=" 🚀 UPDATE DCS NOW",
     font=("Arial", 10, "bold"),
     bg="#00912E",
     fg="white",
