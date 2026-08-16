@@ -8,6 +8,15 @@ Remote update system for DCS World servers in the DCS Norway cluster. Three comp
 | `DCS_RU_Control.py` | Desktop control panel (PySide6) |
 | `DCS_RU_Discord_Bot.py` | Discord live panel and deploy queue |
 | `dcs_ru_common.py` | Shared config, auth, and version scraping |
+| `brand_assets.py` | Embedded logo bytes (regenerate via tools script) |
+
+## Changing the logo
+
+1. Replace `Logo.png` in the repo root  
+2. Run `python tools/refresh_brand_assets.py`  
+3. Rebuild Node and Control Panel  
+
+UI logos are loaded from **embedded bytes** inside `brand_assets.py` (not from loose files next to the exe), so version upgrades always carry the logo you baked in.
 
 ## Installation
 

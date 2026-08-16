@@ -21,11 +21,17 @@ import urllib.request
 import urllib.error
 
 from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version, wrap_command
+from brand_assets import (
+    BRAND_ASSET_VERSION,
+    BRAND_PNG_MD5,
+    logo_pil_image,
+    materialize_icon_file,
+)
 
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.5"
+CURRENT_NODE_VERSION = "2.1.6"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -730,12 +736,11 @@ def setup_tray_icon():
         pystray.MenuItem('Exit Node', lambda icon, item: (icon.stop(), root.after(0, root.destroy)))
     )
     global tray_icon
-    logo_path = get_resource_path("Logo.png")
-    if os.path.exists(logo_path):
-        raw = Image.open(logo_path).convert("RGBA").resize((64, 64), Image.Resampling.LANCZOS)
+    try:
+        raw = logo_pil_image().resize((64, 64), Image.Resampling.LANCZOS)
         bg = Image.new("RGBA", raw.size, (28, 28, 31, 255))
         img_asset = Image.alpha_composite(bg, raw)
-    else:
+    except Exception:
         img_asset = create_tray_image()
     tray_icon = pystray.Icon("dcs_node", img_asset, "DCS Norway Remote Updater Node", menu)
     threading.Thread(target=tray_icon.run, daemon=True).start()
@@ -786,28 +791,26 @@ tk.Label(
 tk.Frame(title_column, bg="#1C1C1F").pack(expand=True, fill="both")
 
 try:
-    icon_path = get_resource_path("Logo.ico")
-    if os.path.exists(icon_path):
-        root.iconbitmap(icon_path)
-except Exception:
-    pass
+    icon_path = materialize_icon_file(application_path)
+    root.iconbitmap(icon_path)
+except Exception as e:
+    logging.warning("[UI] Window icon failed: %s", e)
 
 try:
-    logo_path = get_resource_path("Logo.png")
-    if os.path.exists(logo_path):
-        img_raw = Image.open(logo_path).convert("RGBA")
-        img_scaled = img_raw.resize((88, 88), Image.Resampling.LANCZOS)
-        # Composite onto app background so alpha looks correct in Tk
-        bg = Image.new("RGBA", img_scaled.size, (28, 28, 31, 255))
-        img_comp = Image.alpha_composite(bg, img_scaled).convert("RGB")
-        img_logo = ImageTk.PhotoImage(img_comp)
-        lbl_logo.configure(image=img_logo)
-        lbl_logo.image = img_logo
-        logging.info("[UI] Header logo loaded from %s", logo_path)
-    else:
-        logging.warning("[UI] Logo.png not found via get_resource_path")
+    img_raw = logo_pil_image()
+    img_scaled = img_raw.resize((88, 88), Image.Resampling.LANCZOS)
+    bg = Image.new("RGBA", img_scaled.size, (28, 28, 31, 255))
+    img_comp = Image.alpha_composite(bg, img_scaled).convert("RGB")
+    img_logo = ImageTk.PhotoImage(img_comp)
+    lbl_logo.configure(image=img_logo)
+    lbl_logo.image = img_logo
+    logging.info(
+        "[UI] Embedded brand logo %s (md5=%s)",
+        BRAND_ASSET_VERSION,
+        BRAND_PNG_MD5,
+    )
 except Exception as e:
-    logging.error("[UI] Failed to load header logo: %s", e)
+    logging.error("[UI] Failed to load embedded header logo: %s", e)
 
 # Right: Settings on top, green Run Local Update below
 right_column = tk.Frame(top_bar, bg="#1C1C1F")
@@ -920,6 +923,9 @@ tk.Button(btn_tray, text=" 💾 Save & Apply", font=("Arial", 10, "bold"), bg="#
 tk.Button(btn_tray, text="Cancel", font=("Arial", 10), bg="#5A6268", fg="white", padx=15, command=show_main_frame, relief="flat").grid(row=0, column=1, padx=5)
 
 show_main_frame()
+append_activity_log(
+    f"[UI] Embedded brand logo {BRAND_ASSET_VERSION} (md5={BRAND_PNG_MD5[:8]}…)"
+)
 start_or_restart_listener()
 setup_tray_icon()
 get_dcs_versions_local()

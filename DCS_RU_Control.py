@@ -19,6 +19,13 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QFont, QPixmap, QIcon
 
+from brand_assets import (
+    BRAND_ASSET_VERSION,
+    BRAND_PNG_MD5,
+    logo_png_bytes,
+    materialize_icon_file,
+)
+
 def get_resource_path(relative_path):
     """Resolve bundled assets (PyInstaller) or next to the script/exe."""
     candidates = []
@@ -202,7 +209,11 @@ class MainWindow(QMainWindow):
         self.resize(1100, 850)
         self.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: {STYLE_TEXT_WHITE};")
         
-        icon_path = get_resource_path("Logo.ico")
+        _icon_dir = os.path.join(
+            os.environ.get("APPDATA") or os.path.dirname(os.path.abspath(__file__)),
+            "DCS_Norway_Control",
+        )
+        icon_path = materialize_icon_file(_icon_dir)
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
             
@@ -220,12 +231,15 @@ class MainWindow(QMainWindow):
         self.lbl_logo.setFixedSize(120, 120)
         self.lbl_logo.setAlignment(Qt.AlignCenter)
         self.lbl_logo.setStyleSheet(f"background-color: {STYLE_BG_DARK}; border: none;")
-        logo_path = get_resource_path("Logo.png")
-        if os.path.exists(logo_path):
-            pix = QPixmap(logo_path)
-            # Preserve alpha channel so dark app background shows through
+        pix = QPixmap()
+        if pix.loadFromData(logo_png_bytes()):
             scaled = pix.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.lbl_logo.setPixmap(scaled)
+            logging.info(
+                "[UI] Embedded brand logo %s (md5=%s)",
+                BRAND_ASSET_VERSION,
+                BRAND_PNG_MD5,
+            )
         self.header_layout.addWidget(self.lbl_logo, 0, Qt.AlignVCenter)
 
         self.title_wrap = QWidget()
