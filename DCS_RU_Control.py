@@ -191,7 +191,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("DCS Norway Cluster Control Dashboard (Cloud Ver: Fetching...)")
         # Enforced 20% width increase and 25% height increase parameters explicitly
-        self.resize(1344, 850)
+        self.resize(1100, 850)
         self.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: {STYLE_TEXT_WHITE};")
         
         icon_path = get_resource_path("Logo.ico")
@@ -206,25 +206,38 @@ class MainWindow(QMainWindow):
         
         self.header_layout = QHBoxLayout()
         self.header_layout.setSpacing(16)
+        self.header_layout.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         self.lbl_logo = QLabel()
+        self.lbl_logo.setFixedSize(120, 120)
+        self.lbl_logo.setAlignment(Qt.AlignCenter)
+        self.lbl_logo.setStyleSheet("background: transparent; border: none;")
         logo_path = get_resource_path("Logo.png")
         if os.path.exists(logo_path):
             pix = QPixmap(logo_path)
-            self.lbl_logo.setPixmap(pix.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        self.header_layout.addWidget(self.lbl_logo, 0, Qt.AlignLeft | Qt.AlignVCenter)
+            # Preserve alpha channel so dark app background shows through
+            scaled = pix.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.lbl_logo.setPixmap(scaled)
+        self.header_layout.addWidget(self.lbl_logo, 0, Qt.AlignVCenter)
 
-        self.title_column = QVBoxLayout()
-        self.title_column.setSpacing(2)
+        self.title_wrap = QWidget()
+        self.title_wrap.setStyleSheet("background: transparent;")
+        self.title_column = QVBoxLayout(self.title_wrap)
+        self.title_column.setContentsMargins(0, 0, 0, 0)
+        self.title_column.setSpacing(4)
+        self.title_column.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.lbl_title = QLabel("DCS Norway")
         self.lbl_title.setFont(QFont("Arial", 28, QFont.Bold))
+        self.lbl_title.setStyleSheet(f"color: {STYLE_TEXT_WHITE}; background: transparent;")
         self.lbl_subtitle = QLabel("Remote Update Control Panel")
         self.lbl_subtitle.setFont(QFont("Arial", 16))
-        self.lbl_subtitle.setStyleSheet(f"color: {STYLE_TEXT_MUTED};")
+        self.lbl_subtitle.setStyleSheet(f"color: {STYLE_TEXT_MUTED}; background: transparent;")
+        self.title_column.addStretch()
         self.title_column.addWidget(self.lbl_title)
         self.title_column.addWidget(self.lbl_subtitle)
         self.title_column.addStretch()
-        self.header_layout.addLayout(self.title_column, 1)
+        self.header_layout.addWidget(self.title_wrap, 0, Qt.AlignVCenter)
+        self.header_layout.addStretch()
         self.main_layout.addLayout(self.header_layout)
         
         self.table = QTableWidget()
@@ -232,18 +245,26 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(["Select", "Server Name", "IP Address", "Port", "Installed Ver.", "Latest ED Ver.", "Live Status"])
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: #111112; gridline-color: #2C2C30; border: 1px solid #2C2C30; }}"
-            f"QTableWidget::item {{ color: {STYLE_TEXT_WHITE}; selection-color: {STYLE_TEXT_WHITE}; }}"
+            f"QTableWidget::item {{ color: {STYLE_TEXT_WHITE}; selection-color: {STYLE_TEXT_WHITE}; padding: 4px 10px; }}"
             f"QTableWidget::item:selected {{ background-color: #3A3A3C; }}"
+            f"QHeaderView::section {{ background-color: #1C1C1F; color: {STYLE_TEXT_WHITE}; padding: 6px 10px; border: 1px solid #2C2C30; }}"
         )
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header = self.table.horizontalHeader()
+        # Narrow data columns to content; Server Name takes remaining space
+        header.setMinimumSectionSize(48)
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Select
+        header.setSectionResizeMode(1, QHeaderView.Stretch)           # Server Name
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # IP Address
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Port
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Installed Ver.
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Latest ED Ver.
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Live Status
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.itemClicked.connect(self.handle_row_click)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.main_layout.addWidget(self.table)
-        
+
         self.actions_row_layout = QHBoxLayout()
         self.admin_layout = QHBoxLayout()
         self.btn_add = QPushButton(" Add Server ➕ ")
