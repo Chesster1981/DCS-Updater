@@ -211,7 +211,7 @@ class MainWindow(QMainWindow):
         self.lbl_logo = QLabel()
         self.lbl_logo.setFixedSize(120, 120)
         self.lbl_logo.setAlignment(Qt.AlignCenter)
-        self.lbl_logo.setStyleSheet("background: transparent; border: none;")
+        self.lbl_logo.setStyleSheet(f"background-color: {STYLE_BG_DARK}; border: none;")
         logo_path = get_resource_path("Logo.png")
         if os.path.exists(logo_path):
             pix = QPixmap(logo_path)
@@ -221,17 +221,17 @@ class MainWindow(QMainWindow):
         self.header_layout.addWidget(self.lbl_logo, 0, Qt.AlignVCenter)
 
         self.title_wrap = QWidget()
-        self.title_wrap.setStyleSheet("background: transparent;")
+        self.title_wrap.setStyleSheet(f"background-color: {STYLE_BG_DARK};")
         self.title_column = QVBoxLayout(self.title_wrap)
         self.title_column.setContentsMargins(0, 0, 0, 0)
         self.title_column.setSpacing(4)
         self.title_column.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.lbl_title = QLabel("DCS Norway")
         self.lbl_title.setFont(QFont("Arial", 28, QFont.Bold))
-        self.lbl_title.setStyleSheet(f"color: {STYLE_TEXT_WHITE}; background: transparent;")
+        self.lbl_title.setStyleSheet(f"color: {STYLE_TEXT_WHITE}; background-color: {STYLE_BG_DARK};")
         self.lbl_subtitle = QLabel("Remote Update Control Panel")
         self.lbl_subtitle.setFont(QFont("Arial", 16))
-        self.lbl_subtitle.setStyleSheet(f"color: {STYLE_TEXT_MUTED}; background: transparent;")
+        self.lbl_subtitle.setStyleSheet(f"color: {STYLE_TEXT_MUTED}; background-color: {STYLE_BG_DARK};")
         self.title_column.addStretch()
         self.title_column.addWidget(self.lbl_title)
         self.title_column.addWidget(self.lbl_subtitle)
@@ -250,15 +250,11 @@ class MainWindow(QMainWindow):
             f"QHeaderView::section {{ background-color: #1C1C1F; color: {STYLE_TEXT_WHITE}; padding: 6px 10px; border: 1px solid #2C2C30; }}"
         )
         header = self.table.horizontalHeader()
-        # Narrow data columns to content; Server Name takes remaining space
         header.setMinimumSectionSize(48)
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)  # Select
-        header.setSectionResizeMode(1, QHeaderView.Stretch)           # Server Name
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)  # IP Address
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)  # Port
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)  # Installed Ver.
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)  # Latest ED Ver.
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)  # Live Status
+        header.setStretchLastSection(False)
+        # Content-sized columns. Widget columns (4–6) get explicit mins in apply_column_widths().
+        for col in range(7):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.itemClicked.connect(self.handle_row_click)
@@ -400,6 +396,26 @@ class MainWindow(QMainWindow):
             st = QLabel("CHECKING"); st.setObjectName("status_text"); st.setStyleSheet(f"color: {STYLE_STATUS_WARN}; font-weight: bold; background: transparent;")
             sl.addWidget(lf); sl.addWidget(st); sl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); sc.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
             self.table.setCellWidget(idx, 6, sc)
+        self.apply_column_widths()
+
+    def apply_column_widths(self):
+        """
+        ResizeToContents under-measures columns that use cell widgets
+        (Installed Ver. / Latest ED Ver. / Live Status). Enforce content-friendly widths.
+        Server Name stays content-sized (no stretch).
+        """
+        header = self.table.horizontalHeader()
+        for col in range(7):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        self.table.resizeColumnsToContents()
+
+        # Version strings like 2.9.28.26385 + header padding
+        min_ver_width = 160
+        # Lamp + longest status e.g. "DCS DOWN (DCS_server.exe not running)"
+        min_status_width = 290
+        for col, minimum in ((4, min_ver_width), (5, min_ver_width), (6, min_status_width)):
+            self.table.setColumnWidth(col, max(self.table.columnWidth(col), minimum))
+            header.setSectionResizeMode(col, QHeaderView.Fixed)
 
 # ==============================================================================
 # PART 5 OF 5: THREAD-SAFE SLOTS, EXPLICIT STRING IDENTITY MATCHERS & MAIN LOOPS
@@ -458,6 +474,9 @@ class MainWindow(QMainWindow):
                     
                 lbl.setText(installed_ver)
                 lbl.setStyleSheet(f"color: {cv}; font-weight: bold; background: transparent;")
+
+        # Keep Server Name fitted to longest "Name (Node vX.Y.Z)" after live updates
+        self.table.resizeColumnToContents(1)
 
     @Slot(str)
     def slot_cloud_version_updated(self, version_str):
