@@ -11,7 +11,7 @@ import json
 import logging
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QObject, Signal, Slot, QEvent, QTimer
+from PySide6.QtCore import Qt, QObject, Signal, Slot, QEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
@@ -44,7 +44,7 @@ def get_resource_path(relative_path):
 
 from dcs_ru_common import load_master_config, save_master_config, wrap_command, scrape_dcs_latest_version
 
-CONTROL_PANEL_VERSION = "2.1.11"
+CONTROL_PANEL_VERSION = "2.1.12"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
@@ -547,7 +547,7 @@ class MainWindow(QMainWindow):
             f.write(":del_loop\n")
             f.write('if exist "%EXE_PATH%" (\n')
             f.write('    del /f /q "%EXE_PATH%" >nul 2>&1\n')
-            f.write("    timeout /t 1 /nobreak > nul\n')
+            f.write("    timeout /t 1 /nobreak > nul\n")
             f.write("    goto del_loop\n")
             f.write(")\n")
             f.write('curl.exe -L --fail --retry 3 -o "%EXE_PATH%" "%DOWNLOAD_URL%"\n')
