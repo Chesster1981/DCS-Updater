@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt, QObject, Signal, Slot, QEvent, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
-    QTextEdit, QHeaderView, QMessageBox, QFrame, QCheckBox, QSizePolicy
+    QTextEdit, QHeaderView, QMessageBox, QFrame, QCheckBox, QSizePolicy, QStyle
 )
 from PySide6.QtGui import QFont, QPixmap, QIcon
 
@@ -47,8 +47,8 @@ from dcs_ru_common import load_master_config, save_master_config, wrap_command, 
 CONTROL_PANEL_VERSION = "2.1.9"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
-# Fixed window width (height may still grow with content)
-CONTROL_PANEL_WIDTH = 1100
+# Extra padding beyond layout margins when locking width to table columns
+WINDOW_WIDTH_SIDE_PAD = 8
 
 logging.basicConfig(
     level=logging.INFO,
@@ -211,8 +211,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DCS Norway Cluster Control Dashboard (Cloud Ver: Fetching...)")
-        self.resize(CONTROL_PANEL_WIDTH, 850)
-        self.setFixedWidth(CONTROL_PANEL_WIDTH)
+        self.resize(800, 850)  # temporary; locked to column sum after table load
         self.setMinimumHeight(700)
         self.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: {STYLE_TEXT_WHITE};")
         
@@ -626,6 +625,50 @@ class MainWindow(QMainWindow):
         status_width = min(status_width, 180)
         self.table.setColumnWidth(6, status_width)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.fit_window_width_to_columns()
+
+    def fit_window_width_to_columns(self):
+        """Lock window width to sum of table columns + side margins (no empty table void)."""
+        cols = sum(self.table.columnWidth(c) for c in range(self.table.columnCount()))
+        vh = self.table.verticalHeader()
+        vh_w = vh.width() if vh is not None and not vh.isHidden() else 0
+        frame = self.table.frameWidth() * 2
+        # Reserve vertical scrollbar so tall lists don't force a horizontal scroll
+        sb_w = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        margins = self.main_layout.contentsMargins()
+        table_width = (
+            cols
+            + vh_w
+            + frame
+            + sb_w
+            + margins.left()
+            + margins.right()
+            + WINDOW_WIDTH_SIDE_PAD * 2
+        )
+
+        # Don't clip header / action row if they need slightly more than the table
+        header_width = (
+            self.lbl_logo.width()
+            + self.title_wrap.sizeHint().width()
+            + self.btn_check_updates.sizeHint().width()
+            + self.header_layout.spacing() * 2
+            + 24
+            + margins.left()
+            + margins.right()
+            + WINDOW_WIDTH_SIDE_PAD * 2
+        )
+        actions_width = (
+            100 * 3
+            + max(self.admin_layout.spacing(), 0) * 2
+            + self.lbl_auth.sizeHint().width()
+            + self.ent_auth.width()
+            + self.btn_save_auth.sizeHint().width()
+            + 48
+            + margins.left()
+            + margins.right()
+            + WINDOW_WIDTH_SIDE_PAD * 2
+        )
+        self.setFixedWidth(max(table_width, header_width, actions_width))
 
 # ==============================================================================
 # PART 5 OF 5: THREAD-SAFE SLOTS, EXPLICIT STRING IDENTITY MATCHERS & MAIN LOOPS
