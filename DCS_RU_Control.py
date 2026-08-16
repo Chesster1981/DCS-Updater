@@ -194,7 +194,7 @@ class MainWindow(QMainWindow):
         self.resize(1344, 850)
         self.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: {STYLE_TEXT_WHITE};")
         
-        icon_path = get_resource_path("logo.ico")
+        icon_path = get_resource_path("Logo.ico")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
             
@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
         self.header_layout.addWidget(self.lbl_title)
         
         self.lbl_logo = QLabel()
-        logo_path = get_resource_path("logo.png")
+        logo_path = get_resource_path("Logo.png")
         if os.path.exists(logo_path):
             pix = QPixmap(logo_path)
             self.lbl_logo.setPixmap(pix.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation))
