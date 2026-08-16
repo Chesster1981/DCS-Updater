@@ -42,7 +42,13 @@ def get_resource_path(relative_path):
             return path
     return candidates[0] if candidates else relative_path
 
-from dcs_ru_common import load_master_config, save_master_config, wrap_command
+from dcs_ru_common import load_master_config, save_master_config, wrap_command, scrape_dcs_latest_version
+
+CONTROL_PANEL_VERSION = "2.1.9"
+GITHUB_REPO = "Chesster1981/DCS-Updater"
+URL_GITHUB_API = "https://api.github.com/repos/"
+# Fixed window width (height may still grow with content)
+CONTROL_PANEL_WIDTH = 1100
 
 logging.basicConfig(
     level=logging.INFO,
@@ -205,8 +211,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DCS Norway Cluster Control Dashboard (Cloud Ver: Fetching...)")
-        # Enforced 20% width increase and 25% height increase parameters explicitly
-        self.resize(1100, 850)
+        self.resize(CONTROL_PANEL_WIDTH, 850)
+        self.setFixedWidth(CONTROL_PANEL_WIDTH)
+        self.setMinimumHeight(700)
         self.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: {STYLE_TEXT_WHITE};")
         
         _icon_dir = os.path.join(
@@ -260,6 +267,17 @@ class MainWindow(QMainWindow):
         self.title_column.addStretch()
         self.header_layout.addWidget(self.title_wrap, 0, Qt.AlignVCenter)
         self.header_layout.addStretch()
+
+        self.btn_check_updates = QPushButton(" 🔄 Check for Updates ")
+        self.btn_check_updates.setCursor(Qt.PointingHandCursor)
+        self.btn_check_updates.setStyleSheet(
+            f"QPushButton {{ background-color: #2D2D30; color: {STYLE_TEXT_WHITE}; font-size: 11px; "
+            f"font-weight: bold; border-radius: 6px; padding: 10px 14px; border: 1px solid #3A3A3C; }} "
+            f"QPushButton:hover {{ background-color: #3A3A3C; }}"
+        )
+        self.btn_check_updates.clicked.connect(self.check_for_updates)
+        self.header_layout.addWidget(self.btn_check_updates, 0, Qt.AlignRight | Qt.AlignVCenter)
+
         self.main_layout.addLayout(self.header_layout)
         
         self.table = QTableWidget()
@@ -356,9 +374,159 @@ class MainWindow(QMainWindow):
                 daemon=True,
             ).start()
 
-# ==============================================================================
-# PART 4 OF 5: DATA GENERATION CONTEXTS, DIALOG MATRIX LAYOUTS & CRUD INTERCEPTS
-# ==============================================================================
+    def check_for_updates(self):
+        """Refresh DCS cloud version, re-ping nodes, and check GitHub for a newer Control Panel."""
+        self.btn_check_updates.setEnabled(False)
+        global_signals.append_log.emit("[SYSTEM] Manual update check started…")
+        threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _check_for_updates_worker(self):
+        import urllib.request
+
+        try:
+            cloud = scrape_dcs_latest_version(timeout=10.0)
+            if cloud:
+                global_signals.cloud_version_updated.emit(cloud)
+                global_signals.append_log.emit(f"[SYSTEM] Latest ED DCS version: {cloud}")
+            else:
+                global_signals.append_log.emit("[SYSTEM] Could not scrape latest ED DCS version.")
+        except Exception as e:
+            global_signals.append_log.emit(f"[SYSTEM] DCS version scrape failed: {e}")
+
+        for i, s in enumerate(list(global_servers)):
+            threading.Thread(
+                target=test_single_system_background,
+                args=(i, s["ip"], s["port"], self),
+                daemon=True,
+            ).start()
+        global_signals.append_log.emit(f"[SYSTEM] Re-pinged {len(global_servers)} node(s).")
+
+        try:
+            url = f"{URL_GITHUB_API}{GITHUB_REPO}/releases/latest"
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "DCS-Norway-Control-Panel",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=12) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            latest = str(data.get("tag_name", "")).lstrip("v").strip()
+            global_signals.append_log.emit(
+                f"[SYSTEM] Control Panel v{CONTROL_PANEL_VERSION} | GitHub latest v{latest or '?'}"
+            )
+            download_url = None
+            for asset in data.get("assets", []):
+                name = str(asset.get("name", "")).lower()
+                if "remote.updater.control.panel.exe" in name:
+                    download_url = asset.get("browser_download_url")
+                    break
+            QTimer.singleShot(0, lambda: self._finish_update_check(latest, download_url))
+        except Exception as e:
+            global_signals.append_log.emit(f"[SYSTEM] GitHub check failed: {e}")
+            QTimer.singleShot(0, lambda: self.btn_check_updates.setEnabled(True))
+
+    def _finish_update_check(self, latest: str, download_url):
+        self.btn_check_updates.setEnabled(True)
+        if not latest:
+            QMessageBox.warning(self, "Update Check", "Could not read latest GitHub release tag.")
+            return
+        if latest == CONTROL_PANEL_VERSION:
+            QMessageBox.information(
+                self,
+                "Update Check",
+                f"Control Panel is up to date (v{CONTROL_PANEL_VERSION}).\n"
+                "Node status and ED version were refreshed.",
+            )
+            return
+        if not download_url:
+            QMessageBox.information(
+                self,
+                "Update Check",
+                f"GitHub has v{latest}, but no Control Panel asset was found.\n"
+                f"You are on v{CONTROL_PANEL_VERSION}.",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "Update Available",
+            f"A newer Control Panel is available: v{latest}\n"
+            f"(you have v{CONTROL_PANEL_VERSION})\n\n"
+            "Download and install now?",
+        )
+        if reply == QMessageBox.Yes:
+            threading.Thread(
+                target=self._swap_control_panel_binary,
+                args=(download_url,),
+                daemon=True,
+            ).start()
+
+    def _swap_control_panel_binary(self, download_url: str):
+        """Replace this exe in-place and relaunch (compiled builds only)."""
+        import subprocess
+
+        if not getattr(sys, "frozen", False):
+            global_signals.append_log.emit(
+                "[SYSTEM] App update swap only works from the compiled .exe (not python script)."
+            )
+            QTimer.singleShot(
+                0,
+                lambda: QMessageBox.information(
+                    self,
+                    "Update",
+                    "Run the compiled Control Panel .exe to install updates automatically.\n"
+                    f"Download manually:\n{download_url}",
+                ),
+            )
+            return
+
+        current_exe = os.path.abspath(sys.executable)
+        appdata = os.environ.get("APPDATA") or os.path.dirname(current_exe)
+        work_dir = os.path.join(appdata, "DCS_Norway_Control")
+        os.makedirs(work_dir, exist_ok=True)
+        bat_path = os.path.join(work_dir, "update_control_panel.bat")
+        exe_name = os.path.basename(current_exe)
+        exe_dir = os.path.dirname(current_exe)
+        clean_url = download_url.replace(",", ".")
+
+        global_signals.append_log.emit("[SYSTEM] Downloading Control Panel update…")
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write("@echo off\n")
+            f.write("setlocal\n")
+            f.write(f'set "EXE_PATH={current_exe}"\n')
+            f.write(f'set "EXE_DIR={exe_dir}"\n')
+            f.write(f'set "EXE_NAME={exe_name}"\n')
+            f.write(f'set "DOWNLOAD_URL={clean_url}"\n')
+            f.write('cd /d "%EXE_DIR%"\n')
+            f.write('taskkill /f /im "%EXE_NAME%" >nul 2>&1\n')
+            f.write("timeout /t 3 /nobreak > nul\n")
+            f.write(":del_loop\n")
+            f.write('if exist "%EXE_PATH%" (\n')
+            f.write('    del /f /q "%EXE_PATH%" >nul 2>&1\n')
+            f.write("    timeout /t 1 /nobreak > nul\n")
+            f.write("    goto del_loop\n")
+            f.write(")\n")
+            f.write('curl.exe -L --fail --retry 3 -o "%EXE_PATH%" "%DOWNLOAD_URL%"\n')
+            f.write("if errorlevel 1 (\n")
+            f.write(
+                "    powershell -NoProfile -Command "
+                "\"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+                "Invoke-WebRequest -Uri '%DOWNLOAD_URL%' -OutFile '%EXE_PATH%' -MaximumRedirection 5\"\n"
+            )
+            f.write(")\n")
+            f.write('if not exist "%EXE_PATH%" ( echo Download failed & pause & exit /b 1 )\n')
+            f.write('start "" "%EXE_PATH%"\n')
+            f.write("timeout /t 2 /nobreak > nul\n")
+            f.write('del "%~f0"\n')
+            f.write("exit\n")
+
+        subprocess.Popen(f'cmd.exe /c start /b "" "{bat_path}"', shell=True)
+        QTimer.singleShot(0, self.close)
+
+    # ==============================================================================
+    # PART 4 OF 5: DATA GENERATION CONTEXTS, DIALOG MATRIX LAYOUTS & CRUD INTERCEPTS
+    # ==============================================================================
     def show_form_dialog(self, edit_mode=False):
         if edit_mode and self.selected_row_index is None:
             QMessageBox.warning(self, "Selection Error", "Please select a server row first.")
