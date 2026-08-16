@@ -205,16 +205,26 @@ class MainWindow(QMainWindow):
         self.main_layout.setSpacing(15)
         
         self.header_layout = QHBoxLayout()
-        self.lbl_title = QLabel("DCS Norway Remote Update Control Panel")
-        self.lbl_title.setFont(QFont("Arial", 28, QFont.Bold))
-        self.header_layout.addWidget(self.lbl_title)
-        
+        self.header_layout.setSpacing(16)
+
         self.lbl_logo = QLabel()
         logo_path = get_resource_path("Logo.png")
         if os.path.exists(logo_path):
             pix = QPixmap(logo_path)
-            self.lbl_logo.setPixmap(pix.scaled(150, 150, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        self.header_layout.addWidget(self.lbl_logo, 0, Qt.AlignRight | Qt.AlignVCenter)
+            self.lbl_logo.setPixmap(pix.scaled(120, 120, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.header_layout.addWidget(self.lbl_logo, 0, Qt.AlignLeft | Qt.AlignVCenter)
+
+        self.title_column = QVBoxLayout()
+        self.title_column.setSpacing(2)
+        self.lbl_title = QLabel("DCS Norway")
+        self.lbl_title.setFont(QFont("Arial", 28, QFont.Bold))
+        self.lbl_subtitle = QLabel("Remote Update Control Panel")
+        self.lbl_subtitle.setFont(QFont("Arial", 16))
+        self.lbl_subtitle.setStyleSheet(f"color: {STYLE_TEXT_MUTED};")
+        self.title_column.addWidget(self.lbl_title)
+        self.title_column.addWidget(self.lbl_subtitle)
+        self.title_column.addStretch()
+        self.header_layout.addLayout(self.title_column, 1)
         self.main_layout.addLayout(self.header_layout)
         
         self.table = QTableWidget()
