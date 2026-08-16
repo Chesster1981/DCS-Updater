@@ -25,7 +25,7 @@ from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.1"
+CURRENT_NODE_VERSION = "2.1.2"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -711,8 +711,13 @@ def setup_tray_icon():
         pystray.MenuItem('Exit Node', lambda icon, item: (icon.stop(), root.after(0, root.destroy)))
     )
     global tray_icon
-    logo_path = get_resource_path("logo.png")
-    img_asset = Image.open(logo_path) if os.path.exists(logo_path) else create_tray_image()
+    logo_path = get_resource_path("Logo.png")
+    if os.path.exists(logo_path):
+        raw = Image.open(logo_path).convert("RGBA").resize((64, 64), Image.Resampling.LANCZOS)
+        bg = Image.new("RGBA", raw.size, (28, 28, 31, 255))
+        img_asset = Image.alpha_composite(bg, raw)
+    else:
+        img_asset = create_tray_image()
     tray_icon = pystray.Icon("dcs_node", img_asset, "DCS Norway Remote Updater Node", menu)
     threading.Thread(target=tray_icon.run, daemon=True).start()
 
@@ -723,14 +728,8 @@ def setup_tray_icon():
 # =========================================================================
 root = tk.Tk()
 root.title(f"DCS Norway Remote Updater Node (v{CURRENT_NODE_VERSION})")
-root.geometry("540x580")
+root.geometry("560x580")
 root.configure(bg="#1C1C1F")
-
-try:
-    icon_path = get_resource_path("logo.ico")
-    if os.path.exists(icon_path): root.iconbitmap(icon_path)
-except: 
-    pass
 
 root.protocol('WM_DELETE_WINDOW', lambda: root.withdraw())
 
@@ -738,28 +737,92 @@ frame_main = tk.Frame(root, bg="#1C1C1F")
 top_bar = tk.Frame(frame_main, bg="#1C1C1F")
 top_bar.pack(fill="x", padx=15, pady=(15, 10))
 
+# Left: logo + two-line title (aligned like Control Panel)
 left_column = tk.Frame(top_bar, bg="#1C1C1F")
-left_column.pack(side="left", fill="y", anchor="nw")
+left_column.pack(side="left", fill="y", anchor="w")
 
-tk.Label(left_column, text="DCS Norway Remote Updater Node", font=("Arial", 14, "bold"), fg="white", bg="#1C1C1F").pack(anchor="w")
-tk.Button(left_column, text=" 🚀 RUN LOCAL UPDATE NOW", font=("Arial", 10, "bold"), bg="#0A84FF", fg="white", padx=15, pady=8, command=trigger_local_update, relief="flat", cursor="hand2").pack(anchor="w", pady=(15, 0))
+header_row = tk.Frame(left_column, bg="#1C1C1F")
+header_row.pack(anchor="w")
 
+lbl_logo = tk.Label(header_row, bg="#1C1C1F", bd=0)
+lbl_logo.pack(side="left", padx=(0, 12))
+
+title_column = tk.Frame(header_row, bg="#1C1C1F")
+title_column.pack(side="left", fill="y")
+tk.Frame(title_column, bg="#1C1C1F").pack(expand=True, fill="both")
+tk.Label(
+    title_column,
+    text="DCS Norway",
+    font=("Arial", 18, "bold"),
+    fg="white",
+    bg="#1C1C1F",
+).pack(anchor="w")
+tk.Label(
+    title_column,
+    text="Remote Updater Node",
+    font=("Arial", 11),
+    fg="#8E8E93",
+    bg="#1C1C1F",
+).pack(anchor="w", pady=(2, 0))
+tk.Frame(title_column, bg="#1C1C1F").pack(expand=True, fill="both")
+
+try:
+    icon_path = get_resource_path("Logo.ico")
+    if os.path.exists(icon_path):
+        root.iconbitmap(icon_path)
+except Exception:
+    pass
+
+try:
+    logo_path = get_resource_path("Logo.png")
+    if os.path.exists(logo_path):
+        img_raw = Image.open(logo_path).convert("RGBA")
+        img_scaled = img_raw.resize((88, 88), Image.Resampling.LANCZOS)
+        # Composite onto app background so alpha looks correct in Tk
+        bg = Image.new("RGBA", img_scaled.size, (28, 28, 31, 255))
+        img_comp = Image.alpha_composite(bg, img_scaled)
+        img_logo = ImageTk.PhotoImage(img_comp)
+        lbl_logo.configure(image=img_logo)
+        lbl_logo.image = img_logo
+except Exception:
+    pass
+
+# Right: Settings on top, green Run Local Update below
 right_column = tk.Frame(top_bar, bg="#1C1C1F")
 right_column.pack(side="right", fill="y", anchor="ne")
 
-tk.Button(right_column, text=" ⚙️ Settings", font=("Arial", 9, "bold"), bg="#2D2D30", fg="white", padx=12, pady=4, command=show_settings_frame, relief="flat").pack(anchor="e")
+tk.Button(
+    right_column,
+    text=" ⚙️ Settings",
+    font=("Arial", 9, "bold"),
+    bg="#2D2D30",
+    fg="white",
+    padx=12,
+    pady=4,
+    command=show_settings_frame,
+    relief="flat",
+    bd=0,
+    highlightthickness=0,
+    cursor="hand2",
+).pack(anchor="e")
 
-try:
-    logo_path = get_resource_path("logo.png")
-    if os.path.exists(logo_path):
-        img_raw = Image.open(logo_path)
-        img_scaled = img_raw.resize((75, 75), Image.Resampling.LANCZOS)
-        img_logo = ImageTk.PhotoImage(img_scaled)
-        lbl_logo = tk.Label(right_column, image=img_logo, bg="#1C1C1F")
-        lbl_logo.image = img_logo
-        lbl_logo.pack(anchor="e", pady=(15, 0))
-except: 
-    pass
+btn_local_update = tk.Button(
+    right_column,
+    text=" 🚀 RUN LOCAL UPDATE NOW",
+    font=("Arial", 10, "bold"),
+    bg="#00912E",
+    fg="white",
+    activebackground="#00B339",
+    activeforeground="white",
+    padx=16,
+    pady=10,
+    command=trigger_local_update,
+    relief="flat",
+    bd=0,
+    highlightthickness=0,
+    cursor="hand2",
+)
+btn_local_update.pack(anchor="e", pady=(12, 0))
 
 tk.Label(frame_main, text="Activity Log:", font=("Arial", 9), fg="#8E8E93", bg="#1C1C1F").pack(anchor="w", padx=15, pady=(15, 0))
 log_window = scrolledtext.ScrolledText(frame_main, width=64, height=12, font=("Consolas", 9), bg="#111112", fg="#30D158", insertbackground="white")
