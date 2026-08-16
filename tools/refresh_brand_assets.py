@@ -35,12 +35,60 @@ def _chunk_b64(data: bytes, width: int = 76) -> str:
     return "\n".join(f'    "{part}"' for part in parts)
 
 
+def _is_light(r: int, g: int, b: int) -> bool:
+    return r >= 215 and g >= 215 and b >= 215 and abs(r - g) <= 25 and abs(g - b) <= 25
+
+
+def prepare_logo_alpha(im: Image.Image) -> Image.Image:
+    """
+    Export cleanup for circular brand marks:
+    - Outside the ring: transparent (keeps jet nose that protrudes)
+    - Inside the ring: leave artwork as-is (including white sky)
+    """
+    import math
+
+    im = im.convert("RGBA")
+    w, h = im.size
+    pix = im.load()
+    cx, cy = w / 2, h / 2
+
+    radii = []
+    for angle in range(0, 360, 2):
+        rad = math.radians(angle)
+        for d in range(min(w, h) // 2, max(40, min(w, h) // 8), -1):
+            x = int(cx + d * math.cos(rad))
+            y = int(cy + d * math.sin(rad))
+            if not (0 <= x < w and 0 <= y < h):
+                continue
+            r, g, b, a = pix[x, y]
+            if not _is_light(r, g, b) and (r + g + b) > 30:
+                radii.append(d)
+                break
+    if not radii:
+        return im
+    outer_r = sorted(radii)[len(radii) // 2]
+
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pix[x, y]
+            dist = math.hypot(x - cx, y - cy)
+            if dist <= outer_r + 2:
+                continue
+            # Outside ring: clear light export background only
+            if _is_light(r, g, b) or (r > 200 and g > 200 and b > 200):
+                pix[x, y] = (0, 0, 0, 0)
+            elif dist > outer_r + 50 and r > 180 and g > 180 and b > 180:
+                pix[x, y] = (0, 0, 0, 0)
+    return im
+
+
 def main() -> int:
     if not SRC_PNG.exists():
         print(f"ERROR: missing {SRC_PNG}", file=sys.stderr)
         return 1
 
-    im = Image.open(SRC_PNG).convert("RGBA")
+    im = prepare_logo_alpha(Image.open(SRC_PNG))
+    im.save(SRC_PNG)  # persist cleaned master
     ui = im.resize((256, 256), Image.Resampling.LANCZOS)
 
     png_buf = io.BytesIO()
