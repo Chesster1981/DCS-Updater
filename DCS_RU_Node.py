@@ -25,7 +25,7 @@ from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.2"
+CURRENT_NODE_VERSION = "2.1.3"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
