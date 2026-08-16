@@ -1,0 +1,19 @@
+---
+description: Always publish a new GitHub release tag after finishing code changes
+alwaysApply: true
+---
+
+# Release after code changes
+
+When you finish a batch of code changes for this project (DCS Updater):
+
+1. Bump `CONTROL_PANEL_VERSION` and `CURRENT_NODE_VERSION` together (semver patch unless the change warrants minor/major).
+2. Rebuild both PyInstaller apps (Node + Control Panel) and copy to the dotted release filenames under `dist/`.
+3. Commit the source changes (not `dist/`, not `__pycache__/`, not build artifacts).
+4. Create and push an annotated git tag `vX.Y.Z` matching the bumped versions.
+5. Publish a GitHub release with `gh release create` attaching:
+   - `dist/DCS.Norway.Remote.Updater.Node.exe`
+   - `dist/DCS.Norway.Remote.Updater.Control.Panel.exe`
+6. Return the release URL when done.
+
+Do this automatically at the end of the work — do not wait to be asked for a release tag unless the user explicitly says to skip the release.
