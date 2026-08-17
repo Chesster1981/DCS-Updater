@@ -57,6 +57,12 @@ NODE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "dcs_server_process_names": [],
 }
 
+NODE_LOCAL_ONLY_SETTING_KEYS = (
+    "dcs_main_folder",
+    "dcs_server_exe",
+    "dcs_server_process_names",
+)
+
 NODE_GITHUB_INTERVAL_CHOICES: tuple[tuple[int, str], ...] = (
     (600, "Every 10 minutes"),
     (3600, "Every 1 Hour"),
@@ -93,8 +99,12 @@ def github_interval_seconds(label: str) -> int:
 def sanitize_node_settings(
     incoming: Optional[dict] = None,
     existing: Optional[dict] = None,
+    remote: bool = False,
 ) -> dict[str, Any]:
-    """Merge known Node settings with defaults. Unknown keys on existing are kept."""
+    """Merge known Node settings with defaults. Unknown keys on existing are kept.
+
+    Path/exe settings are local-only: a remote payload cannot overwrite them.
+    """
     merged: dict[str, Any] = dict(NODE_SETTINGS_DEFAULTS)
     if isinstance(existing, dict):
         for key, value in existing.items():
@@ -110,6 +120,8 @@ def sanitize_node_settings(
     }
     for key in NODE_SETTINGS_DEFAULTS:
         if key not in incoming:
+            continue
+        if remote and key in NODE_LOCAL_ONLY_SETTING_KEYS:
             continue
         value = incoming[key]
         if key in bool_keys:

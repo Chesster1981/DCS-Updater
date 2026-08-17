@@ -52,12 +52,13 @@ from dcs_ru_common import (
     github_api_headers,
     NODE_SETTINGS_DEFAULTS,
     NODE_GITHUB_INTERVAL_CHOICES,
+    NODE_LOCAL_ONLY_SETTING_KEYS,
     github_interval_label,
     github_interval_seconds,
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.47"
+CONTROL_PANEL_VERSION = "2.1.48"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -610,7 +611,7 @@ class MainWindow(QMainWindow):
         d = global_servers[self.selected_row_index]
         self.dialog = QDialog(self)
         self.dialog.setWindowTitle("Edit Server")
-        self.dialog.resize(540, 720)
+        self.dialog.resize(540, 620)
         self.dialog.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: white;")
         outer = QVBoxLayout(self.dialog)
 
@@ -639,25 +640,13 @@ class MainWindow(QMainWindow):
         self.lbl_node_settings_status.setWordWrap(True)
         node_form.addRow(self.lbl_node_settings_status)
 
-        self.ent_node_dcs = QLineEdit()
         self.ent_node_bind = QLineEdit()
         self.ent_node_auth = QLineEdit()
         self.ent_node_auth.setEchoMode(QLineEdit.Password)
-        self.ent_node_exe = QLineEdit()
-        self.ent_node_process_names = QLineEdit()
-        for ent in (
-            self.ent_node_dcs,
-            self.ent_node_bind,
-            self.ent_node_auth,
-            self.ent_node_exe,
-            self.ent_node_process_names,
-        ):
+        for ent in (self.ent_node_bind, self.ent_node_auth):
             ent.setStyleSheet(self._dialog_input_style())
-        self.ent_node_dcs.setPlaceholderText(r"D:\DCS")
         self.ent_node_bind.setPlaceholderText("LAN IP (not 0.0.0.0)")
         self.ent_node_auth.setPlaceholderText("Same token as Control Panel")
-        self.ent_node_exe.setPlaceholderText("Optional override, e.g. DCS_server.exe")
-        self.ent_node_process_names.setPlaceholderText("Optional extra names, comma-separated")
 
         self.cmb_github_interval = QComboBox()
         for _seconds, label in NODE_GITHUB_INTERVAL_CHOICES:
@@ -678,17 +667,18 @@ class MainWindow(QMainWindow):
         for chk in (self.chk_preserve, self.chk_reboot, self.chk_watchdog, self.chk_auto_restart):
             chk.setChecked(True)
 
-        node_form.addRow("DCS Main Folder:", self.ent_node_dcs)
         node_form.addRow("Bind Address:", self.ent_node_bind)
         node_form.addRow("Auth Token:", self.ent_node_auth)
         node_form.addRow("GitHub app updates:", self.cmb_github_interval)
         node_form.addRow("Watchdog interval:", self.spn_watchdog_interval)
-        node_form.addRow("DCS server exe:", self.ent_node_exe)
-        node_form.addRow("Process names:", self.ent_node_process_names)
         node_form.addRow(self.chk_preserve)
         node_form.addRow(self.chk_reboot)
         node_form.addRow(self.chk_watchdog)
         node_form.addRow(self.chk_auto_restart)
+        note = QLabel("DCS folder, server exe and process names are set locally on the Node.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {STYLE_TEXT_MUTED}; font-size: 11px;")
+        node_form.addRow(note)
         layout.addWidget(node_box)
 
         scroll.setWidget(body)
@@ -723,15 +713,8 @@ class MainWindow(QMainWindow):
 
     def _fill_node_settings_form(self, settings: dict):
         data = sanitize_node_settings(settings, NODE_SETTINGS_DEFAULTS)
-        self.ent_node_dcs.setText(str(data.get("dcs_main_folder", "")))
         self.ent_node_bind.setText(str(data.get("bind_address", "0.0.0.0")))
         self.ent_node_auth.setText(str(data.get("auth_token", "")))
-        self.ent_node_exe.setText(str(data.get("dcs_server_exe", "")))
-        names = data.get("dcs_server_process_names") or []
-        if isinstance(names, list):
-            self.ent_node_process_names.setText(", ".join(str(n) for n in names if n))
-        else:
-            self.ent_node_process_names.setText(str(names))
         self.cmb_github_interval.setCurrentText(github_interval_label(data.get("github_check_interval")))
         try:
             self.spn_watchdog_interval.setValue(int(data.get("watchdog_interval_seconds") or 300))
@@ -744,7 +727,6 @@ class MainWindow(QMainWindow):
 
     def _collect_node_settings_from_form(self):
         return {
-            "dcs_main_folder": self.ent_node_dcs.text().strip(),
             "network_port": self.ent_port.text().strip(),
             "bind_address": self.ent_node_bind.text().strip() or "0.0.0.0",
             "auth_token": self.ent_node_auth.text().strip(),
@@ -754,8 +736,6 @@ class MainWindow(QMainWindow):
             "watchdog_interval_seconds": self.spn_watchdog_interval.value(),
             "auto_restart_dcs": self.chk_auto_restart.isChecked(),
             "preserve_mission_scripting": self.chk_preserve.isChecked(),
-            "dcs_server_exe": self.ent_node_exe.text().strip(),
-            "dcs_server_process_names": self.ent_node_process_names.text().strip(),
         }
 
     def _on_node_settings_loaded(self, answer):
@@ -885,7 +865,9 @@ class MainWindow(QMainWindow):
             self.dialog.close()
             return
 
-        settings = sanitize_node_settings(self._collect_node_settings_from_form())
+        settings = sanitize_node_settings(self._collect_node_settings_from_form(), remote=True)
+        for key in NODE_LOCAL_ONLY_SETTING_KEYS:
+            settings.pop(key, None)
         payload = "SET_SETTINGS " + json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
         self.btn_push.setEnabled(False)
         self.lbl_node_settings_status.setText("Pushing settings to the Node...")

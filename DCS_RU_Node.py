@@ -59,7 +59,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.47"
+CURRENT_NODE_VERSION = "2.1.48"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -1207,7 +1207,7 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                             conn.close()
                         else:
                             existing = load_node_settings()
-                            merged = sanitize_node_settings(incoming, existing)
+                            merged = sanitize_node_settings(incoming, existing, remote=True)
                             old_port = str(existing.get("network_port", "1015"))
                             old_bind = str(existing.get("bind_address", "0.0.0.0"))
                             write_node_settings_file(merged)
