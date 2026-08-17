@@ -31,7 +31,7 @@ from brand_assets import (
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.16"
+CURRENT_NODE_VERSION = "2.1.17"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -41,13 +41,19 @@ is_listening = False
 tray_icon = None
 
 DCS_CLIENT_PROCESS = "DCS.exe"
+# On disk in bin\ — this is what Node STARTS (underscore is the usual filename).
 DCS_SERVER_PROCESS_DEFAULT = "DCS_server.exe"
-# Common dedicated-server executable names across DCS builds/branches
-DCS_SERVER_KNOWN_NAMES = (
-    "DCS_server.exe",
+DCS_SERVER_EXE_FILENAMES = (
+    DCS_SERVER_PROCESS_DEFAULT,
     "DCS.server.exe",
     "DCS.dcs_serverrelease.exe",
 )
+# Runtime names — Task Manager often shows "DCS.server" while the file is DCS_server.exe.
+DCS_SERVER_PROCESS_STEMS = frozenset({
+    "dcs_server",              # tasklist image for DCS_server.exe
+    "dcs.server",              # Task Manager label on many installs
+    "dcs.dcs_serverrelease",   # release-branch installs
+})
 DCS_PROCESSES = [DCS_CLIENT_PROCESS, DCS_SERVER_PROCESS_DEFAULT]
 WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
 DCS_PORT_BASE = 10300
@@ -338,7 +344,7 @@ def check_active_processes_running():
         for image, _pid in iter_tasklist_processes():
             if normalize_process_name(image) == normalize_process_name(DCS_CLIENT_PROCESS):
                 return True
-            if is_dcs_server_image_name(image, extras):
+            if is_dcs_server_process_stem(process_name_stem(image), extras):
                 return True
     except Exception:
         pass
@@ -371,6 +377,21 @@ def normalize_process_name(name: str) -> str:
     return n
 
 
+def process_name_stem(name: str) -> str:
+    n = normalize_process_name(name)
+    return n[:-4] if n.endswith(".exe") else n
+
+
+def task_manager_label_for_exe(filename: str) -> str:
+    """Map on-disk exe name to the label operators see in Task Manager."""
+    base = os.path.basename(str(filename or ""))
+    if base.lower() == DCS_SERVER_PROCESS_DEFAULT.lower():
+        return "DCS.server"
+    if base.lower().endswith(".exe"):
+        return base[:-4]
+    return base or "DCS.server"
+
+
 def _config_server_name_extras(config=None) -> list[str]:
     cfg = config if config is not None else load_node_settings()
     extras = []
@@ -383,20 +404,29 @@ def _config_server_name_extras(config=None) -> list[str]:
     return extras
 
 
-def is_dcs_server_image_name(name: str, extra_names=None) -> bool:
-    """
-    Match dedicated-server executables across DCS builds.
-    Examples: DCS_server.exe, DCS.server.exe, DCS.dcs_serverrelease.exe
-    Excludes the DCS client (DCS.exe).
-    """
+def is_dcs_server_exe_filename(name: str, extra_names=None) -> bool:
+    """Match dedicated-server executable filenames on disk (not Task Manager labels)."""
     n = normalize_process_name(name)
     if not n or n == normalize_process_name(DCS_CLIENT_PROCESS):
         return False
-    for candidate in list(DCS_SERVER_KNOWN_NAMES) + list(extra_names or []):
+    for candidate in list(DCS_SERVER_EXE_FILENAMES) + list(extra_names or []):
         if n == normalize_process_name(candidate):
             return True
-    stem = n[:-4] if n.endswith(".exe") else n
-    return stem.startswith("dcs") and "server" in stem
+    stem = process_name_stem(n)
+    return stem in DCS_SERVER_PROCESS_STEMS
+
+
+def is_dcs_server_process_stem(stem: str, extra_names=None) -> bool:
+    """Match runtime process names/stems such as DCS.server or DCS_server."""
+    s = process_name_stem(stem)
+    if not s or s == "dcs":
+        return False
+    if s in DCS_SERVER_PROCESS_STEMS:
+        return True
+    for extra in extra_names or []:
+        if s == process_name_stem(extra):
+            return True
+    return s.startswith("dcs") and "server" in s
 
 
 def iter_tasklist_processes():
@@ -422,16 +452,64 @@ def iter_tasklist_processes():
             yield image, pid
 
 
+def iter_windows_processes():
+    """
+    Yield (image_name, pid, executable_path).
+    ExecutablePath is the reliable link between DCS_server.exe on disk and DCS.server in Task Manager.
+    """
+    if sys.platform != "win32":
+        yield from ((image, pid, "") for image, pid in iter_tasklist_processes())
+        return
+    ps_cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object Name,ProcessId,ExecutablePath | "
+        "ConvertTo-Json -Compress"
+    )
+    try:
+        raw = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            text=True,
+            errors="ignore",
+            timeout=20,
+        ).strip()
+        if raw:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                data = [data]
+            for item in data:
+                image = str(item.get("Name") or "")
+                pid = item.get("ProcessId")
+                path = str(item.get("ExecutablePath") or "")
+                if pid is not None:
+                    yield image, int(pid), path
+            return
+    except Exception as e:
+        logging.debug("Win32_Process query failed, falling back to tasklist: %s", e)
+    for image, pid in iter_tasklist_processes():
+        yield image, pid, ""
+
+
 def list_running_dcs_server_processes(config=None):
+    """
+    Return [(task_manager_label, pid, kill_image), ...].
+    kill_image is the real exe filename used by taskkill (e.g. DCS_server.exe).
+    """
     extras = _config_server_name_extras(config)
     seen = set()
     matches = []
-    for image, pid in iter_tasklist_processes():
+    for image, pid, exe_path in iter_windows_processes():
         if pid in seen:
             continue
-        if is_dcs_server_image_name(image, extras):
-            seen.add(pid)
-            matches.append((image, pid))
+        exe_file = os.path.basename(exe_path) if exe_path else image
+        stem = process_name_stem(image or exe_file)
+        by_path = bool(exe_path) and is_dcs_server_exe_filename(exe_file, extras)
+        by_stem = is_dcs_server_process_stem(stem, extras)
+        if not (by_path or by_stem):
+            continue
+        seen.add(pid)
+        label = task_manager_label_for_exe(exe_file if exe_path else stem)
+        kill_image = exe_file or image
+        matches.append((label, pid, kill_image))
     return matches
 
 
@@ -466,7 +544,7 @@ def get_pids_listening_on_port(port: int) -> list[int]:
 
 
 def discover_dcs_server_executables(bin_folder: str, config=None) -> list[str]:
-    """Find dedicated-server executables in the DCS bin folder."""
+    """Find dedicated-server executables in the DCS bin folder (disk names, not Task Manager labels)."""
     cfg = config if config is not None else load_node_settings()
     extras = _config_server_name_extras(cfg)
     if not os.path.isdir(bin_folder):
@@ -488,7 +566,7 @@ def discover_dcs_server_executables(bin_folder: str, config=None) -> list[str]:
     for fname in sorted(os.listdir(bin_folder)):
         if not fname.lower().endswith(".exe"):
             continue
-        if is_dcs_server_image_name(fname, extras):
+        if is_dcs_server_exe_filename(fname, extras):
             discovered.append(os.path.join(bin_folder, fname))
     return discovered
 
@@ -505,7 +583,9 @@ def describe_running_dcs_server_processes(config=None) -> str:
     matches = list_running_dcs_server_processes(config)
     if not matches:
         return "no dedicated-server process"
-    return ", ".join(f"{name} (pid {pid})" for name, pid in matches)
+    return ", ".join(
+        f"{label} ({kill_image} pid {pid})" for label, pid, kill_image in matches
+    )
 
 
 def has_dcs_crash_dialog() -> bool:
@@ -614,7 +694,10 @@ def start_dcs_server_process():
         return False
 
     try:
-        append_activity_log(f"[WATCHDOG] Starting {exe_name} from {bin_folder}...")
+        label = task_manager_label_for_exe(exe_name)
+        append_activity_log(
+            f"[WATCHDOG] Starting {label} via {exe_name} from {bin_folder}..."
+        )
         ps_cmd = (
             f"Start-Process -FilePath '{exe_path}' "
             f"-WorkingDirectory '{bin_folder}'"
@@ -650,19 +733,19 @@ def force_kill_dcs_server(node_port=None):
             except Exception as e:
                 logging.debug("Taskkill pid %s failed: %s", pid, e)
 
-    for image, pid in list_running_dcs_server_processes(config):
+    for _label, pid, kill_image in list_running_dcs_server_processes(config):
         if pid in killed:
             continue
         try:
             subprocess.run(
-                f'taskkill /f /im "{image}"',
+                f'taskkill /f /im "{kill_image}"',
                 shell=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
             killed.add(pid)
         except Exception as e:
-            logging.debug("Taskkill on %s failed: %s", image, e)
+            logging.debug("Taskkill on %s failed: %s", kill_image, e)
 
 
 def attempt_dcs_auto_restart(health: str, node_port) -> bool:
@@ -772,7 +855,9 @@ def force_kill_core_dcs():
     killed_images = set()
     for image, _pid in iter_tasklist_processes():
         n = normalize_process_name(image)
-        if n == normalize_process_name(DCS_CLIENT_PROCESS) or is_dcs_server_image_name(image, extras):
+        if n == normalize_process_name(DCS_CLIENT_PROCESS) or is_dcs_server_process_stem(
+            process_name_stem(image), extras
+        ):
             if n in killed_images:
                 continue
             killed_images.add(n)
