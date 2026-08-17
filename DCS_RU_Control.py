@@ -42,9 +42,15 @@ def get_resource_path(relative_path):
             return path
     return candidates[0] if candidates else relative_path
 
-from dcs_ru_common import load_master_config, save_master_config, wrap_command, scrape_dcs_latest_version
+from dcs_ru_common import (
+    load_master_config,
+    save_master_config,
+    wrap_command,
+    scrape_dcs_latest_version,
+    github_api_headers,
+)
 
-CONTROL_PANEL_VERSION = "2.1.22"
+CONTROL_PANEL_VERSION = "2.1.23"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
@@ -420,13 +426,7 @@ class MainWindow(QMainWindow):
 
         try:
             url = f"{URL_GITHUB_API}{GITHUB_REPO}/releases/latest"
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "User-Agent": "DCS-Norway-Control-Panel",
-                    "Accept": "application/vnd.github.v3+json",
-                },
-            )
+            req = urllib.request.Request(url, headers=github_api_headers("DCS-Norway-Control-Panel"))
             with urllib.request.urlopen(req, timeout=12) as response:
                 data = json.loads(response.read().decode("utf-8"))
             latest = str(data.get("tag_name", "")).lstrip("v").strip()

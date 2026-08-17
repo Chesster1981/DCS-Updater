@@ -15,6 +15,7 @@ from dcs_ru_common import (
     DCS_UPDATE_URLS,
     VERSION_PATTERNS,
     get_discord_bot_token,
+    github_api_headers,
     load_master_config,
     save_master_config,
     wrap_command,
@@ -24,7 +25,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.22"
+CURRENT_BOT_VERSION = "2.1.23"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -161,10 +162,7 @@ class DCSClusterBot(commands.Bot):
         """Compare GitHub latest release and install source files if newer."""
         if self._self_updating or getattr(sys, "frozen", False):
             return
-        headers = {
-            "User-Agent": "DCS-Norway-Discord-Bot",
-            "Accept": "application/vnd.github.v3+json",
-        }
+        headers = github_api_headers("DCS-Norway-Discord-Bot")
         url = f"{URL_GITHUB_API}{GITHUB_REPO}/releases/latest"
         try:
             async with aiohttp.ClientSession(headers=headers) as session:
@@ -187,7 +185,8 @@ class DCSClusterBot(commands.Bot):
 
             downloads = {}
             assets = {str(a.get("name", "")): a.get("browser_download_url") for a in data.get("assets") or []}
-            async with aiohttp.ClientSession(headers={"User-Agent": "DCS-Norway-Discord-Bot"}) as session:
+            download_headers = github_api_headers("DCS-Norway-Discord-Bot")
+            async with aiohttp.ClientSession(headers=download_headers) as session:
                 for filename in BOT_SELF_UPDATE_FILES:
                     content = None
                     asset_url = assets.get(filename)

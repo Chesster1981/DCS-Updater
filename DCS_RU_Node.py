@@ -21,7 +21,12 @@ import pystray
 import urllib.request
 import urllib.error
 
-from dcs_ru_common import parse_authenticated_command, scrape_dcs_latest_version, wrap_command
+from dcs_ru_common import (
+    parse_authenticated_command,
+    scrape_dcs_latest_version,
+    wrap_command,
+    github_api_headers,
+)
 from brand_assets import (
     BRAND_ASSET_VERSION,
     BRAND_PNG_MD5,
@@ -50,7 +55,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.22"
+CURRENT_NODE_VERSION = "2.1.23"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -275,10 +280,10 @@ def check_for_github_node_updates_silent():
         clean_api_base = URL_GITHUB_API.replace(",", ".")
         url = f"{clean_api_base}{GITHUB_REPO}/releases/latest"
         
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept": "application/vnd.github.v3+json"
-        })
+        req = urllib.request.Request(
+            url,
+            headers=github_api_headers("DCS-Norway-Remote-Updater-Node"),
+        )
         append_activity_log("[SYSTEM] Connecting to GitHub API...")
         with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))

@@ -4,6 +4,7 @@ Shared helpers for DCS Norway Remote Updater (Control, Node, Discord Bot).
 - Unified master_config schema
 - TCP command auth wrapping
 - DCS version scraping with primary + fallback URLs
+- .env loading and GitHub API auth headers
 """
 from __future__ import annotations
 
@@ -11,6 +12,7 @@ import json
 import logging
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 from typing import Any, Optional
@@ -18,6 +20,7 @@ from typing import Any, Optional
 logger = logging.getLogger("dcs_ru_common")
 
 MASTER_CONFIG_FILE = "master_config.json"
+_DOTENV_LOADED = False
 
 DCS_UPDATE_URLS = (
     "https://updates.digitalcombatsimulator.com/",
@@ -169,11 +172,103 @@ def scrape_dcs_latest_version(timeout: float = 10.0) -> Optional[str]:
     return None
 
 
+def get_app_base_dir() -> str:
+    """Directory of the running app (.exe or entry .py), for locating .env."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    main_file = getattr(sys.modules.get("__main__"), "__file__", None)
+    if main_file:
+        return os.path.dirname(os.path.abspath(main_file))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _parse_dotenv_line(line: str) -> Optional[tuple[str, str]]:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[7:].strip()
+    if "=" not in stripped:
+        return None
+    key, _, value = stripped.partition("=")
+    key = key.strip()
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    if not key:
+        return None
+    return key, value
+
+
+def load_dotenv(extra_paths: Optional[list[str]] = None) -> None:
+    """Load KEY=VALUE pairs from .env without overwriting existing env vars."""
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+
+    candidates = [
+        os.path.join(get_app_base_dir(), ".env"),
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+    ]
+    if extra_paths:
+        candidates.extend(extra_paths)
+
+    seen_paths: set[str] = set()
+    for path in candidates:
+        norm = os.path.normpath(path)
+        if norm in seen_paths or not os.path.isfile(norm):
+            continue
+        seen_paths.add(norm)
+        try:
+            with open(norm, "r", encoding="utf-8") as f:
+                for line in f:
+                    parsed = _parse_dotenv_line(line)
+                    if not parsed:
+                        continue
+                    key, value = parsed
+                    if key not in os.environ:
+                        os.environ[key] = value
+            logger.info("Loaded environment from %s", norm)
+        except Exception as e:
+            logger.warning("Could not read .env from %s: %s", norm, e)
+
+    _DOTENV_LOADED = True
+
+
+def get_github_token() -> Optional[str]:
+    """Read GitHub token from environment / .env (never from source code)."""
+    load_dotenv()
+    token = (
+        os.environ.get("GITHUB_TOKEN")
+        or os.environ.get("GH_TOKEN")
+        or os.environ.get("DCS_GITHUB_TOKEN")
+        or ""
+    ).strip()
+    return token or None
+
+
+def github_api_headers(user_agent: str = "DCS-Norway-Remote-Updater") -> dict[str, str]:
+    """Standard GitHub REST headers, with Authorization when GITHUB_TOKEN is set."""
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "application/vnd.github.v3+json",
+    }
+    token = get_github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def get_discord_bot_token() -> Optional[str]:
-    """Read Discord bot token from environment (never from source code)."""
+    """Read Discord bot token from environment / .env (never from source code)."""
+    load_dotenv()
     token = (
         os.environ.get("DISCORD_BOT_TOKEN")
         or os.environ.get("DCS_DISCORD_BOT_TOKEN")
         or ""
     ).strip()
     return token or None
+
+
+load_dotenv()
