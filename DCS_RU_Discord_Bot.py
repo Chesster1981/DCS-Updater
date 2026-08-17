@@ -25,7 +25,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.24"
+CURRENT_BOT_VERSION = "2.1.25"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -34,6 +34,7 @@ BOT_GITHUB_CHECK_HOURS = 1
 # Temporary: only DM this Discord name while testing. Set to None to notify all
 # members who can see the panel channel.
 STATUS_ALERT_TEST_USERNAME = "Chesster"
+STATUS_ALERT_TEST_NAME_ALIASES = ("Chesster", "Chesster1981")
 STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY"}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
@@ -360,12 +361,25 @@ class DCSClusterBot(commands.Bot):
         ]
         for name in names:
             lowered = name.strip().lower()
-            if lowered == wanted or lowered.startswith(wanted):
+            if not lowered:
+                continue
+            if lowered == wanted or lowered.startswith(wanted) or wanted in lowered:
+                return True
+        return False
+
+    def _member_matches_test_user(self, member):
+        for alias in STATUS_ALERT_TEST_NAME_ALIASES:
+            if self._member_matches_alert_name(member, alias):
                 return True
         return False
 
     def _describe_status_alert(self, prev, curr):
         if prev is None:
+            logger.info(
+                "Status baseline stored for %s: %s (no DM on first poll)",
+                curr.get("name"),
+                curr.get("status_text"),
+            )
             return None
 
         prev_status = prev.get("status_text") or ""
@@ -383,6 +397,14 @@ class DCSClusterBot(commands.Bot):
 
         name = curr.get("name") or "Unknown server"
         icon = curr.get("icon") or ""
+        logger.info(
+            "Status alert trigger for %s: %s -> %s (left_up_to_date=%s crashed=%s)",
+            name,
+            prev_status,
+            curr_status,
+            left_up_to_date,
+            crashed,
+        )
         lines = [f"**{name}**"]
         if crashed:
             lines.append("DCS_server.exe ser ut til å ha krasjet eller sluttet å svare.")
@@ -401,8 +423,51 @@ class DCSClusterBot(commands.Bot):
             lines.append(f"Detalj: {task_info}")
         return "\n".join(lines)
 
+    async def _collect_guild_members(self, guild):
+        members = []
+        seen = set()
+
+        def _add(member):
+            if member is None or getattr(member, "bot", False) or member.id in seen:
+                return
+            seen.add(member.id)
+            members.append(member)
+
+        if not guild.chunked:
+            try:
+                await guild.chunk()
+            except Exception as e:
+                logger.warning("Could not chunk guild members for status alerts: %s", e)
+
+        for member in guild.members:
+            _add(member)
+
+        if STATUS_ALERT_TEST_USERNAME:
+            for alias in STATUS_ALERT_TEST_NAME_ALIASES:
+                try:
+                    named = guild.get_member_named(alias)
+                    _add(named)
+                except Exception:
+                    pass
+                try:
+                    queried = await guild.query_members(query=alias, limit=10, cache=True)
+                    for member in queried:
+                        _add(member)
+                except Exception as e:
+                    logger.warning("query_members(%s) failed: %s", alias, e)
+
+            if not any(self._member_matches_test_user(member) for member in members):
+                try:
+                    async for member in guild.fetch_members(limit=None):
+                        _add(member)
+                except Exception as e:
+                    logger.warning("Could not fetch guild members for status alerts: %s", e)
+
+        return members
+
     async def _status_alert_recipients(self, guild):
         if guild is None:
+            logger.warning("Status alert skipped recipient lookup: guild is None")
             return []
 
         channel = None
@@ -411,24 +476,7 @@ class DCSClusterBot(commands.Bot):
         except Exception:
             channel = None
 
-        if not guild.chunked:
-            try:
-                await guild.chunk()
-            except Exception as e:
-                logger.warning("Could not chunk guild members for status alerts: %s", e)
-
-        members = list(guild.members)
-        if STATUS_ALERT_TEST_USERNAME and not any(
-            self._member_matches_alert_name(member, STATUS_ALERT_TEST_USERNAME)
-            for member in members
-            if not member.bot
-        ):
-            try:
-                async for member in guild.fetch_members(limit=None):
-                    members.append(member)
-            except Exception as e:
-                logger.warning("Could not fetch guild members for status alerts: %s", e)
-
+        members = await self._collect_guild_members(guild)
         recipients = []
         seen = set()
         for member in members:
@@ -438,13 +486,40 @@ class DCSClusterBot(commands.Bot):
                 perms = channel.permissions_for(member)
                 if not getattr(perms, "view_channel", False):
                     continue
-            if STATUS_ALERT_TEST_USERNAME and not self._member_matches_alert_name(
-                member, STATUS_ALERT_TEST_USERNAME
-            ):
+            if STATUS_ALERT_TEST_USERNAME and not self._member_matches_test_user(member):
                 continue
             seen.add(member.id)
             recipients.append(member)
+
+        if STATUS_ALERT_TEST_USERNAME and not recipients:
+            sample = [
+                f"{m.display_name}/{m.name}"
+                for m in members[:12]
+                if not m.bot
+            ]
+            logger.warning(
+                "No DM recipient matching %s in guild '%s' (%s cached members). Sample: %s",
+                STATUS_ALERT_TEST_NAME_ALIASES,
+                guild.name,
+                len(members),
+                sample,
+            )
         return recipients
+
+    async def _post_alert_to_panel_channel(self, body, recipients):
+        try:
+            channel = await self.get_panel_channel()
+            if channel is None:
+                logger.warning("Cannot post status alert — panel channel unavailable")
+                return
+            mentions = " ".join(member.mention for member in recipients)
+            prefix = f"{mentions}\n" if mentions else ""
+            if STATUS_ALERT_TEST_USERNAME and not mentions:
+                prefix = f"**{STATUS_ALERT_TEST_USERNAME}**\n"
+            await channel.send(prefix + body)
+            logger.info("Posted status alert in panel channel %s", channel.id)
+        except Exception as e:
+            logger.warning("Failed to post status alert in panel channel: %s", e)
 
     async def notify_status_changes(self, snapshots, guild):
         async with self._status_alert_lock:
@@ -463,21 +538,29 @@ class DCSClusterBot(commands.Bot):
             body = "🚨 **DCS Norway — servervarsel**\n\n" + "\n\n".join(problems)
 
         recipients = await self._status_alert_recipients(guild)
-        if not recipients:
-            target = STATUS_ALERT_TEST_USERNAME or "panel channel members"
-            logger.warning("Status alert had no DM recipients (looking for %s).", target)
-            logger.info("Status alert content:\n%s", body)
-            return
-
+        dm_ok = False
         for member in recipients:
             try:
                 await member.send(body)
-                logger.info("Sent status alert DM to %s (%s)", member.display_name, member.id)
+                dm_ok = True
+                logger.info("Sent status alert DM to %s (%s / %s)", member.display_name, member.name, member.id)
             except discord.Forbidden:
-                logger.warning("Cannot DM %s (%s) — DMs closed.", member.display_name, member.id)
+                logger.warning(
+                    "Cannot DM %s (%s) — DMs closed. Falling back to panel channel.",
+                    member.display_name,
+                    member.id,
+                )
             except Exception as e:
                 logger.warning("Failed to DM %s (%s): %s", member.display_name, member.id, e)
             await asyncio.sleep(0.4)
+
+        if not dm_ok:
+            if not recipients:
+                logger.warning(
+                    "Status alert had no DM recipients (looking for %s).",
+                    STATUS_ALERT_TEST_USERNAME or "panel channel members",
+                )
+            await self._post_alert_to_panel_channel(body, recipients)
 
     async def send_socket_command(self, ip, port, command_str):
         payload = wrap_command(command_str, self.auth_token)
