@@ -26,7 +26,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.41"
+CURRENT_BOT_VERSION = "2.1.42"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -41,6 +41,7 @@ ATTENTION_REPLY_TIMEOUT_SECONDS = 300
 ATTENTION_QUESTION = "Are you available to attend the issue ?"
 ATTENTION_YES_REPLIES = {"ja", "yes"}
 ATTENTION_NO_REPLIES = {"no", "nei"}
+STATUS_MESSAGE_DISMISS_SECONDS = 10
 STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY"}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
@@ -76,6 +77,20 @@ class DCSClusterBot(commands.Bot):
         self._attention_wait = None
         self._attention_issue_body = ""
         self._attention_stop = asyncio.Event()
+
+    def dismiss_status_message_later(self, message):
+        """Delete a transient Discord status message after a short delay."""
+        if message is None:
+            return
+
+        async def _delete():
+            try:
+                await asyncio.sleep(STATUS_MESSAGE_DISMISS_SECONDS)
+                await message.delete()
+            except Exception:
+                pass
+
+        asyncio.create_task(_delete())
 
     def load_cluster_config(self):
         data = load_master_config(self.config_path)
@@ -690,7 +705,8 @@ class DCSClusterBot(commands.Bot):
                     ATTENTION_REPLY_TIMEOUT_SECONDS,
                 )
                 try:
-                    await member.send("No reply received — contacting the next person.")
+                    timeout_msg = await member.send("No reply received — contacting the next person.")
+                    self.dismiss_status_message_later(timeout_msg)
                 except Exception:
                     pass
 
@@ -728,11 +744,13 @@ class DCSClusterBot(commands.Bot):
             if reply in ATTENTION_YES_REPLIES:
                 wait["answer"] = "yes"
                 wait["event"].set()
-                await message.channel.send("Thanks — the alert round is closed.")
+                ack = await message.channel.send("Thanks — the alert round is closed.")
+                self.dismiss_status_message_later(ack)
             elif reply in ATTENTION_NO_REPLIES:
                 wait["answer"] = "no"
                 wait["event"].set()
-                await message.channel.send("Understood — contacting the next person.")
+                ack = await message.channel.send("Understood — contacting the next person.")
+                self.dismiss_status_message_later(ack)
         except Exception as e:
             logger.warning("Failed to acknowledge attention DM reply: %s", e)
 
@@ -851,60 +869,63 @@ class DCSClusterBot(commands.Bot):
         name = node["name"]
 
         status_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
-        ans = await self.send_socket_command(node["ip"], node["port"], "TRIGGER_DCS_UPDATE")
-
-        if not ans:
-            await status_msg.edit(content=f"❌ **[{name}]** Connection timeout. Node did not respond.")
-            return
-
         try:
-            res_json = json.loads(ans)
-            if res_json.get("status") == "UNAUTHORIZED":
-                await status_msg.edit(
-                    content=f"🔐 **[{name}]** Unauthorized — check shared auth_token on Bot and Node."
-                )
+            ans = await self.send_socket_command(node["ip"], node["port"], "TRIGGER_DCS_UPDATE")
+
+            if not ans:
+                await status_msg.edit(content=f"❌ **[{name}]** Connection timeout. Node did not respond.")
                 return
-            if res_json.get("status") == "REJECTED_BUSY":
-                await status_msg.edit(content=f"⚠️ **[{name}]** Server busy executing: `{res_json.get('task')}`.")
+
+            try:
+                res_json = json.loads(ans)
+                if res_json.get("status") == "UNAUTHORIZED":
+                    await status_msg.edit(
+                        content=f"🔐 **[{name}]** Unauthorized — check shared auth_token on Bot and Node."
+                    )
+                    return
+                if res_json.get("status") == "REJECTED_BUSY":
+                    await status_msg.edit(content=f"⚠️ **[{name}]** Server busy executing: `{res_json.get('task')}`.")
+                    return
+                if res_json.get("status") != "OK_STARTING":
+                    await status_msg.edit(content=f"❌ **[{name}]** Rejected with status: `{res_json.get('status')}`.")
+                    return
+            except Exception:
+                await status_msg.edit(content=f"❌ **[{name}]** Error parsing JSON response payload.")
                 return
-            if res_json.get("status") != "OK_STARTING":
-                await status_msg.edit(content=f"❌ **[{name}]** Rejected with status: `{res_json.get('status')}`.")
-                return
-        except Exception:
-            await status_msg.edit(content=f"❌ **[{name}]** Error parsing JSON response payload.")
-            return
 
-        await status_msg.edit(content=f"🚀 **[{name}]** DCS update authorized! Downloading patch payload...")
-        await asyncio.sleep(15)
+            await status_msg.edit(content=f"🚀 **[{name}]** DCS update authorized! Downloading patch payload...")
+            await asyncio.sleep(15)
 
-        start_time = asyncio.get_event_loop().time()
-        while True:
-            if asyncio.get_event_loop().time() - start_time > 900:
-                await status_msg.edit(content=f"⏰ **[{name}]** Deployment exceeded 15 minutes (Timeout reached).")
-                break
+            start_time = asyncio.get_event_loop().time()
+            while True:
+                if asyncio.get_event_loop().time() - start_time > 900:
+                    await status_msg.edit(content=f"⏰ **[{name}]** Deployment exceeded 15 minutes (Timeout reached).")
+                    break
 
-            chk = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
-            if chk is None:
-                await status_msg.edit(content=f"🎉 **[{name}]** Connection closed. Server completed sequence!")
-                break
+                chk = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
+                if chk is None:
+                    await status_msg.edit(content=f"🎉 **[{name}]** Connection closed. Server completed sequence!")
+                    break
 
-            if chk.startswith("{"):
+                if chk.startswith("{"):
+                    try:
+                        res = json.loads(chk)
+                        if res.get("active_task", "Idle") in ["Rebooting", "Idle"]:
+                            await status_msg.edit(
+                                content=f"🎉 **[{name}]** DCS update successfully completed and verified!"
+                            )
+                            break
+                    except Exception:
+                        pass
+                await asyncio.sleep(4)
+
+            if self.active_panel_view:
                 try:
-                    res = json.loads(chk)
-                    if res.get("active_task", "Idle") in ["Rebooting", "Idle"]:
-                        await status_msg.edit(
-                            content=f"🎉 **[{name}]** DCS update successfully completed and verified!"
-                        )
-                        break
+                    await self.active_panel_view.refresh_panel()
                 except Exception:
                     pass
-            await asyncio.sleep(4)
-
-        if self.active_panel_view:
-            try:
-                await self.active_panel_view.refresh_panel()
-            except Exception:
-                pass
+        finally:
+            self.dismiss_status_message_later(status_msg)
 
     @tasks.loop(seconds=30)
     async def persistent_panel_refresh_loop(self):
@@ -938,6 +959,10 @@ def has_dcs_management_permission():
                 "❌ **Permission Denied:** Restricted to Management and Staff.",
                 ephemeral=True,
             )
+            try:
+                bot.dismiss_status_message_later(await interaction.original_response())
+            except Exception:
+                pass
             return False
         return True
 
@@ -1164,7 +1189,10 @@ class LiveControlPanelView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         self.currently_selected_server_names = self.select_menu.values
         selected_text = ", ".join(self.currently_selected_server_names)
-        await interaction.followup.send(f"✅ Selected for deployment: **{selected_text}**.", ephemeral=True)
+        confirm = await interaction.followup.send(
+            f"✅ Selected for deployment: **{selected_text}**.", ephemeral=True
+        )
+        self.bot.dismiss_status_message_later(confirm)
 
     async def refresh_panel(self):
         if self.bot.panel_channel_id and self.bot.panel_message_id:
@@ -1204,16 +1232,18 @@ class LiveControlPanelView(discord.ui.View):
         await interaction.response.defer()
 
         if not self.currently_selected_server_names:
-            await interaction.followup.send(
+            warn = await interaction.followup.send(
                 "⚠️ You must select at least one server from the menu dropdown!",
                 ephemeral=True,
             )
+            self.bot.dismiss_status_message_later(warn)
             return
 
-        await interaction.channel.send(
+        log_msg = await interaction.channel.send(
             f"🚨 **[DEPLOYMENT LOG]** Initiating sequential cluster updates for: "
             f"**{', '.join(self.currently_selected_server_names)}**."
         )
+        self.bot.dismiss_status_message_later(log_msg)
 
         for server_name in self.currently_selected_server_names:
             matched_node = next((n for n in self.all_nodes_cached if n["name"] == server_name), None)
@@ -1259,7 +1289,8 @@ async def check_bot_update(interaction: discord.Interaction):
         "message": "Update check returned no result.",
     }
     prefix = "✅" if result.get("ok") else "❌"
-    await interaction.followup.send(f"{prefix} {result.get('message')}", ephemeral=True)
+    status = await interaction.followup.send(f"{prefix} {result.get('message')}", ephemeral=True)
+    bot.dismiss_status_message_later(status)
     downloads = result.get("downloads")
     if result.get("ok") and result.get("updated") and downloads:
         await bot._apply_self_update(downloads)
