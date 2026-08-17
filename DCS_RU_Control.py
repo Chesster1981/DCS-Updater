@@ -50,11 +50,13 @@ from dcs_ru_common import (
     github_api_headers,
 )
 
-CONTROL_PANEL_VERSION = "2.1.32"
+CONTROL_PANEL_VERSION = "2.1.33"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
 WINDOW_WIDTH_SIDE_PAD = 8
+TABLE_MAX_VISIBLE_ROWS = 10
+TABLE_ROW_HEIGHT = 32
 CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS = 2500
 CONTROL_PANEL_UPDATE_INTERVAL_MS = 60 * 60 * 1000
 
@@ -238,8 +240,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DCS Norway Cluster Control Dashboard (Cloud Ver: Fetching...)")
-        self.resize(800, 850)  # temporary; locked to column sum after table load
-        self.setMinimumHeight(700)
+        self.resize(800, 600)  # temporary; locked to columns/rows after table load
         self.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: {STYLE_TEXT_WHITE};")
         
         _icon_dir = os.path.join(
@@ -314,7 +315,11 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.itemClicked.connect(self.handle_row_click)
-        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.main_layout.addWidget(self.table)
 
         self.actions_row_layout = QHBoxLayout()
@@ -377,6 +382,7 @@ class MainWindow(QMainWindow):
         self.btn_remove.clicked.connect(self.remove_server)
         self.button_deploy.clicked.connect(self.confirm_and_deploy)
         self.load_table_data()
+        QTimer.singleShot(0, self.fit_window_height_to_rows)
 
         self._update_check_in_progress = False
         self._update_prompt_open = False
@@ -385,6 +391,10 @@ class MainWindow(QMainWindow):
         self.update_check_timer.timeout.connect(self._scheduled_update_check)
         self.update_check_timer.start()
         QTimer.singleShot(CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS, self._scheduled_update_check)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.fit_window_height_to_rows)
 
     def handle_row_click(self, item):
         self.selected_row_index = item.row()
@@ -606,7 +616,10 @@ class MainWindow(QMainWindow):
             st = QLabel("CHECKING"); st.setObjectName("status_text"); st.setStyleSheet(f"color: {STYLE_STATUS_WARN}; font-weight: bold; background: transparent;")
             sl.addWidget(lf); sl.addWidget(st); sl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); sc.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
             self.table.setCellWidget(idx, 6, sc)
+        for idx in range(self.table.rowCount()):
+            self.table.setRowHeight(idx, TABLE_ROW_HEIGHT)
         self.apply_column_widths()
+        self.fit_window_height_to_rows()
 
     def apply_column_widths(self):
         """
@@ -689,6 +702,51 @@ class MainWindow(QMainWindow):
             + WINDOW_WIDTH_SIDE_PAD * 2
         )
         self.setFixedWidth(max(table_width, header_width, actions_width))
+
+    def fit_window_height_to_rows(self):
+        """Lock window height to server rows (max 10 visible; scrollbar after that)."""
+        rows = self.table.rowCount()
+        visible = min(rows, TABLE_MAX_VISIBLE_ROWS)
+        header = self.table.horizontalHeader()
+        header_h = header.height()
+        if header_h <= 1:
+            header_h = max(header.sizeHint().height(), 28)
+        row_h = TABLE_ROW_HEIGHT
+        if rows > 0:
+            measured = self.table.rowHeight(0)
+            if measured > 0:
+                row_h = measured
+        frame = self.table.frameWidth() * 2
+        table_h = header_h + (visible * row_h) + frame
+        overflow = rows > TABLE_MAX_VISIBLE_ROWS
+        self.table.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded if overflow else Qt.ScrollBarAlwaysOff
+        )
+        self.table.setFixedHeight(table_h)
+
+        layout = self.main_layout
+        margins = layout.contentsMargins()
+        content_h = margins.top() + margins.bottom()
+        item_count = layout.count()
+        for i in range(item_count):
+            item = layout.itemAt(i)
+            widget = item.widget()
+            nested = item.layout()
+            if widget is self.table:
+                content_h += table_h
+            elif widget is not None:
+                content_h += max(widget.height(), widget.sizeHint().height())
+            elif nested is not None:
+                content_h += nested.sizeHint().height()
+            if i < item_count - 1:
+                content_h += layout.spacing()
+
+        deco = 0
+        if self.isVisible():
+            deco = max(0, self.frameGeometry().height() - self.geometry().height())
+        if deco <= 0:
+            deco = self.style().pixelMetric(QStyle.PM_TitleBarHeight)
+        self.setFixedHeight(content_h + deco)
 
 # ==============================================================================
 # PART 5 OF 5: THREAD-SAFE SLOTS, EXPLICIT STRING IDENTITY MATCHERS & MAIN LOOPS
