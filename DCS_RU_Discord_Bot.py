@@ -26,17 +26,21 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.34"
+CURRENT_BOT_VERSION = "2.1.35"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
 BOT_GITHUB_CHECK_DELAY_SECONDS = 20
 BOT_GITHUB_CHECK_MINUTES = 5
-# Temporary: only DM this Discord name while testing. Set to None to notify all
-# members who can see the panel channel.
-STATUS_ALERT_TEST_USERNAME = "Chesster"
+# Set to a Discord username to DM only that person while testing.
+# None = page panel-channel members one at a time (online first).
+STATUS_ALERT_TEST_USERNAME = None
 STATUS_ALERT_TEST_NAME_ALIASES = ("Chesster", "Chesster1981")
 STATUS_ALERT_DELAY_SECONDS = 300
+ATTENTION_REPLY_TIMEOUT_SECONDS = 300
+ATTENTION_QUESTION = "Are you available to attend the issue ?"
+ATTENTION_YES_REPLIES = {"ja", "yes"}
+ATTENTION_NO_REPLIES = {"no", "nei"}
 STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY"}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
@@ -49,6 +53,7 @@ class DCSClusterBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
+        intents.presences = True
         super().__init__(command_prefix="!", intents=intents)
 
         self.config_path = "master_config.json"
@@ -67,6 +72,10 @@ class DCSClusterBot(commands.Bot):
         self._last_node_status = {}
         self._pending_status_alerts = {}
         self._status_alert_lock = asyncio.Lock()
+        self._attention_task = None
+        self._attention_wait = None
+        self._attention_issue_body = ""
+        self._attention_stop = asyncio.Event()
 
     def load_cluster_config(self):
         data = load_master_config(self.config_path)
@@ -569,7 +578,163 @@ class DCSClusterBot(commands.Bot):
                 len(members),
                 sample,
             )
+        recipients.sort(key=self._presence_sort_key)
         return recipients
+
+    @staticmethod
+    def _presence_sort_key(member):
+        status = getattr(member, "status", discord.Status.offline)
+        rank = {
+            discord.Status.online: 0,
+            discord.Status.idle: 1,
+            discord.Status.dnd: 2,
+            discord.Status.invisible: 3,
+            discord.Status.offline: 4,
+        }.get(status, 5)
+        name = (getattr(member, "display_name", None) or getattr(member, "name", "") or "").lower()
+        return (rank, name)
+
+    @staticmethod
+    def _normalize_attention_reply(text):
+        return str(text or "").strip().lower().strip("!.? ")
+
+    def _any_server_still_needs_attention(self):
+        for snap in self._last_node_status.values():
+            status = snap.get("status_text") or ""
+            health = str(snap.get("dcs_health") or "").strip().upper()
+            if status == STATUS_UP_TO_DATE:
+                continue
+            if status in STATUS_DOWN or health in HEALTH_CRASHED:
+                return True
+        return bool(self._pending_status_alerts)
+
+    async def _cancel_attention_round(self, reason=""):
+        if reason:
+            logger.info("Stopping attention DM round (%s)", reason)
+        self._attention_stop.set()
+        wait = self._attention_wait
+        if wait is not None:
+            wait["answer"] = "cancel"
+            event = wait.get("event")
+            if event is not None and not event.is_set():
+                event.set()
+
+    async def _start_attention_round(self, body, guild):
+        self._attention_issue_body = body
+        task = self._attention_task
+        if task is not None and not task.done():
+            logger.info("Attention DM round already running — updated issue body")
+            return
+        self._attention_stop = asyncio.Event()
+        recipients = await self._status_alert_recipients(guild)
+        if not recipients:
+            logger.warning(
+                "Status alert had no DM recipients (looking for %s).",
+                STATUS_ALERT_TEST_USERNAME or "panel channel members",
+            )
+            await self._post_alert_to_panel_channel(body, [])
+            return
+        self._attention_task = asyncio.create_task(
+            self._run_attention_round(body, recipients, guild),
+            name="dcs-attention-dm-round",
+        )
+
+    async def _run_attention_round(self, body, recipients, guild):
+        question = ATTENTION_QUESTION
+        contacted = []
+        for member in recipients:
+            if self._attention_stop.is_set():
+                logger.info("Attention DM round cancelled before paging %s", member.display_name)
+                return
+            if not self._any_server_still_needs_attention():
+                logger.info("Attention DM round stopped — servers recovered")
+                return
+
+            wait = {
+                "user_id": member.id,
+                "event": asyncio.Event(),
+                "answer": None,
+            }
+            self._attention_wait = wait
+            dm_body = f"{self._attention_issue_body or body}\n\n{question}"
+            try:
+                await member.send(dm_body)
+                contacted.append(member)
+                logger.info(
+                    "Attention DM sent to %s (%s / %s) status=%s",
+                    member.display_name,
+                    member.name,
+                    member.id,
+                    getattr(member, "status", "?"),
+                )
+            except discord.Forbidden:
+                logger.warning(
+                    "Cannot DM %s (%s) — DMs closed. Trying next member.",
+                    member.display_name,
+                    member.id,
+                )
+                self._attention_wait = None
+                continue
+            except Exception as e:
+                logger.warning("Failed to DM %s (%s): %s", member.display_name, member.id, e)
+                self._attention_wait = None
+                continue
+
+            try:
+                await asyncio.wait_for(wait["event"].wait(), timeout=ATTENTION_REPLY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                wait["answer"] = "timeout"
+                logger.info(
+                    "No attention reply from %s within %ss — paging next",
+                    member.display_name,
+                    ATTENTION_REPLY_TIMEOUT_SECONDS,
+                )
+                try:
+                    await member.send("No reply received — contacting the next person.")
+                except Exception:
+                    pass
+
+            answer = wait.get("answer")
+            self._attention_wait = None
+            if answer == "yes":
+                logger.info("%s accepted the attention DM — round closed", member.display_name)
+                return
+            if answer == "cancel":
+                return
+            logger.info(
+                "%s declined or did not reply (%s) — paging next",
+                member.display_name,
+                answer,
+            )
+
+        logger.warning("Attention DM round exhausted the member list without an acceptance")
+        await self._post_alert_to_panel_channel(
+            f"{self._attention_issue_body or body}\n\n"
+            "No one accepted the DM page. Please check the server.",
+            contacted[:5],
+        )
+
+    async def on_message(self, message):
+        await self.process_commands(message)
+        if message.author.bot:
+            return
+        if message.guild is not None:
+            return
+        wait = self._attention_wait
+        if wait is None or message.author.id != wait["user_id"]:
+            return
+        reply = self._normalize_attention_reply(message.content)
+        try:
+            if reply in ATTENTION_YES_REPLIES:
+                wait["answer"] = "yes"
+                wait["event"].set()
+                await message.channel.send("Thanks — the alert round is closed.")
+            elif reply in ATTENTION_NO_REPLIES:
+                wait["answer"] = "no"
+                wait["event"].set()
+                await message.channel.send("Understood — contacting the next person.")
+        except Exception as e:
+            logger.warning("Failed to acknowledge attention DM reply: %s", e)
 
     async def _post_alert_to_panel_channel(self, body, recipients):
         try:
@@ -635,34 +800,18 @@ class DCSClusterBot(commands.Bot):
                     (prev or {}).get("status_text"),
                     curr_status,
                 )
+            recovered = not self._any_server_still_needs_attention()
             if not problems:
-                return
-            body = "🚨 **DCS Norway — server alert**\n\n" + "\n\n".join(problems)
+                body = None
+            else:
+                body = "🚨 **DCS Norway — server alert**\n\n" + "\n\n".join(problems)
 
-        recipients = await self._status_alert_recipients(guild)
-        dm_ok = False
-        for member in recipients:
-            try:
-                await member.send(body)
-                dm_ok = True
-                logger.info("Sent status alert DM to %s (%s / %s)", member.display_name, member.name, member.id)
-            except discord.Forbidden:
-                logger.warning(
-                    "Cannot DM %s (%s) — DMs closed. Falling back to panel channel.",
-                    member.display_name,
-                    member.id,
-                )
-            except Exception as e:
-                logger.warning("Failed to DM %s (%s): %s", member.display_name, member.id, e)
-            await asyncio.sleep(0.4)
-
-        if not dm_ok:
-            if not recipients:
-                logger.warning(
-                    "Status alert had no DM recipients (looking for %s).",
-                    STATUS_ALERT_TEST_USERNAME or "panel channel members",
-                )
-            await self._post_alert_to_panel_channel(body, recipients)
+        if recovered:
+            await self._cancel_attention_round("all servers recovered")
+            return
+        if not body:
+            return
+        await self._start_attention_round(body, guild)
 
     async def send_socket_command(self, ip, port, command_str):
         payload = wrap_command(command_str, self.auth_token)

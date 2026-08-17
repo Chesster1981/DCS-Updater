@@ -50,7 +50,7 @@ from dcs_ru_common import (
     github_api_headers,
 )
 
-CONTROL_PANEL_VERSION = "2.1.34"
+CONTROL_PANEL_VERSION = "2.1.35"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
@@ -277,6 +277,7 @@ class MainWindow(QMainWindow):
         self.header_layout.addWidget(self.lbl_logo, 0, Qt.AlignVCenter)
 
         self.title_wrap = QWidget()
+        self.title_wrap.setFixedHeight(120)
         self.title_wrap.setStyleSheet(f"background-color: {STYLE_BG_DARK};")
         self.title_column = QVBoxLayout(self.title_wrap)
         self.title_column.setContentsMargins(0, 0, 0, 0)
@@ -308,7 +309,7 @@ class MainWindow(QMainWindow):
         )
         header = self.table.horizontalHeader()
         header.setMinimumSectionSize(48)
-        header.setStretchLastSection(False)
+        header.setStretchLastSection(True)
         # Content-sized columns. Widget columns (4–6) get explicit mins in apply_column_widths().
         for col in range(7):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
@@ -360,11 +361,13 @@ class MainWindow(QMainWindow):
         self.deploy_row_layout.addWidget(self.button_deploy, 0, Qt.AlignRight)
         self.main_layout.addLayout(self.deploy_row_layout)
         
-        self.main_layout.addWidget(QLabel("Deployment Activity Console Logs:"))
+        self.lbl_logs = QLabel("Deployment Activity Console Logs:")
+        self.main_layout.addWidget(self.lbl_logs)
         self.log_console = QTextEdit()
         self.log_console.setReadOnly(True)
         self.log_console.setStyleSheet("background-color: #111112; color: #30D158; font-family: Consolas; font-size: 11px; border: 1px solid #2C2C30;")
-        self.log_console.setFixedHeight(150) 
+        self.log_console.setFixedHeight(150)
+        self.log_console.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.main_layout.addWidget(self.log_console)
         
         global_signals.node_updated.connect(self.slot_node_updated)
@@ -643,7 +646,7 @@ class MainWindow(QMainWindow):
         self.apply_live_status_column_width()
 
     def apply_live_status_column_width(self):
-        """Size Live Status to its text, then stretch it to fill leftover window width."""
+        """Keep Live Status at least as wide as its text; stretch fills leftover table width."""
         header = self.table.horizontalHeader()
         status_width = 120  # lamp + "ONLINE" + margin
         for row in range(self.table.rowCount()):
@@ -657,17 +660,19 @@ class MainWindow(QMainWindow):
             if st is not None:
                 text_w = st.fontMetrics().horizontalAdvance(st.text())
                 status_width = max(status_width, text_w + 16 + 16 + 10 + 16)  # pad + lamp + spacing
-        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        header.setMinimumSectionSize(48)
         self.table.setColumnWidth(6, status_width)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        header.setStretchLastSection(True)
         self.fit_window_width_to_columns()
 
     def fit_window_width_to_columns(self):
-        """Lock window width to chrome/content, then stretch Live Status into leftover space."""
+        """Lock window width to chrome/content; Live Status stretches into leftover table space."""
         vh = self.table.verticalHeader()
         vh_w = vh.width() if vh is not None and not vh.isHidden() else 0
         frame = self.table.frameWidth() * 2
-        # Reserve vertical scrollbar so tall lists don't force a horizontal scroll
-        sb_w = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+        overflow = self.table.rowCount() > TABLE_MAX_VISIBLE_ROWS
+        sb_w = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent) if overflow else 0
         margins = self.main_layout.contentsMargins()
         table_chrome = (
             vh_w
@@ -678,10 +683,9 @@ class MainWindow(QMainWindow):
             + WINDOW_WIDTH_SIDE_PAD * 2
         )
         cols_except_status = sum(self.table.columnWidth(c) for c in range(6))
-        status_w = self.table.columnWidth(6)
+        status_w = max(self.table.columnWidth(6), 120)
         table_width = cols_except_status + status_w + table_chrome
 
-        # Don't clip header / action row if they need slightly more than the table
         header_width = (
             self.lbl_logo.width()
             + self.title_wrap.sizeHint().width()
@@ -703,55 +707,40 @@ class MainWindow(QMainWindow):
             + WINDOW_WIDTH_SIDE_PAD * 2
         )
         window_w = max(table_width, header_width, actions_width)
-        leftover_status = window_w - cols_except_status - table_chrome
-        if leftover_status > status_w:
-            self.table.setColumnWidth(6, leftover_status)
         self.setFixedWidth(window_w)
 
     def fit_window_height_to_rows(self):
-        """Lock window height to server rows (max 10 visible; scrollbar after that)."""
+        """Only the server table grows; chrome stays content-sized. Scroll after 10 rows."""
         rows = self.table.rowCount()
         visible = min(rows, TABLE_MAX_VISIBLE_ROWS)
         header = self.table.horizontalHeader()
-        header_h = header.height()
-        if header_h <= 1:
-            header_h = max(header.sizeHint().height(), 28)
-        row_h = TABLE_ROW_HEIGHT
-        if rows > 0:
-            measured = self.table.rowHeight(0)
-            if measured > 0:
-                row_h = measured
-        frame = self.table.frameWidth() * 2
-        table_h = header_h + (visible * row_h) + frame
+        header_h = header.sizeHint().height()
+        if header.height() > 1:
+            header_h = header.height()
+        table_h = header_h + (visible * TABLE_ROW_HEIGHT) + (self.table.frameWidth() * 2)
         overflow = rows > TABLE_MAX_VISIBLE_ROWS
         self.table.setVerticalScrollBarPolicy(
             Qt.ScrollBarAsNeeded if overflow else Qt.ScrollBarAlwaysOff
         )
         self.table.setFixedHeight(table_h)
 
-        layout = self.main_layout
-        margins = layout.contentsMargins()
-        content_h = margins.top() + margins.bottom()
-        item_count = layout.count()
-        for i in range(item_count):
-            item = layout.itemAt(i)
-            widget = item.widget()
-            nested = item.layout()
-            if widget is self.table:
-                content_h += table_h
-            elif widget is not None:
-                content_h += max(widget.height(), widget.sizeHint().height())
-            elif nested is not None:
-                content_h += nested.sizeHint().height()
-            if i < item_count - 1:
-                content_h += layout.spacing()
-
-        deco = 0
-        if self.isVisible():
-            deco = max(0, self.frameGeometry().height() - self.geometry().height())
-        if deco <= 0:
-            deco = self.style().pixelMetric(QStyle.PM_TitleBarHeight)
-        self.setFixedHeight(content_h + deco)
+        margins = self.main_layout.contentsMargins()
+        item_count = self.main_layout.count()
+        spacing = self.main_layout.spacing() * max(0, item_count - 1)
+        actions_h = max(self.btn_add.sizeHint().height(), self.ent_auth.sizeHint().height())
+        chrome_h = (
+            margins.top()
+            + margins.bottom()
+            + spacing
+            + 120  # logo / title header
+            + actions_h
+            + self.button_deploy.height()
+            + self.lbl_logs.sizeHint().height()
+            + 150  # log console
+        )
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+        self.setFixedHeight(chrome_h + table_h)
 
 # ==============================================================================
 # PART 5 OF 5: THREAD-SAFE SLOTS, EXPLICIT STRING IDENTITY MATCHERS & MAIN LOOPS
