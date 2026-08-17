@@ -26,7 +26,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.43"
+CURRENT_BOT_VERSION = "2.1.44"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -87,6 +87,7 @@ def _terminate_pid(pid: int) -> None:
             capture_output=True,
             text=True,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return
     try:
@@ -95,62 +96,57 @@ def _terminate_pid(pid: int) -> None:
         pass
 
 
-def _other_bot_pids():
-    """PIDs of other Python processes running this Discord bot script."""
-    my_pid = os.getpid()
-    marker = os.path.basename(__file__).lower()
-    found = []
-    if sys.platform == "win32":
-        cmd = (
-            "Get-CimInstance Win32_Process | "
-            "Where-Object { "
-            "($_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe' -or $_.Name -eq 'py.exe') "
-            "-and $_.CommandLine -and $_.CommandLine -like '*"
-            + marker
-            + "*' } | "
-            "Select-Object -ExpandProperty ProcessId"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", cmd],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                check=False,
-            )
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    pid = int(line)
-                    if pid != my_pid:
-                        found.append(pid)
-        except Exception as e:
-            logger.warning("Could not list other Discord Bot processes: %s", e)
-        return found
-    return found
+def _process_exe_name(pid: int) -> str:
+    if pid <= 0 or sys.platform != "win32":
+        return ""
+    import ctypes
+    from ctypes import wintypes
+
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return ""
+    buf = ctypes.create_unicode_buffer(32768)
+    size = wintypes.DWORD(len(buf))
+    ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+        handle, 0, buf, ctypes.byref(size)
+    )
+    ctypes.windll.kernel32.CloseHandle(handle)
+    if not ok:
+        return ""
+    return os.path.basename(buf.value).lower()
+
+
+def _running_under_nssm() -> bool:
+    try:
+        return _process_exe_name(os.getppid()) in {"nssm.exe", "nssm64.exe", "nssm32.exe"}
+    except Exception:
+        return False
 
 
 def ensure_single_bot_instance():
-    """Keep one bot process so the panel cannot flip between two versions."""
-    stale = set()
+    """Record this PID. Do not scan processes with PowerShell — that hangs under NSSM."""
     path = _bot_pid_path()
+    my_pid = os.getpid()
+    old_pid = None
     try:
         if os.path.exists(path):
-            raw = open(path, encoding="utf-8").read().strip()
-            old_pid = int(raw)
-            if old_pid != os.getpid() and _pid_is_running(old_pid):
-                stale.add(old_pid)
+            old_pid = int(open(path, encoding="utf-8").read().strip())
     except Exception as e:
         logger.warning("Could not inspect previous bot pid file: %s", e)
-    stale.update(_other_bot_pids())
-    for pid in sorted(stale):
-        logger.warning("Stopping previous Discord Bot process pid=%s", pid)
-        _terminate_pid(pid)
-    if stale:
-        time.sleep(1.5)
+
+    if old_pid and old_pid != my_pid and _pid_is_running(old_pid):
+        # NSSM restart already stops the previous service process. Wait for it
+        # instead of launching PowerShell/WMI, which freezes Session 0.
+        deadline = time.time() + (8 if _running_under_nssm() else 1)
+        while time.time() < deadline and _pid_is_running(old_pid):
+            time.sleep(0.25)
+        if _pid_is_running(old_pid):
+            logger.warning("Stopping previous Discord Bot process pid=%s", old_pid)
+            _terminate_pid(old_pid)
+            time.sleep(1.0)
     try:
         with open(path, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
+            f.write(str(my_pid))
     except Exception as e:
         logger.warning("Could not write bot pid file: %s", e)
 
@@ -391,8 +387,15 @@ class DCSClusterBot(commands.Bot):
             return
 
         script = os.path.abspath(sys.argv[0] if sys.argv else __file__)
-        argv = [sys.executable, script, *sys.argv[1:]]
         cwd = install_dir or os.getcwd()
+        if _running_under_nssm():
+            logger.info(
+                "Updated Discord Bot files in %s; exiting so NSSM can restart the service",
+                cwd,
+            )
+            os._exit(0)
+
+        argv = [sys.executable, script, *sys.argv[1:]]
         logger.info("Relaunching Discord Bot from %s", script)
         kwargs = {
             "cwd": cwd,
