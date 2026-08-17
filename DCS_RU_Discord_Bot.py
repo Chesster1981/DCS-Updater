@@ -25,12 +25,12 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.26"
+CURRENT_BOT_VERSION = "2.1.27"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
 BOT_GITHUB_CHECK_DELAY_SECONDS = 20
-BOT_GITHUB_CHECK_HOURS = 1
+BOT_GITHUB_CHECK_MINUTES = 5
 # Temporary: only DM this Discord name while testing. Set to None to notify all
 # members who can see the panel channel.
 STATUS_ALERT_TEST_USERNAME = "Chesster"
@@ -663,7 +663,7 @@ class DCSClusterBot(commands.Bot):
             except Exception as e:
                 logger.error("Suppressed automated background refresh exception: %s", e)
 
-    @tasks.loop(hours=BOT_GITHUB_CHECK_HOURS)
+    @tasks.loop(minutes=BOT_GITHUB_CHECK_MINUTES)
     async def github_self_update_loop(self):
         await self.check_github_self_update()
 
