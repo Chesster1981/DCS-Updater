@@ -15,9 +15,10 @@ from PySide6.QtCore import Qt, QObject, Signal, Slot, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
-    QTextEdit, QHeaderView, QMessageBox, QFrame, QCheckBox, QSizePolicy, QStyle
+    QTextEdit, QHeaderView, QMessageBox, QFrame, QCheckBox, QSizePolicy, QStyle,
+    QAbstractScrollArea,
 )
-from PySide6.QtGui import QFont, QPixmap, QIcon
+from PySide6.QtGui import QFont, QPixmap, QIcon, QFontMetrics
 
 from brand_assets import (
     BRAND_ASSET_VERSION,
@@ -50,7 +51,7 @@ from dcs_ru_common import (
     github_api_headers,
 )
 
-CONTROL_PANEL_VERSION = "2.1.39"
+CONTROL_PANEL_VERSION = "2.1.40"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -309,18 +310,20 @@ class MainWindow(QMainWindow):
             f"QHeaderView::section {{ background-color: #1C1C1F; color: {STYLE_TEXT_WHITE}; padding: 6px 10px; border: 1px solid #2C2C30; }}"
         )
         header = self.table.horizontalHeader()
-        header.setMinimumSectionSize(48)
+        header.setMinimumSectionSize(32)
         header.setStretchLastSection(False)
-        for col in range(7):
-            header.setSectionResizeMode(col, QHeaderView.Fixed)
+        header.setSectionResizeMode(QHeaderView.Fixed)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.itemClicked.connect(self.handle_row_click)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
+        self.table.setTextElideMode(Qt.ElideNone)
+        self.table.setWordWrap(False)
         self.table.verticalHeader().setDefaultSectionSize(TABLE_ROW_HEIGHT)
         self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
-        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.main_layout.addWidget(self.table)
 
         self.actions_row_layout = QHBoxLayout()
@@ -661,17 +664,23 @@ class MainWindow(QMainWindow):
             max(300, int(geo.height() * WINDOW_MAX_SCREEN_HEIGHT_FRACTION)),
         )
 
+    @staticmethod
+    def _text_pixel_width(text, font):
+        fm = QFontMetrics(font)
+        return max(fm.horizontalAdvance(text), fm.boundingRect(text).width())
+
     def _measure_column_widths(self):
-        """Each column is as wide as its header or widest cell content."""
+        """Content width only. Never shrink to the window; 50% cap uses a scrollbar instead."""
         header = self.table.horizontalHeader()
-        header_fm = header.fontMetrics()
+        item_pad = 32  # QTableWidget::item padding 10px x2 + grid/bold fudge
+        header_pad = 28
         widths = []
         for col in range(self.table.columnCount()):
             header_item = self.table.horizontalHeaderItem(col)
             title = header_item.text() if header_item is not None else ""
-            width = header_fm.horizontalAdvance(title) + 24
+            width = self._text_pixel_width(title, header.font()) + header_pad
             if col == 0:
-                width = max(width, 48)
+                width = max(width, 52)
             elif col in (4, 5):
                 for row in range(self.table.rowCount()):
                     cell = self.table.cellWidget(row, col)
@@ -680,8 +689,10 @@ class MainWindow(QMainWindow):
                     lbl = cell.findChild(QLabel)
                     if lbl is None:
                         continue
-                    text_w = lbl.fontMetrics().boundingRect(lbl.text()).width()
-                    width = max(width, text_w + CELL_TEXT_PAD * 2)
+                    width = max(
+                        width,
+                        self._text_pixel_width(lbl.text(), lbl.font()) + CELL_TEXT_PAD * 2 + 8,
+                    )
             elif col == 6:
                 for row in range(self.table.rowCount()):
                     cell = self.table.cellWidget(row, 6)
@@ -690,35 +701,29 @@ class MainWindow(QMainWindow):
                     st = cell.findChild(QLabel, "status_text")
                     if st is None:
                         continue
-                    text_w = st.fontMetrics().boundingRect(st.text()).width()
-                    # lamp + spacing + equal side pads + extra for bold glyph overflow
-                    width = max(width, text_w + 16 + 8 + CELL_TEXT_PAD * 2 + 6)
+                    text_w = self._text_pixel_width(st.text(), st.font())
+                    width = max(width, text_w + 16 + 8 + CELL_TEXT_PAD * 2 + 12)
             else:
                 for row in range(self.table.rowCount()):
                     item = self.table.item(row, col)
                     if item is None:
                         continue
-                    fm = self.table.fontMetrics()
-                    width = max(width, fm.horizontalAdvance(item.text()) + 24)
+                    font = self.table.font()
+                    width = max(width, self._text_pixel_width(item.text(), font) + item_pad)
             widths.append(width)
         return widths
 
     def fit_table_and_window(self):
-        """
-        Columns follow widest content. Window follows the column sum and row count,
-        capped at 50% of the screen (and 10 visible server rows).
-        """
+        """Lock columns to content. Cap the window at 50%/75% of the screen; scroll don't squeeze."""
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.Fixed)
         widths = self._measure_column_widths()
         for col, width in enumerate(widths):
-            header.setSectionResizeMode(col, QHeaderView.Fixed)
             self.table.setColumnWidth(col, width)
 
         rows = self.table.rowCount()
-        header_h = header.sizeHint().height()
-        if header.height() > 1:
-            header_h = header.height()
+        header_h = max(header.sizeHint().height(), header.height(), 28)
         frame = self.table.frameWidth() * 2
         vh = self.table.verticalHeader()
         vh_w = vh.width() if vh is not None and not vh.isHidden() else 0
@@ -736,6 +741,7 @@ class MainWindow(QMainWindow):
             + self.lbl_logs.sizeHint().height()
             + 150
         )
+        sb = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent)
 
         visible = min(rows, TABLE_MAX_VISIBLE_ROWS)
         table_h = header_h + (visible * TABLE_ROW_HEIGHT) + frame
@@ -745,28 +751,33 @@ class MainWindow(QMainWindow):
             visible = min(visible, TABLE_MAX_VISIBLE_ROWS, max(rows, 1))
             table_h = header_h + (visible * TABLE_ROW_HEIGHT) + frame
         overflow_v = rows > visible
-        sb_v = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent) if overflow_v else 0
+
+        cols_w = sum(widths)
+        inner_max_w = max_w - margins.left() - margins.right()
+        table_content_w = cols_w + vh_w + frame + (sb if overflow_v else 0)
+        overflow_h = table_content_w > inner_max_w
+        table_view_w = min(table_content_w, inner_max_w)
+        if overflow_h:
+            table_h += sb
+
         self.table.setVerticalScrollBarPolicy(
             Qt.ScrollBarAsNeeded if overflow_v else Qt.ScrollBarAlwaysOff
         )
-        self.table.setFixedHeight(table_h)
-
-        cols_w = sum(widths)
-        table_chrome_w = vh_w + frame + sb_v + margins.left() + margins.right()
-        ideal_w = cols_w + table_chrome_w
-        overflow_h = ideal_w > max_w
         self.table.setHorizontalScrollBarPolicy(
             Qt.ScrollBarAsNeeded if overflow_h else Qt.ScrollBarAlwaysOff
         )
-        if overflow_h:
-            sb_h = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent)
-            self.table.setFixedHeight(table_h + sb_h)
+        self.table.setFixedHeight(table_h)
 
-        window_w = min(ideal_w, max_w)
-        window_h = min(chrome_h + self.table.height(), max_h)
+        window_w = table_view_w + margins.left() + margins.right()
+        window_h = min(chrome_h + table_h, max_h)
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
         self.setFixedSize(window_w, window_h)
+
+        # Re-apply column widths after the window resize so Qt cannot squeeze them.
+        for col, width in enumerate(widths):
+            header.setSectionResizeMode(col, QHeaderView.Fixed)
+            self.table.setColumnWidth(col, width)
 
 # ==============================================================================
 # PART 5 OF 5: THREAD-SAFE SLOTS, EXPLICIT STRING IDENTITY MATCHERS & MAIN LOOPS
