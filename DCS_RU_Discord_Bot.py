@@ -26,7 +26,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.44"
+CURRENT_BOT_VERSION = "2.1.45"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -37,6 +37,9 @@ BOT_GITHUB_CHECK_MINUTES = 5
 STATUS_ALERT_TEST_USERNAME = None
 STATUS_ALERT_TEST_NAME_ALIASES = ("Chesster", "Chesster1981")
 STATUS_ALERT_DELAY_SECONDS = 300
+STATUS_RESTART_WAIT_SECONDS = 600
+STATUS_LOG_FILE = "dcs_ru_server_status.log"
+STATUS_LOG_REPEAT_SECONDS = 60
 ATTENTION_REPLY_TIMEOUT_SECONDS = 300
 ATTENTION_QUESTION = "Are you available to attend the issue ?"
 ATTENTION_YES_REPLIES = {"ja", "yes"}
@@ -174,6 +177,7 @@ class DCSClusterBot(commands.Bot):
         self._self_updating = False
         self._last_node_status = {}
         self._pending_status_alerts = {}
+        self._last_status_log = {}
         self._status_alert_lock = asyncio.Lock()
         self._attention_task = None
         self._attention_wait = None
@@ -568,6 +572,79 @@ class DCSClusterBot(commands.Bot):
                 return True
         return False
 
+    def _status_log_path(self):
+        return os.path.join(self._bot_install_dir(), STATUS_LOG_FILE)
+
+    def _append_status_log_line(self, line):
+        try:
+            with open(self._status_log_path(), "a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+        except Exception as e:
+            logger.warning("Could not write server status log: %s", e)
+        logger.info("Server status log: %s", line)
+
+    @staticmethod
+    def _is_server_online(snap):
+        status = snap.get("status_text") or ""
+        return status in STATUS_RUNNING
+
+    def _log_non_online_status(self, snap, extra="", force=False):
+        """Append non-online server status to dcs_ru_server_status.log next to the bot."""
+        if snap is None or self._is_server_online(snap):
+            return
+        key = snap.get("key") or snap.get("name") or "?"
+        name = snap.get("name") or key
+        status = snap.get("status_text") or "UNKNOWN"
+        task = snap.get("task_info") or ""
+        health = str(snap.get("dcs_health") or "").strip() or "-"
+        signature = f"{status}|{task}|{health}|{extra}"
+        now = time.monotonic()
+        previous = self._last_status_log.get(key) or {}
+        if (
+            not force
+            and previous.get("signature") == signature
+            and now - previous.get("at", 0) < STATUS_LOG_REPEAT_SECONDS
+        ):
+            return
+        self._last_status_log[key] = {"signature": signature, "at": now}
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        parts = [stamp, name, status]
+        if task:
+            parts.append(task)
+        if health and health != "-":
+            parts.append(f"health={health}")
+        if extra:
+            parts.append(extra)
+        self._append_status_log_line(" | ".join(parts))
+
+    async def _request_node_restart(self, snap):
+        name = snap.get("name") or snap.get("key") or "unknown"
+        ip = snap.get("ip")
+        port = snap.get("port")
+        self._log_non_online_status(snap, extra="action=RESTART_DCS", force=True)
+        if not ip or not port:
+            logger.warning("Cannot restart %s — missing ip/port", name)
+            self._log_non_online_status(snap, extra="restart=skipped_no_address", force=True)
+            return "missing-address"
+        logger.info("Requesting DCS restart on %s (%s:%s)", name, ip, port)
+        answer = await self.send_socket_command(ip, port, "RESTART_DCS")
+        if not answer:
+            self._log_non_online_status(snap, extra="restart=unreachable", force=True)
+            return "unreachable"
+        result = "unknown"
+        if answer.startswith("{"):
+            try:
+                result = str(json.loads(answer).get("status") or "unknown")
+            except Exception:
+                result = answer[:80]
+        elif "UNKNOWN_COMMAND" in answer:
+            result = "UNKNOWN_COMMAND"
+        else:
+            result = answer[:80]
+        self._log_non_online_status(snap, extra=f"restart={result}", force=True)
+        logger.info("DCS restart response from %s: %s", name, result)
+        return result
+
     def _describe_status_alert(self, prev, curr):
         if prev is None:
             logger.info(
@@ -888,27 +965,67 @@ class DCSClusterBot(commands.Bot):
                 pending = self._pending_status_alerts.get(key)
                 name = snap.get("name") or key
                 curr_status = snap.get("status_text") or ""
+                online = self._is_server_online(snap)
 
-                if pending and curr_status == STATUS_UP_TO_DATE:
+                if not online:
+                    self._log_non_online_status(snap)
+
+                if pending and online:
                     logger.info(
                         "Cancelling delayed status alert for %s — recovered to %s",
                         name,
-                        STATUS_UP_TO_DATE,
+                        curr_status,
+                    )
+                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    self._append_status_log_line(
+                        f"{stamp} | {name} | {curr_status} | recovered=ONLINE"
                     )
                     self._pending_status_alerts.pop(key, None)
                     continue
 
                 if pending:
                     pending["latest_snap"] = snap
-                    elapsed = now - pending["started_at"]
-                    if elapsed < STATUS_ALERT_DELAY_SECONDS:
+                    phase = pending.get("phase") or "grace"
+                    if phase == "grace":
+                        elapsed = now - pending["started_at"]
+                        if elapsed < STATUS_ALERT_DELAY_SECONDS:
+                            continue
+                        logger.info(
+                            "Grace period elapsed for %s — requesting DCS restart",
+                            name,
+                        )
+                        pending["phase"] = "restart_wait"
+                        pending["restart_at"] = now
+                        pending["restart_attempted"] = True
+                        await self._request_node_restart(snap)
+                        continue
+
+                    restart_elapsed = now - pending.get("restart_at", pending["started_at"])
+                    if restart_elapsed < STATUS_RESTART_WAIT_SECONDS:
                         continue
                     text = self._describe_status_alert(pending["from_snap"], snap)
                     self._pending_status_alerts.pop(key, None)
-                    if text:
-                        problems.append(text)
+                    if not text:
+                        icon = snap.get("icon") or ""
+                        text = (
+                            f"**{name}**\n"
+                            f"Still not ONLINE after automatic restart.\n"
+                            f"New status: {icon} **{curr_status}**."
+                        )
+                    text += (
+                        "\nAutomatic DCS restart was attempted after the grace period, "
+                        "but the server did not return to ONLINE."
+                    )
+                    problems.append(text)
+                    self._log_non_online_status(
+                        snap,
+                        extra="action=DM_ALERT restart_did_not_recover",
+                        force=True,
+                    )
                     continue
 
+                if online:
+                    continue
                 text = self._describe_status_alert(prev, snap)
                 if not text:
                     continue
@@ -916,9 +1033,11 @@ class DCSClusterBot(commands.Bot):
                     "started_at": now,
                     "from_snap": prev,
                     "latest_snap": snap,
+                    "phase": "grace",
+                    "restart_attempted": False,
                 }
                 logger.info(
-                    "Delaying status alert for %s by %ss (%s -> %s)",
+                    "Delaying status alert for %s by %ss then restart (%s -> %s)",
                     name,
                     STATUS_ALERT_DELAY_SECONDS,
                     (prev or {}).get("status_text"),
@@ -1235,6 +1354,8 @@ class LiveControlPanelView(discord.ui.View):
             snapshots.append(
                 {
                     "key": f"{node.get('ip')}:{node.get('port')}",
+                    "ip": node.get("ip"),
+                    "port": node.get("port"),
                     "name": node["name"],
                     **classified,
                 }

@@ -55,7 +55,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.44"
+CURRENT_NODE_VERSION = "2.1.45"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -831,6 +831,42 @@ def force_kill_dcs_server(node_port=None):
             logging.debug("Taskkill on %s failed: %s", kill_image, e)
 
 
+def execute_dcs_restart(node_port=None, source="watchdog") -> bool:
+    """Kill DCS if needed and start it again. Safe to run from a background thread."""
+    cfg = load_node_settings()
+    if node_port is None:
+        node_port = cfg.get("network_port", "1015")
+    health = refresh_dcs_health_state(node_port)
+    tag = "REMOTE" if source == "remote" else "WATCHDOG"
+    node_state["active_task"] = "Restarting DCS"
+    try:
+        if is_dcs_server_process_running(cfg) or health == DCS_HEALTH_UNHEALTHY:
+            force_kill_dcs_server(node_port)
+            time.sleep(3)
+
+        started = start_dcs_server_process()
+        if not started:
+            append_activity_log(f"[{tag}] DCS restart failed — could not start the server exe.")
+            return False
+
+        record_dcs_auto_restart()
+        time.sleep(15)
+        new_health = refresh_dcs_health_state(node_port)
+        if new_health == DCS_HEALTH_HEALTHY:
+            append_activity_log(f"[{tag}] DCS server restart verified ✅")
+        else:
+            append_activity_log(
+                f"[{tag}] Restart launched but health is still {new_health} ⚠️"
+            )
+        return new_health == DCS_HEALTH_HEALTHY
+    except Exception as e:
+        append_activity_log(f"[{tag}] DCS restart failed: {e}")
+        logging.error("DCS restart failed (%s): %s", source, e)
+        return False
+    finally:
+        node_state["active_task"] = "Idle"
+
+
 def attempt_dcs_auto_restart(health: str, node_port) -> bool:
     """Restart DCS only after it was previously healthy (not on fresh boot)."""
     if health in (DCS_HEALTH_NEVER_STARTED, DCS_HEALTH_STARTING):
@@ -848,28 +884,7 @@ def attempt_dcs_auto_restart(health: str, node_port) -> bool:
             f"[WATCHDOG] Auto-restart limit reached ({WATCHDOG_MAX_RESTARTS_PER_HOUR}/hour)."
         )
         return False
-
-    node_state["active_task"] = "Restarting DCS"
-    if health == DCS_HEALTH_UNHEALTHY and is_dcs_server_process_running(load_node_settings()):
-        force_kill_dcs_server(node_port)
-        time.sleep(3)
-
-    started = start_dcs_server_process()
-    if not started:
-        node_state["active_task"] = "Idle"
-        return False
-
-    record_dcs_auto_restart()
-    time.sleep(15)
-    new_health = refresh_dcs_health_state(node_port)
-    if new_health == DCS_HEALTH_HEALTHY:
-        append_activity_log("[WATCHDOG] DCS server restart verified ✅")
-    else:
-        append_activity_log(
-            f"[WATCHDOG] Restart launched but health is still {new_health} ⚠️"
-        )
-    node_state["active_task"] = "Idle"
-    return new_health == DCS_HEALTH_HEALTHY
+    return execute_dcs_restart(node_port, source="watchdog")
 
 
 def dcs_watchdog_loop():
@@ -1130,6 +1145,35 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         response = {"status": "REJECTED_BUSY", "task": node_state["active_task"]}
                         conn.send((json.dumps(response) + "\n").encode("utf-8"))
                         conn.close()
+                elif command == "RESTART_DCS":
+                    if is_swapping or node_state["active_task"] != "Idle":
+                        response = {
+                            "status": "REJECTED_BUSY",
+                            "task": node_state["active_task"],
+                        }
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                    elif not can_auto_restart_dcs():
+                        response = {"status": "REJECTED_LIMIT"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log(
+                            "[REMOTE] Discord bot asked for DCS restart, but the hourly limit is reached."
+                        )
+                    else:
+                        node_state["active_task"] = "Restarting DCS"
+                        response = {"status": "OK_STARTING"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log("[REMOTE] Discord bot requested DCS restart.")
+                        threading.Thread(
+                            target=execute_dcs_restart,
+                            kwargs={
+                                "node_port": load_node_settings().get("network_port", "1015"),
+                                "source": "remote",
+                            },
+                            daemon=True,
+                        ).start()
                 elif command == "EXIT_NODE":
                     # Local takeover only: require loopback when auth is enabled
                     if live_token and addr[0] not in ("127.0.0.1", "::1"):
