@@ -50,11 +50,9 @@ from dcs_ru_common import (
     github_api_headers,
 )
 
-CONTROL_PANEL_VERSION = "2.1.35"
+CONTROL_PANEL_VERSION = "2.1.36"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
-# Extra padding beyond layout margins when locking width to table columns
-WINDOW_WIDTH_SIDE_PAD = 8
 TABLE_MAX_VISIBLE_ROWS = 10
 TABLE_ROW_HEIGHT = 32
 CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS = 2500
@@ -309,10 +307,11 @@ class MainWindow(QMainWindow):
         )
         header = self.table.horizontalHeader()
         header.setMinimumSectionSize(48)
-        header.setStretchLastSection(True)
-        # Content-sized columns. Widget columns (4–6) get explicit mins in apply_column_widths().
-        for col in range(7):
+        header.setStretchLastSection(False)
+        # Content-sized columns. Live Status is filled to the viewport after window lock.
+        for col in range(6):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.itemClicked.connect(self.handle_row_click)
@@ -398,6 +397,7 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         QTimer.singleShot(0, self.fit_window_height_to_rows)
+        QTimer.singleShot(0, self._fill_live_status_column)
 
     def handle_row_click(self, item):
         self.selected_row_index = item.row()
@@ -629,25 +629,25 @@ class MainWindow(QMainWindow):
     def apply_column_widths(self):
         """
         ResizeToContents under-measures columns that use cell widgets
-        (Installed Ver. / Latest ED Ver. / Live Status). Enforce content-friendly widths.
-        Server Name stays content-sized (no stretch).
+        (Installed Ver. / Latest ED Ver.). Server Name stays content-sized.
+        Live Status is filled to the table viewport after the window width is locked.
         """
         header = self.table.horizontalHeader()
-        for col in range(7):
+        header.setStretchLastSection(False)
+        for col in range(6):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.table.resizeColumnsToContents()
 
-        # Version strings like 2.9.28.26385 + header padding
         min_ver_width = 160
         for col, minimum in ((4, min_ver_width), (5, min_ver_width)):
             self.table.setColumnWidth(col, max(self.table.columnWidth(col), minimum))
             header.setSectionResizeMode(col, QHeaderView.Fixed)
+        for col in (0, 2, 3):
+            header.setSectionResizeMode(col, QHeaderView.Fixed)
 
-        self.apply_live_status_column_width()
+        self.fit_window_width_to_columns()
 
-    def apply_live_status_column_width(self):
-        """Keep Live Status at least as wide as its text; stretch fills leftover table width."""
-        header = self.table.horizontalHeader()
+    def _live_status_min_width(self):
         status_width = 120  # lamp + "ONLINE" + margin
         for row in range(self.table.rowCount()):
             sc = self.table.cellWidget(row, 6)
@@ -659,31 +659,24 @@ class MainWindow(QMainWindow):
             st = sc.findChild(QLabel, "status_text")
             if st is not None:
                 text_w = st.fontMetrics().horizontalAdvance(st.text())
-                status_width = max(status_width, text_w + 16 + 16 + 10 + 16)  # pad + lamp + spacing
-        header.setMinimumSectionSize(48)
-        self.table.setColumnWidth(6, status_width)
-        header.setSectionResizeMode(6, QHeaderView.Stretch)
-        header.setStretchLastSection(True)
+                status_width = max(status_width, text_w + 16 + 16 + 10 + 16)
+        return status_width
+
+    def apply_live_status_column_width(self):
+        """Refit window and fill Live Status after status text changes."""
         self.fit_window_width_to_columns()
 
     def fit_window_width_to_columns(self):
-        """Lock window width to chrome/content; Live Status stretches into leftover table space."""
+        """Lock window width to chrome/content, then fill Live Status to the table edge."""
         vh = self.table.verticalHeader()
         vh_w = vh.width() if vh is not None and not vh.isHidden() else 0
         frame = self.table.frameWidth() * 2
         overflow = self.table.rowCount() > TABLE_MAX_VISIBLE_ROWS
         sb_w = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent) if overflow else 0
         margins = self.main_layout.contentsMargins()
-        table_chrome = (
-            vh_w
-            + frame
-            + sb_w
-            + margins.left()
-            + margins.right()
-            + WINDOW_WIDTH_SIDE_PAD * 2
-        )
+        table_chrome = vh_w + frame + sb_w + margins.left() + margins.right()
         cols_except_status = sum(self.table.columnWidth(c) for c in range(6))
-        status_w = max(self.table.columnWidth(6), 120)
+        status_w = self._live_status_min_width()
         table_width = cols_except_status + status_w + table_chrome
 
         header_width = (
@@ -693,7 +686,6 @@ class MainWindow(QMainWindow):
             + 24
             + margins.left()
             + margins.right()
-            + WINDOW_WIDTH_SIDE_PAD * 2
         )
         actions_width = (
             100 * 3
@@ -704,10 +696,27 @@ class MainWindow(QMainWindow):
             + 48
             + margins.left()
             + margins.right()
-            + WINDOW_WIDTH_SIDE_PAD * 2
         )
         window_w = max(table_width, header_width, actions_width)
         self.setFixedWidth(window_w)
+        QTimer.singleShot(0, self._fill_live_status_column)
+
+    def _fill_live_status_column(self):
+        """Make Live Status consume leftover viewport so right margin matches the left."""
+        header = self.table.horizontalHeader()
+        vh = self.table.verticalHeader()
+        vh_w = vh.width() if vh is not None and not vh.isHidden() else 0
+        overflow = self.table.rowCount() > TABLE_MAX_VISIBLE_ROWS
+        sb_w = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent) if overflow else 0
+        viewport_w = self.table.viewport().width()
+        if viewport_w <= 1:
+            viewport_w = max(0, self.table.width() - vh_w - self.table.frameWidth() * 2 - sb_w)
+        used = sum(self.table.columnWidth(c) for c in range(6))
+        leftover = viewport_w - used
+        width = max(self._live_status_min_width(), leftover)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.setColumnWidth(6, width)
 
     def fit_window_height_to_rows(self):
         """Only the server table grows; chrome stays content-sized. Scroll after 10 rows."""
