@@ -50,12 +50,13 @@ from dcs_ru_common import (
     github_api_headers,
 )
 
-CONTROL_PANEL_VERSION = "2.1.37"
+CONTROL_PANEL_VERSION = "2.1.38"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
 TABLE_ROW_HEIGHT = 32
-WINDOW_MAX_SCREEN_FRACTION = 0.5
+WINDOW_MAX_SCREEN_WIDTH_FRACTION = 0.5
+WINDOW_MAX_SCREEN_HEIGHT_FRACTION = 0.75
 CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS = 2500
 CONTROL_PANEL_UPDATE_INTERVAL_MS = 60 * 60 * 1000
 
@@ -651,8 +652,8 @@ class MainWindow(QMainWindow):
             return 960, 540
         geo = screen.availableGeometry()
         return (
-            max(400, int(geo.width() * WINDOW_MAX_SCREEN_FRACTION)),
-            max(300, int(geo.height() * WINDOW_MAX_SCREEN_FRACTION)),
+            max(400, int(geo.width() * WINDOW_MAX_SCREEN_WIDTH_FRACTION)),
+            max(300, int(geo.height() * WINDOW_MAX_SCREEN_HEIGHT_FRACTION)),
         )
 
     def _measure_column_widths(self):
