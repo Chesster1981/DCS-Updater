@@ -9,6 +9,7 @@ import os
 import sys
 import subprocess
 import re
+import time
 from datetime import datetime
 
 from dcs_ru_common import (
@@ -25,7 +26,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.29"
+CURRENT_BOT_VERSION = "2.1.30"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -35,6 +36,7 @@ BOT_GITHUB_CHECK_MINUTES = 5
 # members who can see the panel channel.
 STATUS_ALERT_TEST_USERNAME = "Chesster"
 STATUS_ALERT_TEST_NAME_ALIASES = ("Chesster", "Chesster1981")
+STATUS_ALERT_DELAY_SECONDS = 120
 STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY"}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
@@ -63,6 +65,7 @@ class DCSClusterBot(commands.Bot):
         self._restoring_panel = False
         self._self_updating = False
         self._last_node_status = {}
+        self._pending_status_alerts = {}
         self._status_alert_lock = asyncio.Lock()
 
     def load_cluster_config(self):
@@ -553,6 +556,7 @@ class DCSClusterBot(commands.Bot):
             logger.warning("Failed to post status alert in panel channel: %s", e)
 
     async def notify_status_changes(self, snapshots, guild):
+        now = time.monotonic()
         async with self._status_alert_lock:
             problems = []
             for snap in snapshots:
@@ -561,9 +565,45 @@ class DCSClusterBot(commands.Bot):
                     continue
                 prev = self._last_node_status.get(key)
                 self._last_node_status[key] = snap
+                pending = self._pending_status_alerts.get(key)
+                name = snap.get("name") or key
+                curr_status = snap.get("status_text") or ""
+
+                if pending and curr_status == STATUS_UP_TO_DATE:
+                    logger.info(
+                        "Cancelling delayed status alert for %s — recovered to %s",
+                        name,
+                        STATUS_UP_TO_DATE,
+                    )
+                    self._pending_status_alerts.pop(key, None)
+                    continue
+
+                if pending:
+                    pending["latest_snap"] = snap
+                    elapsed = now - pending["started_at"]
+                    if elapsed < STATUS_ALERT_DELAY_SECONDS:
+                        continue
+                    text = self._describe_status_alert(pending["from_snap"], snap)
+                    self._pending_status_alerts.pop(key, None)
+                    if text:
+                        problems.append(text)
+                    continue
+
                 text = self._describe_status_alert(prev, snap)
-                if text:
-                    problems.append(text)
+                if not text:
+                    continue
+                self._pending_status_alerts[key] = {
+                    "started_at": now,
+                    "from_snap": prev,
+                    "latest_snap": snap,
+                }
+                logger.info(
+                    "Delaying status alert for %s by %ss (%s -> %s)",
+                    name,
+                    STATUS_ALERT_DELAY_SECONDS,
+                    (prev or {}).get("status_text"),
+                    curr_status,
+                )
             if not problems:
                 return
             body = "🚨 **DCS Norway — server alert**\n\n" + "\n\n".join(problems)
