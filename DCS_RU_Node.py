@@ -31,7 +31,7 @@ from brand_assets import (
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.14"
+CURRENT_NODE_VERSION = "2.1.15"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -43,6 +43,14 @@ tray_icon = None
 DCS_SERVER_PROCESS = "DCS_server.exe"
 DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
 WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
+DCS_PORT_BASE = 10300
+WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
+
+# DCS health states reported to Control Panel / Discord
+DCS_HEALTH_NEVER_STARTED = "NEVER_STARTED"
+DCS_HEALTH_HEALTHY = "HEALTHY"
+DCS_HEALTH_UNHEALTHY = "UNHEALTHY"
+DCS_HEALTH_DEAD = "DEAD"
 
 node_state = {
     "installed_version": "Unknown",
@@ -50,7 +58,11 @@ node_state = {
     "active_task": "Idle",
     "is_running": True,
     "dcs_running": False,
+    "dcs_health": DCS_HEALTH_NEVER_STARTED,
+    "dcs_ever_healthy": False,
 }
+
+_watchdog_restart_times = []
 
 appdata_dir = os.environ.get('APPDATA')
 if appdata_dir:
@@ -322,8 +334,27 @@ def check_active_processes_running():
     return False
 
 
-def is_dcs_server_running():
-    """True when the dedicated DCS World server process is alive."""
+def derive_dcs_port(node_port) -> int:
+    """Last two digits of the Node port + 10300 = DCS server port (1015 -> 10315)."""
+    try:
+        suffix = int(str(node_port).strip()) % 100
+    except (TypeError, ValueError):
+        suffix = 15
+    return DCS_PORT_BASE + suffix
+
+
+def is_dcs_port_listening(node_port, host="127.0.0.1", timeout=2.0) -> bool:
+    """True when something accepts TCP on the derived DCS server port."""
+    port = derive_dcs_port(node_port)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def is_dcs_server_process_running() -> bool:
+    """True when DCS_server.exe appears in the process list."""
     try:
         output = subprocess.check_output("tasklist", shell=True, text=True, errors="ignore")
         return DCS_SERVER_PROCESS.lower() in output.lower()
@@ -331,10 +362,92 @@ def is_dcs_server_running():
         return False
 
 
-def refresh_dcs_running_state():
-    running = is_dcs_server_running()
-    node_state["dcs_running"] = running
-    return running
+def has_dcs_crash_dialog() -> bool:
+    """Detect Eagle Dynamics crash/report dialogs while the process may still be alive."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        found = False
+        keywords = (
+            "crash",
+            "problem",
+            "eagle dynamics",
+            "error report",
+            "stopped working",
+            "send report",
+        )
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def callback(hwnd, _lparam):
+            nonlocal found
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd) + 1
+            if length <= 1:
+                return True
+            buf = ctypes.create_unicode_buffer(length)
+            user32.GetWindowTextW(hwnd, buf, length)
+            title = buf.value.lower()
+            if any(keyword in title for keyword in keywords):
+                if "dcs" in title or "digital combat simulator" in title:
+                    found = True
+                    return False
+            return True
+
+        user32.EnumWindows(callback, 0)
+        return found
+    except Exception as e:
+        logging.debug("Crash dialog scan failed: %s", e)
+        return False
+
+
+def evaluate_dcs_health(node_port) -> str:
+    """
+    Classify DCS server state:
+    - HEALTHY: process + listening port (and no crash dialog)
+    - UNHEALTHY: process alive but port closed / crash dialog (hung or post-crash UI)
+    - DEAD: process gone after having been healthy before
+    - NEVER_STARTED: process never seen healthy since Node boot
+    """
+    process_up = is_dcs_server_process_running()
+    port_up = is_dcs_port_listening(node_port)
+    crash_dialog = has_dcs_crash_dialog()
+
+    if process_up and port_up and not crash_dialog:
+        return DCS_HEALTH_HEALTHY
+    if process_up:
+        return DCS_HEALTH_UNHEALTHY
+    if node_state.get("dcs_ever_healthy"):
+        return DCS_HEALTH_DEAD
+    return DCS_HEALTH_NEVER_STARTED
+
+
+def refresh_dcs_health_state(node_port=None):
+    """Refresh node_state from process + port health checks."""
+    if node_port is None:
+        node_port = load_node_settings().get("network_port", "1015")
+    health = evaluate_dcs_health(node_port)
+    if health == DCS_HEALTH_HEALTHY:
+        node_state["dcs_ever_healthy"] = True
+    node_state["dcs_health"] = health
+    node_state["dcs_running"] = health == DCS_HEALTH_HEALTHY
+    return health
+
+
+def can_auto_restart_dcs() -> bool:
+    now = time.time()
+    _watchdog_restart_times[:] = [
+        ts for ts in _watchdog_restart_times if now - ts < 3600
+    ]
+    return len(_watchdog_restart_times) < WATCHDOG_MAX_RESTARTS_PER_HOUR
+
+
+def record_dcs_auto_restart():
+    _watchdog_restart_times.append(time.time())
 
 
 def start_dcs_server_process():
@@ -366,8 +479,62 @@ def start_dcs_server_process():
         return False
 
 
+def force_kill_dcs_server():
+    append_activity_log("[WATCHDOG] Terminating DCS_server.exe before restart...")
+    try:
+        subprocess.run(
+            f"taskkill /f /im {DCS_SERVER_PROCESS}",
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logging.debug("Taskkill on %s failed: %s", DCS_SERVER_PROCESS, e)
+
+
+def attempt_dcs_auto_restart(health: str, node_port) -> bool:
+    """Restart DCS only after it was previously healthy (not on fresh boot)."""
+    if health == DCS_HEALTH_NEVER_STARTED:
+        append_activity_log(
+            "[WATCHDOG] DCS has not been started since Node boot — skipping auto-restart."
+        )
+        return False
+    if not node_state.get("dcs_ever_healthy"):
+        append_activity_log(
+            "[WATCHDOG] DCS was never healthy — skipping auto-restart."
+        )
+        return False
+    if not can_auto_restart_dcs():
+        append_activity_log(
+            f"[WATCHDOG] Auto-restart limit reached ({WATCHDOG_MAX_RESTARTS_PER_HOUR}/hour)."
+        )
+        return False
+
+    node_state["active_task"] = "Restarting DCS"
+    if health == DCS_HEALTH_UNHEALTHY and is_dcs_server_process_running():
+        force_kill_dcs_server()
+        time.sleep(3)
+
+    started = start_dcs_server_process()
+    if not started:
+        node_state["active_task"] = "Idle"
+        return False
+
+    record_dcs_auto_restart()
+    time.sleep(15)
+    new_health = refresh_dcs_health_state(node_port)
+    if new_health == DCS_HEALTH_HEALTHY:
+        append_activity_log("[WATCHDOG] DCS server restart verified ✅")
+    else:
+        append_activity_log(
+            f"[WATCHDOG] Restart launched but health is still {new_health} ⚠️"
+        )
+    node_state["active_task"] = "Idle"
+    return new_health == DCS_HEALTH_HEALTHY
+
+
 def dcs_watchdog_loop():
-    """Every N seconds: verify DCS_server.exe; auto-restart if crashed/stopped."""
+    """Every N seconds: verify DCS health (process + port); restart only after prior healthy run."""
     time.sleep(30)  # allow boot / first login before first check
     while True:
         try:
@@ -380,6 +547,7 @@ def dcs_watchdog_loop():
             interval = int(cfg.get("watchdog_interval_seconds", WATCHDOG_DEFAULT_INTERVAL))
             if interval < 60:
                 interval = 60
+            node_port = cfg.get("network_port", "1015")
 
             if not enabled:
                 time.sleep(interval)
@@ -392,23 +560,28 @@ def dcs_watchdog_loop():
                 time.sleep(interval)
                 continue
 
-            running = refresh_dcs_running_state()
-            if running:
-                append_activity_log(f"[WATCHDOG] {DCS_SERVER_PROCESS} is running ✅")
-            else:
-                append_activity_log(f"[WATCHDOG] {DCS_SERVER_PROCESS} is NOT running.")
+            health = refresh_dcs_health_state(node_port)
+            dcs_port = derive_dcs_port(node_port)
+            if health == DCS_HEALTH_HEALTHY:
+                append_activity_log(
+                    f"[WATCHDOG] DCS healthy ({DCS_SERVER_PROCESS} + port {dcs_port}) ✅"
+                )
+            elif health == DCS_HEALTH_NEVER_STARTED:
+                append_activity_log(
+                    f"[WATCHDOG] DCS not running (never started since Node boot, port {dcs_port})."
+                )
+            elif health == DCS_HEALTH_UNHEALTHY:
+                append_activity_log(
+                    f"[WATCHDOG] DCS unhealthy — process up but port {dcs_port} not responding."
+                )
                 if bool(cfg.get("auto_restart_dcs", True)):
-                    node_state["active_task"] = "Restarting DCS"
-                    started = start_dcs_server_process()
-                    if started:
-                        time.sleep(15)
-                        if refresh_dcs_running_state():
-                            append_activity_log("[WATCHDOG] DCS server restart verified ✅")
-                        else:
-                            append_activity_log(
-                                "[WATCHDOG] Restart launched but process not detected yet ⚠️"
-                            )
-                    node_state["active_task"] = "Idle"
+                    attempt_dcs_auto_restart(health, node_port)
+                else:
+                    append_activity_log("[WATCHDOG] Auto-restart disabled in settings.")
+            elif health == DCS_HEALTH_DEAD:
+                append_activity_log(f"[WATCHDOG] DCS stopped/crashed (port {dcs_port}).")
+                if bool(cfg.get("auto_restart_dcs", True)):
+                    attempt_dcs_auto_restart(health, node_port)
                 else:
                     append_activity_log("[WATCHDOG] Auto-restart disabled in settings.")
 
@@ -550,14 +723,16 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
 
                 if command == "PING_STATUS":
                     inst_v, cloud_v = get_dcs_versions_local()
-                    dcs_alive = refresh_dcs_running_state()
+                    node_port = load_node_settings().get("network_port", "1015")
+                    dcs_health = refresh_dcs_health_state(node_port)
                     response = {
                         "status": "ACK",
                         "installed_version": inst_v,
                         "latest_cloud_version": cloud_v,
                         "active_task": node_state["active_task"],
                         "node_version": CURRENT_NODE_VERSION,
-                        "dcs_running": dcs_alive,
+                        "dcs_running": dcs_health == DCS_HEALTH_HEALTHY,
+                        "dcs_health": dcs_health,
                     }
                     conn.send((json.dumps(response) + "\n").encode("utf-8"))
                     conn.close()
@@ -911,10 +1086,10 @@ v_reboot = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Reboot Windows automatically after update completes", variable=v_reboot, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 v_watchdog = tk.BooleanVar()
-tk.Checkbutton(frame_settings, text="Watch DCS_server.exe every 5 minutes", variable=v_watchdog, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+tk.Checkbutton(frame_settings, text="Watch DCS server health every 5 minutes (process + port)", variable=v_watchdog, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 v_auto_restart = tk.BooleanVar()
-tk.Checkbutton(frame_settings, text="Auto-restart DCS server if it stopped/crashed", variable=v_auto_restart, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+tk.Checkbutton(frame_settings, text="Auto-restart DCS only after it was previously running", variable=v_auto_restart, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 btn_tray = tk.Frame(frame_settings, bg="#1C1C1F")
 btn_tray.pack(pady=15)
@@ -932,7 +1107,7 @@ get_dcs_versions_local()
 
 threading.Thread(target=github_update_monitor_loop, daemon=True).start()
 threading.Thread(target=dcs_watchdog_loop, daemon=True).start()
-refresh_dcs_running_state()
+refresh_dcs_health_state()
 
 root.after(100, lambda: root.withdraw())
 root.mainloop()

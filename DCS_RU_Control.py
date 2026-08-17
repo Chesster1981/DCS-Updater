@@ -44,7 +44,7 @@ def get_resource_path(relative_path):
 
 from dcs_ru_common import load_master_config, save_master_config, wrap_command, scrape_dcs_latest_version
 
-CONTROL_PANEL_VERSION = "2.1.14"
+CONTROL_PANEL_VERSION = "2.1.15"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
@@ -140,16 +140,26 @@ def parse_socket_response(answer):
             data = json.loads(answer)
             if data.get("status") == "UNAUTHORIZED":
                 return "UNAUTHORIZED", "BAD TOKEN", "—", "Check auth_token", ""
+            dcs_health = str(data.get("dcs_health", "")).strip().upper()
             dcs_running = data.get("dcs_running", True)
             active_task = data.get("active_task", "Idle")
-            if dcs_running is False and active_task in ("Idle", "Restarting DCS"):
-                status = "DCS DOWN"
-                if active_task == "Restarting DCS":
-                    active_task = "Restarting DCS"
-                else:
-                    active_task = "DCS_server.exe not running"
-            else:
+
+            if dcs_health == "HEALTHY" or dcs_running is True:
                 status = "ONLINE"
+            elif dcs_health == "NEVER_STARTED":
+                status = "ONLINE"
+                if active_task == "Idle":
+                    active_task = "DCS not started"
+            elif active_task == "Restarting DCS":
+                status = "DCS DOWN"
+            else:
+                status = "DCS DOWN"
+                if dcs_health == "UNHEALTHY" and active_task == "Idle":
+                    active_task = "DCS not responding on port"
+                elif dcs_health == "DEAD" and active_task == "Idle":
+                    active_task = "DCS server stopped/crashed"
+                elif dcs_running is False and active_task == "Idle":
+                    active_task = "DCS_server.exe not running"
             return (
                 status,
                 data.get("installed_version", "Unknown"),

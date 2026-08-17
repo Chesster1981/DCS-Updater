@@ -390,18 +390,31 @@ class LiveControlPanelView(discord.ui.View):
                     else:
                         installed_ver = res.get("installed_version", "Unknown")
                         latest_ver = res.get("latest_cloud_version", installed_ver)
+                        dcs_health = str(res.get("dcs_health", "")).strip().upper()
                         dcs_running = res.get("dcs_running", True)
                         active_task = res.get("active_task", "Idle")
 
-                        if dcs_running is False:
-                            status_text = "DCS DOWN"
+                        if dcs_health == "NEVER_STARTED":
+                            status_text = "DCS NOT STARTED"
                             ver_info = f"{installed_ver}"
-                            icon = "🛑"
+                            icon = "⏸️"
                             task_info = (
                                 "Restarting..."
                                 if active_task == "Restarting DCS"
-                                else "DCS_server.exe stopped"
+                                else "Waiting for manual/server boot start"
                             )
+                        elif dcs_running is False or dcs_health in ("DEAD", "UNHEALTHY"):
+                            status_text = "DCS DOWN"
+                            ver_info = f"{installed_ver}"
+                            icon = "🛑"
+                            if active_task == "Restarting DCS":
+                                task_info = "Restarting..."
+                            elif dcs_health == "UNHEALTHY":
+                                task_info = "Process up, port not responding"
+                            elif dcs_health == "DEAD":
+                                task_info = "Server stopped/crashed"
+                            else:
+                                task_info = "DCS_server.exe stopped"
                         elif str(installed_ver).strip() != str(latest_ver).strip() and latest_ver != "Unknown":
                             status_text = "UPDATE READY"
                             ver_info = f"{installed_ver}"
