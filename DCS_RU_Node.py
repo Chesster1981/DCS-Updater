@@ -10,6 +10,7 @@ import socket
 import threading
 import logging
 import subprocess
+import ctypes
 import re
 import shutil
 import tkinter as tk
@@ -28,10 +29,28 @@ from brand_assets import (
     materialize_icon_file,
 )
 
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+def _hidden_subprocess_kwargs(capture_output=True):
+    """Run child processes without flashing a console window."""
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = CREATE_NO_WINDOW
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+    if not capture_output:
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    return kwargs
+
+
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.19"
+CURRENT_NODE_VERSION = "2.1.20"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -226,7 +245,11 @@ def _execute_silent_node_binary_swap(download_url):
             f.write('del "%~f0"\n')
             f.write("exit\n")
 
-        subprocess.Popen(f'cmd.exe /c start /b "" "{bat_path}"', shell=True)
+        subprocess.Popen(
+            f'cmd.exe /c start /b "" "{bat_path}"',
+            shell=True,
+            **_hidden_subprocess_kwargs(capture_output=False),
+        )
         
         global is_listening, server_socket, tray_icon
         is_listening = False
@@ -440,6 +463,7 @@ def iter_tasklist_processes():
             ["tasklist", "/FO", "CSV", "/NH"],
             text=True,
             errors="ignore",
+            **_hidden_subprocess_kwargs(),
         )
     except Exception:
         return
@@ -458,37 +482,61 @@ def iter_tasklist_processes():
 
 def iter_windows_processes():
     """
-    Yield (image_name, pid, executable_path).
+    Yield (image_name, pid, executable_path) without spawning PowerShell.
     ExecutablePath is the reliable link between DCS_server.exe on disk and DCS.server in Task Manager.
     """
     if sys.platform != "win32":
         yield from ((image, pid, "") for image, pid in iter_tasklist_processes())
         return
-    ps_cmd = (
-        "Get-CimInstance Win32_Process | "
-        "Select-Object Name,ProcessId,ExecutablePath | "
-        "ConvertTo-Json -Compress"
-    )
+
     try:
-        raw = subprocess.check_output(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            text=True,
-            errors="ignore",
-            timeout=20,
-        ).strip()
-        if raw:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                data = [data]
-            for item in data:
-                image = str(item.get("Name") or "")
-                pid = item.get("ProcessId")
-                path = str(item.get("ExecutablePath") or "")
-                if pid is not None:
-                    yield image, int(pid), path
-            return
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_void_p),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.windll.kernel32
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snapshot in (0, INVALID_HANDLE_VALUE):
+            raise OSError("CreateToolhelp32Snapshot failed")
+
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            pid = int(entry.th32ProcessID)
+            image = entry.szExeFile
+            exe_path = ""
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                try:
+                    size = wintypes.DWORD(32768)
+                    buf = ctypes.create_unicode_buffer(size.value)
+                    if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                        exe_path = buf.value
+                finally:
+                    kernel32.CloseHandle(handle)
+            yield image, pid, exe_path
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        kernel32.CloseHandle(snapshot)
+        return
     except Exception as e:
-        logging.debug("Win32_Process query failed, falling back to tasklist: %s", e)
+        logging.debug("Native process scan failed, falling back to tasklist: %s", e)
     for image, pid in iter_tasklist_processes():
         yield image, pid, ""
 
@@ -531,6 +579,7 @@ def get_pids_listening_on_port(port: int) -> list[int]:
             shell=True,
             text=True,
             errors="ignore",
+            **_hidden_subprocess_kwargs(),
         )
         for line in output.splitlines():
             upper = line.upper()
@@ -711,14 +760,16 @@ def start_dcs_server_process():
         append_activity_log(
             f"[WATCHDOG] Starting {label} via {exe_name} from {bin_folder}..."
         )
-        ps_cmd = (
-            f"Start-Process -FilePath '{exe_path}' "
-            f"-WorkingDirectory '{bin_folder}'"
-        )
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         subprocess.Popen(
-            ["powershell", "-Command", ps_cmd],
+            [exe_path],
+            cwd=bin_folder,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=flags,
         )
         return True
     except Exception as e:
@@ -739,8 +790,7 @@ def force_kill_dcs_server(node_port=None):
                 subprocess.run(
                     f"taskkill /f /pid {pid}",
                     shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    **_hidden_subprocess_kwargs(capture_output=False),
                 )
                 killed.add(pid)
             except Exception as e:
@@ -753,8 +803,7 @@ def force_kill_dcs_server(node_port=None):
             subprocess.run(
                 f'taskkill /f /im "{kill_image}"',
                 shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                **_hidden_subprocess_kwargs(capture_output=False),
             )
             killed.add(pid)
         except Exception as e:
@@ -886,8 +935,7 @@ def force_kill_core_dcs():
                 subprocess.run(
                     f'taskkill /f /im "{image}"',
                     shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    **_hidden_subprocess_kwargs(capture_output=False),
                 )
             except Exception as e:
                 logging.debug(f"Taskkill command rejected on {image}: {e}")
@@ -942,7 +990,10 @@ def execute_deployment_pipeline():
         updater_path = os.path.join(bin_folder, "DCS_updater.exe")
         ps_cmd = f"Start-Process -FilePath '{updater_path}' -ArgumentList '--quiet update' -WorkingDirectory '{bin_folder}' -Verb RunAs -Wait"
         
-        subprocess.run(["powershell", "-Command", ps_cmd], shell=True)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+            **_hidden_subprocess_kwargs(capture_output=False),
+        )
         append_activity_log(" [PROCESS] DCS core update finished. ✅")
     except Exception as e:
         append_activity_log(f" ERROR during DCS update: ❌ {e}")
@@ -966,7 +1017,7 @@ def execute_deployment_pipeline():
         append_activity_log(" [PROCESS] Windows reboot is enabled. ⚠️ Rebooting machine in 5 seconds...")
         node_state["active_task"] = "Rebooting"
         time.sleep(5)
-        subprocess.run("shutdown /r /t 0", shell=True)
+        subprocess.run("shutdown /r /t 0", shell=True, **_hidden_subprocess_kwargs(capture_output=False))
     else:
         append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
         node_state["active_task"] = "Idle"
