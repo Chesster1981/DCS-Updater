@@ -11,7 +11,7 @@ import json
 import logging
 from datetime import datetime
 
-from PySide6.QtCore import Qt, QObject, Signal, Slot, QEvent
+from PySide6.QtCore import Qt, QObject, Signal, Slot, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
@@ -44,11 +44,13 @@ def get_resource_path(relative_path):
 
 from dcs_ru_common import load_master_config, save_master_config, wrap_command, scrape_dcs_latest_version
 
-CONTROL_PANEL_VERSION = "2.1.13"
+CONTROL_PANEL_VERSION = "2.1.14"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
 WINDOW_WIDTH_SIDE_PAD = 8
+CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS = 2500
+CONTROL_PANEL_UPDATE_INTERVAL_MS = 60 * 60 * 1000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -95,7 +97,7 @@ class ClusterSignals(QObject):
     timeout_triggered = Signal(str, object)
     # Marshals Control Panel GitHub check results onto the GUI thread
     control_update_check_finished = Signal(str, str)  # latest_version, download_url ("" if none)
-    control_update_check_failed = Signal(str)
+    control_update_check_failed = Signal()
     control_update_swap_started = Signal()  # close window after update bat is launched
     control_update_not_frozen = Signal(str)  # download_url for manual install hint
 
@@ -272,16 +274,6 @@ class MainWindow(QMainWindow):
         self.header_layout.addWidget(self.title_wrap, 0, Qt.AlignVCenter)
         self.header_layout.addStretch()
 
-        self.btn_check_updates = QPushButton(" 🔄 Check for Updates ")
-        self.btn_check_updates.setCursor(Qt.PointingHandCursor)
-        self.btn_check_updates.setStyleSheet(
-            f"QPushButton {{ background-color: #2D2D30; color: {STYLE_TEXT_WHITE}; font-size: 11px; "
-            f"font-weight: bold; border-radius: 6px; padding: 10px 14px; border: 1px solid #3A3A3C; }} "
-            f"QPushButton:hover {{ background-color: #3A3A3C; }}"
-        )
-        self.btn_check_updates.clicked.connect(self.check_for_updates)
-        self.header_layout.addWidget(self.btn_check_updates, 0, Qt.AlignRight | Qt.AlignVCenter)
-
         self.main_layout.addLayout(self.header_layout)
         
         self.table = QTableWidget()
@@ -366,6 +358,14 @@ class MainWindow(QMainWindow):
         self.button_deploy.clicked.connect(self.confirm_and_deploy)
         self.load_table_data()
 
+        self._update_check_in_progress = False
+        self._update_prompt_open = False
+        self.update_check_timer = QTimer(self)
+        self.update_check_timer.setInterval(CONTROL_PANEL_UPDATE_INTERVAL_MS)
+        self.update_check_timer.timeout.connect(self._scheduled_update_check)
+        self.update_check_timer.start()
+        QTimer.singleShot(CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS, self._scheduled_update_check)
+
     def handle_row_click(self, item):
         self.selected_row_index = item.row()
 
@@ -382,10 +382,12 @@ class MainWindow(QMainWindow):
                 daemon=True,
             ).start()
 
-    def check_for_updates(self):
-        """Refresh DCS cloud version, re-ping nodes, and check GitHub for a newer Control Panel."""
-        self.btn_check_updates.setEnabled(False)
-        global_signals.append_log.emit("[SYSTEM] Manual update check started…")
+    def _scheduled_update_check(self):
+        """Startup + hourly GitHub check; prompt only when a newer Control Panel exists."""
+        if self._update_check_in_progress or self._update_prompt_open:
+            return
+        self._update_check_in_progress = True
+        global_signals.append_log.emit("[SYSTEM] Checking GitHub for Control Panel updates…")
         threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
 
     @staticmethod
@@ -401,24 +403,6 @@ class MainWindow(QMainWindow):
 
     def _check_for_updates_worker(self):
         import urllib.request
-
-        try:
-            cloud = scrape_dcs_latest_version(timeout=10.0)
-            if cloud:
-                global_signals.cloud_version_updated.emit(cloud)
-                global_signals.append_log.emit(f"[SYSTEM] Latest ED DCS version: {cloud}")
-            else:
-                global_signals.append_log.emit("[SYSTEM] Could not scrape latest ED DCS version.")
-        except Exception as e:
-            global_signals.append_log.emit(f"[SYSTEM] DCS version scrape failed: {e}")
-
-        for i, s in enumerate(list(global_servers)):
-            threading.Thread(
-                target=test_single_system_background,
-                args=(i, s["ip"], s["port"], self),
-                daemon=True,
-            ).start()
-        global_signals.append_log.emit(f"[SYSTEM] Re-pinged {len(global_servers)} node(s).")
 
         try:
             url = f"{URL_GITHUB_API}{GITHUB_REPO}/releases/latest"
@@ -444,54 +428,24 @@ class MainWindow(QMainWindow):
             global_signals.control_update_check_finished.emit(latest, download_url)
         except Exception as e:
             global_signals.append_log.emit(f"[SYSTEM] GitHub check failed: {e}")
-            global_signals.control_update_check_failed.emit(str(e))
+            global_signals.control_update_check_failed.emit()
 
-    @Slot(str)
-    def _fail_update_check(self, error: str):
-        self.btn_check_updates.setEnabled(True)
-        QMessageBox.warning(
-            self,
-            "Update Check Failed",
-            f"Could not check GitHub for Control Panel updates.\n\n{error}",
-        )
+    @Slot()
+    def _fail_update_check(self):
+        self._update_check_in_progress = False
 
     @Slot(str, str)
     def _finish_update_check(self, latest: str, download_url: str):
-        self.btn_check_updates.setEnabled(True)
-        if not latest:
-            QMessageBox.warning(self, "Update Check", "Could not read latest GitHub release tag.")
+        self._update_check_in_progress = False
+        if not latest or not download_url:
             return
 
         local_v = self._version_tuple(CONTROL_PANEL_VERSION)
         remote_v = self._version_tuple(latest)
-
-        if remote_v == local_v:
-            QMessageBox.information(
-                self,
-                "Update Check",
-                f"Control Panel is up to date (v{CONTROL_PANEL_VERSION}).\n"
-                "Node status and ED version were refreshed.",
-            )
+        if remote_v <= local_v:
             return
 
-        if remote_v < local_v:
-            QMessageBox.information(
-                self,
-                "Update Check",
-                f"You are on v{CONTROL_PANEL_VERSION}, which is newer than GitHub v{latest}.\n"
-                "Node status and ED version were refreshed.",
-            )
-            return
-
-        if not download_url:
-            QMessageBox.information(
-                self,
-                "Update Check",
-                f"GitHub has v{latest}, but no Control Panel .exe asset was found.\n"
-                f"You are on v{CONTROL_PANEL_VERSION}.",
-            )
-            return
-
+        self._update_prompt_open = True
         reply = QMessageBox.question(
             self,
             "Update Available",
@@ -502,8 +456,8 @@ class MainWindow(QMainWindow):
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
+        self._update_prompt_open = False
         if reply == QMessageBox.Yes:
-            self.btn_check_updates.setEnabled(False)
             global_signals.append_log.emit(
                 f"[SYSTEM] Operator accepted update to v{latest}. Downloading…"
             )
@@ -569,7 +523,6 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _show_not_frozen_update_hint(self, download_url: str):
-        self.btn_check_updates.setEnabled(True)
         QMessageBox.information(
             self,
             "Update",
@@ -704,8 +657,7 @@ class MainWindow(QMainWindow):
         header_width = (
             self.lbl_logo.width()
             + self.title_wrap.sizeHint().width()
-            + self.btn_check_updates.sizeHint().width()
-            + self.header_layout.spacing() * 2
+            + self.header_layout.spacing()
             + 24
             + margins.left()
             + margins.right()
