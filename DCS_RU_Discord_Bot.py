@@ -25,7 +25,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.28"
+CURRENT_BOT_VERSION = "2.1.29"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -159,10 +159,16 @@ class DCSClusterBot(commands.Bot):
             return os.path.dirname(os.path.abspath(sys.executable))
         return os.path.dirname(os.path.abspath(__file__))
 
-    async def check_github_self_update(self):
-        """Compare GitHub latest release and install source files if newer."""
-        if self._self_updating or getattr(sys, "frozen", False):
-            return
+    async def check_github_self_update(self, apply=True):
+        """Compare GitHub latest release and install source files if newer.
+
+        Returns a short status dict for slash-command feedback.
+        """
+        if self._self_updating:
+            return {"ok": False, "message": "A self-update is already in progress."}
+        if getattr(sys, "frozen", False):
+            return {"ok": False, "message": "Self-update is not available for a compiled bot."}
+
         headers = github_api_headers("DCS-Norway-Discord-Bot")
         url = f"{URL_GITHUB_API}{GITHUB_REPO}/releases/latest"
         try:
@@ -170,7 +176,10 @@ class DCSClusterBot(commands.Bot):
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
                     if response.status != 200:
                         logger.warning("GitHub bot update check HTTP %s", response.status)
-                        return
+                        return {
+                            "ok": False,
+                            "message": f"GitHub check failed (HTTP {response.status}).",
+                        }
                     data = await response.json()
             latest = str(data.get("tag_name", "")).lstrip("v").strip()
             tag = str(data.get("tag_name", "")).strip() or f"v{latest}"
@@ -180,9 +189,16 @@ class DCSClusterBot(commands.Bot):
                 latest or "?",
             )
             if not latest:
-                return
+                return {"ok": False, "message": "GitHub did not return a latest version tag."}
             if self._version_tuple(latest) <= self._version_tuple(CURRENT_BOT_VERSION):
-                return
+                return {
+                    "ok": True,
+                    "updated": False,
+                    "message": (
+                        f"Already on latest: **v{CURRENT_BOT_VERSION}** "
+                        f"(GitHub: v{latest})."
+                    ),
+                }
 
             downloads = {}
             assets = {str(a.get("name", "")): a.get("browser_download_url") for a in data.get("assets") or []}
@@ -202,13 +218,28 @@ class DCSClusterBot(commands.Bot):
                                 content = await response.read()
                     if not content:
                         logger.error("Could not download %s for bot self-update.", filename)
-                        return
+                        return {
+                            "ok": False,
+                            "message": f"Could not download `{filename}` from GitHub.",
+                        }
                     downloads[filename] = content
 
             logger.info("Newer Discord Bot v%s available — applying self-update.", latest)
-            await self._apply_self_update(downloads)
+            result = {
+                "ok": True,
+                "updated": True,
+                "downloads": downloads,
+                "message": (
+                    f"Update found: **v{CURRENT_BOT_VERSION}** → **v{latest}**. "
+                    "Restarting now…"
+                ),
+            }
+            if apply:
+                await self._apply_self_update(downloads)
+            return result
         except Exception as e:
             logger.error("GitHub bot update check failed: %s", e)
+            return {"ok": False, "message": f"GitHub check failed: {e}"}
 
     async def _apply_self_update(self, downloads: dict):
         self._self_updating = True
@@ -980,6 +1011,24 @@ async def dcs_panel_init(interaction: discord.Interaction):
     bot.active_panel_view = view
     bot.persist_panel_ids()
     logger.info("Persistent dashboard frame spawned and locked onto Message ID: %s", message.id)
+
+
+@bot.tree.command(
+    name="check-bot-update",
+    description="Force an immediate GitHub check and install a newer Discord Bot if available.",
+)
+@has_dcs_management_permission()
+async def check_bot_update(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    result = await bot.check_github_self_update(apply=False) or {
+        "ok": False,
+        "message": "Update check returned no result.",
+    }
+    prefix = "✅" if result.get("ok") else "❌"
+    await interaction.followup.send(f"{prefix} {result.get('message')}", ephemeral=True)
+    downloads = result.get("downloads")
+    if result.get("ok") and result.get("updated") and downloads:
+        await bot._apply_self_update(downloads)
 
 
 if __name__ == "__main__":
