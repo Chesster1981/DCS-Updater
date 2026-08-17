@@ -50,7 +50,7 @@ from dcs_ru_common import (
     github_api_headers,
 )
 
-CONTROL_PANEL_VERSION = "2.1.33"
+CONTROL_PANEL_VERSION = "2.1.34"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
@@ -614,7 +614,9 @@ class MainWindow(QMainWindow):
             sc = QWidget(); sl = QHBoxLayout(sc); sl.setContentsMargins(8,0,8,0); sl.setSpacing(10)
             lf = QFrame(); lf.setObjectName("status_lamp"); lf.setStyleSheet(f"background-color: {STYLE_STATUS_WARN}; border-radius: 8px;"); lf.setFixedSize(16,16)
             st = QLabel("CHECKING"); st.setObjectName("status_text"); st.setStyleSheet(f"color: {STYLE_STATUS_WARN}; font-weight: bold; background: transparent;")
-            sl.addWidget(lf); sl.addWidget(st); sl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); sc.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
+            st.setWordWrap(False)
+            st.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            sl.addWidget(lf); sl.addWidget(st, 1); sl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); sc.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
             self.table.setCellWidget(idx, 6, sc)
         for idx in range(self.table.rowCount()):
             self.table.setRowHeight(idx, TABLE_ROW_HEIGHT)
@@ -641,7 +643,7 @@ class MainWindow(QMainWindow):
         self.apply_live_status_column_width()
 
     def apply_live_status_column_width(self):
-        """Fit Live Status to current labels (ONLINE is compact; long text gets a modest cap)."""
+        """Size Live Status to its text, then stretch it to fill leftover window width."""
         header = self.table.horizontalHeader()
         status_width = 120  # lamp + "ONLINE" + margin
         for row in range(self.table.rowCount()):
@@ -653,32 +655,31 @@ class MainWindow(QMainWindow):
                 status_width = max(status_width, hint + 16)
             st = sc.findChild(QLabel, "status_text")
             if st is not None:
-                # Font metrics are more reliable than sizeHint for bold labels
                 text_w = st.fontMetrics().horizontalAdvance(st.text())
                 status_width = max(status_width, text_w + 16 + 16 + 10 + 16)  # pad + lamp + spacing
-        status_width = min(status_width, 180)
-        self.table.setColumnWidth(6, status_width)
         header.setSectionResizeMode(6, QHeaderView.Fixed)
+        self.table.setColumnWidth(6, status_width)
         self.fit_window_width_to_columns()
 
     def fit_window_width_to_columns(self):
-        """Lock window width to sum of table columns + side margins (no empty table void)."""
-        cols = sum(self.table.columnWidth(c) for c in range(self.table.columnCount()))
+        """Lock window width to chrome/content, then stretch Live Status into leftover space."""
         vh = self.table.verticalHeader()
         vh_w = vh.width() if vh is not None and not vh.isHidden() else 0
         frame = self.table.frameWidth() * 2
         # Reserve vertical scrollbar so tall lists don't force a horizontal scroll
         sb_w = self.table.style().pixelMetric(QStyle.PM_ScrollBarExtent)
         margins = self.main_layout.contentsMargins()
-        table_width = (
-            cols
-            + vh_w
+        table_chrome = (
+            vh_w
             + frame
             + sb_w
             + margins.left()
             + margins.right()
             + WINDOW_WIDTH_SIDE_PAD * 2
         )
+        cols_except_status = sum(self.table.columnWidth(c) for c in range(6))
+        status_w = self.table.columnWidth(6)
+        table_width = cols_except_status + status_w + table_chrome
 
         # Don't clip header / action row if they need slightly more than the table
         header_width = (
@@ -701,7 +702,11 @@ class MainWindow(QMainWindow):
             + margins.right()
             + WINDOW_WIDTH_SIDE_PAD * 2
         )
-        self.setFixedWidth(max(table_width, header_width, actions_width))
+        window_w = max(table_width, header_width, actions_width)
+        leftover_status = window_w - cols_except_status - table_chrome
+        if leftover_status > status_w:
+            self.table.setColumnWidth(6, leftover_status)
+        self.setFixedWidth(window_w)
 
     def fit_window_height_to_rows(self):
         """Lock window height to server rows (max 10 visible; scrollbar after that)."""
