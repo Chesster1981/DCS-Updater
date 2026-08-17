@@ -25,7 +25,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.27"
+CURRENT_BOT_VERSION = "2.1.28"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -407,20 +407,20 @@ class DCSClusterBot(commands.Bot):
         )
         lines = [f"**{name}**"]
         if crashed:
-            lines.append("DCS_server.exe ser ut til å ha krasjet eller sluttet å svare.")
+            lines.append("DCS_server.exe appears to have crashed or stopped responding.")
         if left_up_to_date:
             lines.append(
-                f"Status endret fra :green_circle: **{STATUS_UP_TO_DATE}** "
-                f"til {icon} **{curr_status}**."
+                f"Status changed from :green_circle: **{STATUS_UP_TO_DATE}** "
+                f"to {icon} **{curr_status}**."
             )
         else:
-            lines.append(f"Ny status: {icon} **{curr_status}**.")
+            lines.append(f"New status: {icon} **{curr_status}**.")
         ver_info = curr.get("ver_info")
         if ver_info and ver_info != "Unknown":
-            lines.append(f"Versjon: `{ver_info}`")
+            lines.append(f"Version: `{ver_info}`")
         task_info = curr.get("task_info")
         if task_info:
-            lines.append(f"Detalj: {task_info}")
+            lines.append(f"Detail: {task_info}")
         return "\n".join(lines)
 
     async def _collect_guild_members(self, guild):
@@ -535,7 +535,7 @@ class DCSClusterBot(commands.Bot):
                     problems.append(text)
             if not problems:
                 return
-            body = "🚨 **DCS Norway — servervarsel**\n\n" + "\n\n".join(problems)
+            body = "🚨 **DCS Norway — server alert**\n\n" + "\n\n".join(problems)
 
         recipients = await self._status_alert_recipients(guild)
         dm_ok = False
