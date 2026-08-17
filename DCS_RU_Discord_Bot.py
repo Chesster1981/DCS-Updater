@@ -26,7 +26,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.30"
+CURRENT_BOT_VERSION = "2.1.31"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -281,8 +281,38 @@ class DCSClusterBot(commands.Bot):
         subprocess.Popen(argv, **kwargs)
         os._exit(0)
 
+    async def sync_slash_commands(self, guild=None):
+        """Register slash commands. Guild sync is instant; global sync can take up to an hour."""
+        try:
+            synced = await self.tree.sync()
+            logger.info("Synced %s global slash command(s)", len(synced))
+        except Exception as e:
+            logger.error("Global slash sync failed: %s", e)
+
+        targets = []
+        if guild is not None:
+            targets.append(guild)
+        elif self.panel_channel_id:
+            try:
+                channel = await self.get_panel_channel()
+                if channel and getattr(channel, "guild", None):
+                    targets.append(channel.guild)
+            except Exception as e:
+                logger.warning("Could not resolve panel guild for slash sync: %s", e)
+
+        for target_guild in targets:
+            try:
+                guild_synced = await self.tree.sync(guild=target_guild)
+                logger.info(
+                    "Synced %s guild slash command(s) for '%s'",
+                    len(guild_synced),
+                    target_guild.name,
+                )
+            except Exception as e:
+                logger.warning("Guild slash sync failed for %s: %s", target_guild.name, e)
+
     async def setup_hook(self):
-        await self.tree.sync()
+        await self.sync_slash_commands()
         self.queue_processor_loop.start()
         self.persistent_panel_refresh_loop.start()
         self.github_self_update_loop.start()
@@ -294,6 +324,7 @@ class DCSClusterBot(commands.Bot):
         # Defer slightly so guild/channel cache is warm after PC reboot
         await asyncio.sleep(2)
         await self.restore_or_recreate_panel()
+        await self.sync_slash_commands()
 
     async def get_panel_channel(self):
         if not self.panel_channel_id:
@@ -764,7 +795,18 @@ def has_dcs_management_permission():
     return app_commands.check(predicate)
 
 
-PANEL_BOX_LINE_WIDTH = 20
+PANEL_BOX_LINE_WIDTH = 13
+PANEL_STATUS_SHORT = {
+    "DCS NOT STARTED": "NOT STARTED",
+    "DCS STARTING": "STARTING",
+}
+PANEL_TASK_SHORT = {
+    "Awaiting server boot": "Boot pending",
+    "Awaiting DCS port": "Port pending",
+    "Port not responding": "Port down",
+    "Server stopped/crashed": "Crashed",
+    "DCS_server stopped": "Stopped",
+}
 
 
 def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
@@ -776,6 +818,8 @@ def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
 
 def format_server_status_box(status_text: str, ver_info: str, task_info: str) -> str:
     """Fixed three-line status block so every server tile is the same height."""
+    status_text = PANEL_STATUS_SHORT.get(status_text, status_text)
+    task_info = PANEL_TASK_SHORT.get(task_info, task_info)
     rows = [
         f"ℹ️ {_panel_line(status_text)}",
         f"⚙️ {_panel_line(ver_info)}",
@@ -1050,6 +1094,7 @@ async def dcs_panel_init(interaction: discord.Interaction):
     bot.panel_message_id = message.id
     bot.active_panel_view = view
     bot.persist_panel_ids()
+    await bot.sync_slash_commands(guild=interaction.guild)
     logger.info("Persistent dashboard frame spawned and locked onto Message ID: %s", message.id)
 
 
