@@ -31,7 +31,7 @@ from brand_assets import (
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.15"
+CURRENT_NODE_VERSION = "2.1.16"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -40,8 +40,15 @@ listener_thread = None
 is_listening = False
 tray_icon = None
 
-DCS_SERVER_PROCESS = "DCS_server.exe"
-DCS_PROCESSES = ["DCS.exe", "DCS_server.exe"]
+DCS_CLIENT_PROCESS = "DCS.exe"
+DCS_SERVER_PROCESS_DEFAULT = "DCS_server.exe"
+# Common dedicated-server executable names across DCS builds/branches
+DCS_SERVER_KNOWN_NAMES = (
+    "DCS_server.exe",
+    "DCS.server.exe",
+    "DCS.dcs_serverrelease.exe",
+)
+DCS_PROCESSES = [DCS_CLIENT_PROCESS, DCS_SERVER_PROCESS_DEFAULT]
 WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
 DCS_PORT_BASE = 10300
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
@@ -126,6 +133,8 @@ def load_node_settings():
         "watchdog_enabled": True,
         "watchdog_interval_seconds": WATCHDOG_DEFAULT_INTERVAL,
         "auto_restart_dcs": True,
+        "dcs_server_exe": "",
+        "dcs_server_process_names": [],
     }
     if os.path.exists(absolute_config_path):
         try:
@@ -325,9 +334,11 @@ def get_dcs_versions_local():
 
 def check_active_processes_running():
     try:
-        output = subprocess.check_output("tasklist", shell=True, text=True, errors="ignore")
-        for prog in DCS_PROCESSES:
-            if prog.lower() in output.lower():
+        extras = _config_server_name_extras()
+        for image, _pid in iter_tasklist_processes():
+            if normalize_process_name(image) == normalize_process_name(DCS_CLIENT_PROCESS):
+                return True
+            if is_dcs_server_image_name(image, extras):
                 return True
     except Exception:
         pass
@@ -353,13 +364,148 @@ def is_dcs_port_listening(node_port, host="127.0.0.1", timeout=2.0) -> bool:
         return False
 
 
-def is_dcs_server_process_running() -> bool:
-    """True when DCS_server.exe appears in the process list."""
-    try:
-        output = subprocess.check_output("tasklist", shell=True, text=True, errors="ignore")
-        return DCS_SERVER_PROCESS.lower() in output.lower()
-    except Exception:
+def normalize_process_name(name: str) -> str:
+    n = str(name or "").strip().lower()
+    if n and not n.endswith(".exe"):
+        n += ".exe"
+    return n
+
+
+def _config_server_name_extras(config=None) -> list[str]:
+    cfg = config if config is not None else load_node_settings()
+    extras = []
+    explicit = str(cfg.get("dcs_server_exe", "")).strip()
+    if explicit:
+        extras.append(os.path.basename(explicit))
+    for item in cfg.get("dcs_server_process_names") or []:
+        if str(item).strip():
+            extras.append(str(item).strip())
+    return extras
+
+
+def is_dcs_server_image_name(name: str, extra_names=None) -> bool:
+    """
+    Match dedicated-server executables across DCS builds.
+    Examples: DCS_server.exe, DCS.server.exe, DCS.dcs_serverrelease.exe
+    Excludes the DCS client (DCS.exe).
+    """
+    n = normalize_process_name(name)
+    if not n or n == normalize_process_name(DCS_CLIENT_PROCESS):
         return False
+    for candidate in list(DCS_SERVER_KNOWN_NAMES) + list(extra_names or []):
+        if n == normalize_process_name(candidate):
+            return True
+    stem = n[:-4] if n.endswith(".exe") else n
+    return stem.startswith("dcs") and "server" in stem
+
+
+def iter_tasklist_processes():
+    """Yield (image_name, pid) from Windows tasklist."""
+    try:
+        output = subprocess.check_output(
+            ["tasklist", "/FO", "CSV", "/NH"],
+            text=True,
+            errors="ignore",
+        )
+    except Exception:
+        return
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip('"') for part in line.split('","')]
+        if len(parts) < 2:
+            continue
+        image = parts[0]
+        pid_text = parts[1].strip('"')
+        pid = int(pid_text) if pid_text.isdigit() else None
+        if pid is not None:
+            yield image, pid
+
+
+def list_running_dcs_server_processes(config=None):
+    extras = _config_server_name_extras(config)
+    seen = set()
+    matches = []
+    for image, pid in iter_tasklist_processes():
+        if pid in seen:
+            continue
+        if is_dcs_server_image_name(image, extras):
+            seen.add(pid)
+            matches.append((image, pid))
+    return matches
+
+
+def is_dcs_server_process_running(config=None) -> bool:
+    """True when any known/pattern-matched DCS dedicated-server process is alive."""
+    return bool(list_running_dcs_server_processes(config))
+
+
+def get_pids_listening_on_port(port: int) -> list[int]:
+    """Return PIDs with a TCP listener on the given local port."""
+    pids = []
+    try:
+        output = subprocess.check_output(
+            f'netstat -ano -p tcp | findstr ":{port} "',
+            shell=True,
+            text=True,
+            errors="ignore",
+        )
+        for line in output.splitlines():
+            upper = line.upper()
+            if "LISTENING" not in upper:
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            pid_text = parts[-1]
+            if pid_text.isdigit():
+                pids.append(int(pid_text))
+    except Exception as e:
+        logging.debug("netstat scan for port %s failed: %s", port, e)
+    return list(dict.fromkeys(pids))
+
+
+def discover_dcs_server_executables(bin_folder: str, config=None) -> list[str]:
+    """Find dedicated-server executables in the DCS bin folder."""
+    cfg = config if config is not None else load_node_settings()
+    extras = _config_server_name_extras(cfg)
+    if not os.path.isdir(bin_folder):
+        return []
+
+    explicit = str(cfg.get("dcs_server_exe", "")).strip()
+    if explicit:
+        if os.path.isabs(explicit) and os.path.exists(explicit):
+            return [explicit]
+        candidate = os.path.join(bin_folder, os.path.basename(explicit))
+        if os.path.exists(candidate):
+            return [candidate]
+
+    preferred = os.path.join(bin_folder, DCS_SERVER_PROCESS_DEFAULT)
+    if os.path.exists(preferred):
+        return [preferred]
+
+    discovered = []
+    for fname in sorted(os.listdir(bin_folder)):
+        if not fname.lower().endswith(".exe"):
+            continue
+        if is_dcs_server_image_name(fname, extras):
+            discovered.append(os.path.join(bin_folder, fname))
+    return discovered
+
+
+def resolve_dcs_server_exe_path(config=None) -> str:
+    cfg = config if config is not None else load_node_settings()
+    main_folder = str(cfg.get("dcs_main_folder", "")).strip()
+    bin_folder = os.path.join(main_folder, "bin")
+    matches = discover_dcs_server_executables(bin_folder, cfg)
+    return matches[0] if matches else os.path.join(bin_folder, DCS_SERVER_PROCESS_DEFAULT)
+
+
+def describe_running_dcs_server_processes(config=None) -> str:
+    matches = list_running_dcs_server_processes(config)
+    if not matches:
+        return "no dedicated-server process"
+    return ", ".join(f"{name} (pid {pid})" for name, pid in matches)
 
 
 def has_dcs_crash_dialog() -> bool:
@@ -408,16 +554,19 @@ def has_dcs_crash_dialog() -> bool:
 def evaluate_dcs_health(node_port) -> str:
     """
     Classify DCS server state:
-    - HEALTHY: process + listening port (and no crash dialog)
-    - UNHEALTHY: process alive but port closed / crash dialog (hung or post-crash UI)
-    - DEAD: process gone after having been healthy before
-    - NEVER_STARTED: process never seen healthy since Node boot
+    - HEALTHY: listening port (primary) and no crash dialog
+    - UNHEALTHY: crash dialog, or server process alive but port closed
+    - DEAD: process/port gone after having been healthy before
+    - NEVER_STARTED: never healthy since Node boot
     """
-    process_up = is_dcs_server_process_running()
+    config = load_node_settings()
     port_up = is_dcs_port_listening(node_port)
     crash_dialog = has_dcs_crash_dialog()
+    process_up = is_dcs_server_process_running(config)
 
-    if process_up and port_up and not crash_dialog:
+    if crash_dialog:
+        return DCS_HEALTH_UNHEALTHY
+    if port_up:
         return DCS_HEALTH_HEALTHY
     if process_up:
         return DCS_HEALTH_UNHEALTHY
@@ -451,18 +600,21 @@ def record_dcs_auto_restart():
 
 
 def start_dcs_server_process():
-    """Launch DCS_server.exe from the configured DCS bin folder."""
+    """Launch the dedicated DCS server executable from the configured bin folder."""
     config = load_node_settings()
     main_folder = config.get("dcs_main_folder", "").strip()
     bin_folder = os.path.join(main_folder, "bin")
-    exe_path = os.path.join(bin_folder, DCS_SERVER_PROCESS)
+    exe_path = resolve_dcs_server_exe_path(config)
+    exe_name = os.path.basename(exe_path)
 
     if not os.path.exists(exe_path):
-        append_activity_log(f" [WATCHDOG] ERROR: {DCS_SERVER_PROCESS} not found at ❌ {exe_path}")
+        append_activity_log(
+            f" [WATCHDOG] ERROR: no dedicated-server exe found in ❌ {bin_folder}"
+        )
         return False
 
     try:
-        append_activity_log(f"[WATCHDOG] Starting {DCS_SERVER_PROCESS} from {bin_folder}...")
+        append_activity_log(f"[WATCHDOG] Starting {exe_name} from {bin_folder}...")
         ps_cmd = (
             f"Start-Process -FilePath '{exe_path}' "
             f"-WorkingDirectory '{bin_folder}'"
@@ -479,17 +631,38 @@ def start_dcs_server_process():
         return False
 
 
-def force_kill_dcs_server():
-    append_activity_log("[WATCHDOG] Terminating DCS_server.exe before restart...")
-    try:
-        subprocess.run(
-            f"taskkill /f /im {DCS_SERVER_PROCESS}",
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as e:
-        logging.debug("Taskkill on %s failed: %s", DCS_SERVER_PROCESS, e)
+def force_kill_dcs_server(node_port=None):
+    config = load_node_settings()
+    killed = set()
+    process_desc = describe_running_dcs_server_processes(config)
+    append_activity_log(f"[WATCHDOG] Terminating DCS server ({process_desc})...")
+
+    if node_port is not None:
+        for pid in get_pids_listening_on_port(derive_dcs_port(node_port)):
+            try:
+                subprocess.run(
+                    f"taskkill /f /pid {pid}",
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                killed.add(pid)
+            except Exception as e:
+                logging.debug("Taskkill pid %s failed: %s", pid, e)
+
+    for image, pid in list_running_dcs_server_processes(config):
+        if pid in killed:
+            continue
+        try:
+            subprocess.run(
+                f'taskkill /f /im "{image}"',
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            killed.add(pid)
+        except Exception as e:
+            logging.debug("Taskkill on %s failed: %s", image, e)
 
 
 def attempt_dcs_auto_restart(health: str, node_port) -> bool:
@@ -511,8 +684,8 @@ def attempt_dcs_auto_restart(health: str, node_port) -> bool:
         return False
 
     node_state["active_task"] = "Restarting DCS"
-    if health == DCS_HEALTH_UNHEALTHY and is_dcs_server_process_running():
-        force_kill_dcs_server()
+    if health == DCS_HEALTH_UNHEALTHY and is_dcs_server_process_running(load_node_settings()):
+        force_kill_dcs_server(node_port)
         time.sleep(3)
 
     started = start_dcs_server_process()
@@ -564,7 +737,7 @@ def dcs_watchdog_loop():
             dcs_port = derive_dcs_port(node_port)
             if health == DCS_HEALTH_HEALTHY:
                 append_activity_log(
-                    f"[WATCHDOG] DCS healthy ({DCS_SERVER_PROCESS} + port {dcs_port}) ✅"
+                    f"[WATCHDOG] DCS healthy (port {dcs_port}, {describe_running_dcs_server_processes(cfg)}) ✅"
                 )
             elif health == DCS_HEALTH_NEVER_STARTED:
                 append_activity_log(
@@ -572,7 +745,8 @@ def dcs_watchdog_loop():
                 )
             elif health == DCS_HEALTH_UNHEALTHY:
                 append_activity_log(
-                    f"[WATCHDOG] DCS unhealthy — process up but port {dcs_port} not responding."
+                    f"[WATCHDOG] DCS unhealthy — {describe_running_dcs_server_processes(cfg)} "
+                    f"but port {dcs_port} not responding."
                 )
                 if bool(cfg.get("auto_restart_dcs", True)):
                     attempt_dcs_auto_restart(health, node_port)
@@ -593,11 +767,24 @@ def dcs_watchdog_loop():
 
 def force_kill_core_dcs():
     append_activity_log("[PROCESS] Requesting termination of core DCS processes...")
-    for prog in DCS_PROCESSES:
-        try:
-            subprocess.run(f"taskkill /f /im {prog}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            logging.debug(f"Taskkill command rejected on {prog}: {e}")
+    config = load_node_settings()
+    extras = _config_server_name_extras(config)
+    killed_images = set()
+    for image, _pid in iter_tasklist_processes():
+        n = normalize_process_name(image)
+        if n == normalize_process_name(DCS_CLIENT_PROCESS) or is_dcs_server_image_name(image, extras):
+            if n in killed_images:
+                continue
+            killed_images.add(n)
+            try:
+                subprocess.run(
+                    f'taskkill /f /im "{image}"',
+                    shell=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                logging.debug(f"Taskkill command rejected on {image}: {e}")
 
 
 # =========================================================================
