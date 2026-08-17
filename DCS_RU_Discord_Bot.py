@@ -5,6 +5,9 @@ import json
 import asyncio
 import logging
 import aiohttp
+import os
+import sys
+import subprocess
 import re
 from datetime import datetime
 
@@ -20,6 +23,13 @@ from dcs_ru_common import (
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
+
+CURRENT_BOT_VERSION = "2.1.19"
+GITHUB_REPO = "Chesster1981/DCS-Updater"
+URL_GITHUB_API = "https://api.github.com/repos/"
+BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
+BOT_GITHUB_CHECK_DELAY_SECONDS = 20
+BOT_GITHUB_CHECK_HOURS = 1
 
 
 class DCSClusterBot(commands.Bot):
@@ -40,6 +50,7 @@ class DCSClusterBot(commands.Bot):
         self.last_cache_time = 0
         self.auth_token = ""
         self._restoring_panel = False
+        self._self_updating = False
 
     def load_cluster_config(self):
         data = load_master_config(self.config_path)
@@ -119,12 +130,119 @@ class DCSClusterBot(commands.Bot):
 
         return self.cached_dcs_version
 
+    @staticmethod
+    def _version_tuple(version_str: str):
+        parts = []
+        for chunk in str(version_str or "").strip().lstrip("vV").split("."):
+            try:
+                parts.append(int(chunk))
+            except ValueError:
+                digits = "".join(ch for ch in chunk if ch.isdigit())
+                parts.append(int(digits) if digits else 0)
+        return tuple(parts) if parts else (0,)
+
+    def _bot_install_dir(self):
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.dirname(os.path.abspath(__file__))
+
+    async def check_github_self_update(self):
+        """Compare GitHub latest release and install source files if newer."""
+        if self._self_updating or getattr(sys, "frozen", False):
+            return
+        headers = {
+            "User-Agent": "DCS-Norway-Discord-Bot",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        url = f"{URL_GITHUB_API}{GITHUB_REPO}/releases/latest"
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status != 200:
+                        logger.warning("GitHub bot update check HTTP %s", response.status)
+                        return
+                    data = await response.json()
+            latest = str(data.get("tag_name", "")).lstrip("v").strip()
+            tag = str(data.get("tag_name", "")).strip() or f"v{latest}"
+            logger.info(
+                "Discord Bot v%s | GitHub latest v%s",
+                CURRENT_BOT_VERSION,
+                latest or "?",
+            )
+            if not latest:
+                return
+            if self._version_tuple(latest) <= self._version_tuple(CURRENT_BOT_VERSION):
+                return
+
+            downloads = {}
+            assets = {str(a.get("name", "")): a.get("browser_download_url") for a in data.get("assets") or []}
+            async with aiohttp.ClientSession(headers={"User-Agent": "DCS-Norway-Discord-Bot"}) as session:
+                for filename in BOT_SELF_UPDATE_FILES:
+                    content = None
+                    asset_url = assets.get(filename)
+                    if asset_url:
+                        async with session.get(asset_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                            if response.status == 200:
+                                content = await response.read()
+                    if not content:
+                        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{tag}/{filename}"
+                        async with session.get(raw_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                            if response.status == 200:
+                                content = await response.read()
+                    if not content:
+                        logger.error("Could not download %s for bot self-update.", filename)
+                        return
+                    downloads[filename] = content
+
+            logger.info("Newer Discord Bot v%s available — applying self-update.", latest)
+            await self._apply_self_update(downloads)
+        except Exception as e:
+            logger.error("GitHub bot update check failed: %s", e)
+
+    async def _apply_self_update(self, downloads: dict):
+        self._self_updating = True
+        install_dir = self._bot_install_dir()
+        try:
+            for filename, content in downloads.items():
+                target = os.path.join(install_dir, filename)
+                tmp_path = target + ".new"
+                with open(tmp_path, "wb") as f:
+                    f.write(content)
+                os.replace(tmp_path, target)
+                logger.info("Updated %s", target)
+        except Exception as e:
+            logger.error("Failed to write bot update files: %s", e)
+            self._self_updating = False
+            return
+
+        script = os.path.abspath(sys.argv[0] if sys.argv else __file__)
+        argv = [sys.executable, script, *sys.argv[1:]]
+        cwd = install_dir or os.getcwd()
+        logger.info("Relaunching Discord Bot from %s", script)
+        try:
+            await self.close()
+        except Exception:
+            pass
+
+        kwargs = {
+            "cwd": cwd,
+            "env": os.environ.copy(),
+            "close_fds": True,
+        }
+        if sys.platform == "win32":
+            kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        subprocess.Popen(argv, **kwargs)
+        os._exit(0)
+
     async def setup_hook(self):
         await self.tree.sync()
         self.queue_processor_loop.start()
         self.persistent_panel_refresh_loop.start()
+        self.github_self_update_loop.start()
         self.load_cluster_config()
-        logger.info("Discord Bot v1.2 running. Auto panel restore enabled.")
+        logger.info("Discord Bot v%s running. Auto panel restore enabled.", CURRENT_BOT_VERSION)
 
     async def on_ready(self):
         logger.info("Logged in as %s", self.user)
@@ -319,6 +437,15 @@ class DCSClusterBot(commands.Bot):
                 await self.active_panel_view.refresh_panel()
             except Exception as e:
                 logger.error("Suppressed automated background refresh exception: %s", e)
+
+    @tasks.loop(hours=BOT_GITHUB_CHECK_HOURS)
+    async def github_self_update_loop(self):
+        await self.check_github_self_update()
+
+    @github_self_update_loop.before_loop
+    async def before_github_self_update_loop(self):
+        await self.wait_until_ready()
+        await asyncio.sleep(BOT_GITHUB_CHECK_DELAY_SECONDS)
 
 
 bot = DCSClusterBot()
