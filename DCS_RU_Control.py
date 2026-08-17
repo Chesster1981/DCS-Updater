@@ -16,7 +16,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
     QTextEdit, QHeaderView, QMessageBox, QFrame, QCheckBox, QSizePolicy, QStyle,
-    QAbstractScrollArea,
+    QAbstractScrollArea, QDialog, QFormLayout, QComboBox, QSpinBox, QScrollArea,
+    QGroupBox,
 )
 from PySide6.QtGui import QFont, QPixmap, QIcon, QFontMetrics
 
@@ -49,9 +50,14 @@ from dcs_ru_common import (
     wrap_command,
     scrape_dcs_latest_version,
     github_api_headers,
+    NODE_SETTINGS_DEFAULTS,
+    NODE_GITHUB_INTERVAL_CHOICES,
+    github_interval_label,
+    github_interval_seconds,
+    sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.46"
+CONTROL_PANEL_VERSION = "2.1.47"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -110,6 +116,8 @@ class ClusterSignals(QObject):
     control_update_check_failed = Signal()
     control_update_swap_started = Signal()  # close window after update bat is launched
     control_update_not_frozen = Signal(str)  # download_url for manual install hint
+    node_settings_loaded = Signal(object)
+    node_settings_pushed = Signal(object)
 
 global_signals = ClusterSignals()
 global_servers = []
@@ -201,7 +209,7 @@ def send_socket_command(ip, port, command_str):
         sock.connect((ip, int(port)))
         payload = wrap_command(command_str, cached_auth_token)
         sock.sendall(payload.encode("utf-8"))
-        response_data = sock.recv(4096).decode("utf-8")
+        response_data = sock.recv(65536).decode("utf-8")
         sock.close()
         return response_data.strip()
     except Exception as e:
@@ -381,6 +389,8 @@ class MainWindow(QMainWindow):
         global_signals.control_update_check_failed.connect(self._fail_update_check)
         global_signals.control_update_swap_started.connect(self.close)
         global_signals.control_update_not_frozen.connect(self._show_not_frozen_update_hint)
+        global_signals.node_settings_loaded.connect(self._on_node_settings_loaded)
+        global_signals.node_settings_pushed.connect(self._on_node_settings_pushed)
         
         self.selected_row_index = None
         self.btn_add.clicked.connect(lambda: self.show_form_dialog(edit_mode=False))
@@ -567,22 +577,27 @@ class MainWindow(QMainWindow):
     # ==============================================================================
     # PART 4 OF 5: DATA GENERATION CONTEXTS, DIALOG MATRIX LAYOUTS & CRUD INTERCEPTS
     # ==============================================================================
+    def _dialog_input_style(self):
+        return (
+            f"background-color: {STYLE_BG_CELL}; color: white; "
+            f"border: 1px solid #2C2C30; padding: 6px; border-radius: 3px;"
+        )
+
     def show_form_dialog(self, edit_mode=False):
         if edit_mode and self.selected_row_index is None:
             QMessageBox.warning(self, "Selection Error", "Please select a server row first.")
             return
-        from PySide6.QtWidgets import QDialog
+        if edit_mode:
+            self._show_edit_server_dialog()
+            return
         self.dialog = QDialog(self)
-        self.dialog.setWindowTitle("Edit Server" if edit_mode else "Add Server")
+        self.dialog.setWindowTitle("Add Server")
         self.dialog.setFixedSize(420, 290)
         self.dialog.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: white;")
         layout = QVBoxLayout(self.dialog)
         self.ent_name, self.ent_ip, self.ent_port = QLineEdit(), QLineEdit(), QLineEdit("1015")
         for ent in [self.ent_name, self.ent_ip, self.ent_port]:
-            ent.setStyleSheet(f"background-color: {STYLE_BG_CELL}; color: white; border: 1px solid #2C2C30; padding: 6px; border-radius: 3px;")
-        if edit_mode:
-            d = global_servers[self.selected_row_index]
-            self.ent_name.setText(d["name"]); self.ent_ip.setText(d["ip"]); self.ent_port.setText(d["port"])
+            ent.setStyleSheet(self._dialog_input_style())
         layout.addWidget(QLabel("Server Name:")); layout.addWidget(self.ent_name)
         layout.addWidget(QLabel("IP / Hostname:")); layout.addWidget(self.ent_ip)
         layout.addWidget(QLabel("Port:")); layout.addWidget(self.ent_port)
@@ -591,17 +606,295 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self.save_form_data)
         layout.addWidget(self.btn_save); self.dialog.exec_()
 
-    def save_form_data(self):
+    def _show_edit_server_dialog(self):
+        d = global_servers[self.selected_row_index]
+        self.dialog = QDialog(self)
+        self.dialog.setWindowTitle("Edit Server")
+        self.dialog.resize(540, 720)
+        self.dialog.setStyleSheet(f"background-color: {STYLE_BG_DARK}; color: white;")
+        outer = QVBoxLayout(self.dialog)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+
+        conn_box = QGroupBox("Control Panel connection")
+        conn_form = QFormLayout(conn_box)
+        self.ent_name = QLineEdit(d.get("name", ""))
+        self.ent_ip = QLineEdit(d.get("ip", ""))
+        self.ent_port = QLineEdit(str(d.get("port", "1015")))
+        for ent in (self.ent_name, self.ent_ip, self.ent_port):
+            ent.setStyleSheet(self._dialog_input_style())
+        conn_form.addRow("Server Name:", self.ent_name)
+        conn_form.addRow("IP / Hostname:", self.ent_ip)
+        conn_form.addRow("Port:", self.ent_port)
+        layout.addWidget(conn_box)
+
+        node_box = QGroupBox("Node settings")
+        node_form = QFormLayout(node_box)
+        self.lbl_node_settings_status = QLabel("Loading settings from node...")
+        self.lbl_node_settings_status.setStyleSheet(f"color: {STYLE_TEXT_MUTED};")
+        self.lbl_node_settings_status.setWordWrap(True)
+        node_form.addRow(self.lbl_node_settings_status)
+
+        self.ent_node_dcs = QLineEdit()
+        self.ent_node_bind = QLineEdit()
+        self.ent_node_auth = QLineEdit()
+        self.ent_node_auth.setEchoMode(QLineEdit.Password)
+        self.ent_node_exe = QLineEdit()
+        self.ent_node_process_names = QLineEdit()
+        for ent in (
+            self.ent_node_dcs,
+            self.ent_node_bind,
+            self.ent_node_auth,
+            self.ent_node_exe,
+            self.ent_node_process_names,
+        ):
+            ent.setStyleSheet(self._dialog_input_style())
+        self.ent_node_dcs.setPlaceholderText(r"D:\DCS")
+        self.ent_node_bind.setPlaceholderText("LAN IP (not 0.0.0.0)")
+        self.ent_node_auth.setPlaceholderText("Same token as Control Panel")
+        self.ent_node_exe.setPlaceholderText("Optional override, e.g. DCS_server.exe")
+        self.ent_node_process_names.setPlaceholderText("Optional extra names, comma-separated")
+
+        self.cmb_github_interval = QComboBox()
+        for _seconds, label in NODE_GITHUB_INTERVAL_CHOICES:
+            self.cmb_github_interval.addItem(label)
+        self.cmb_github_interval.setStyleSheet(self._dialog_input_style())
+
+        self.spn_watchdog_interval = QSpinBox()
+        self.spn_watchdog_interval.setRange(60, 3600)
+        self.spn_watchdog_interval.setSingleStep(30)
+        self.spn_watchdog_interval.setSuffix(" seconds")
+        self.spn_watchdog_interval.setValue(300)
+        self.spn_watchdog_interval.setStyleSheet(self._dialog_input_style())
+
+        self.chk_preserve = QCheckBox("Preserve current MissionScripting.lua")
+        self.chk_reboot = QCheckBox("Reboot Windows after DCS update completes")
+        self.chk_watchdog = QCheckBox("Watch DCS server health (process + port)")
+        self.chk_auto_restart = QCheckBox("Auto-restart DCS only after it was previously running")
+        for chk in (self.chk_preserve, self.chk_reboot, self.chk_watchdog, self.chk_auto_restart):
+            chk.setChecked(True)
+
+        node_form.addRow("DCS Main Folder:", self.ent_node_dcs)
+        node_form.addRow("Bind Address:", self.ent_node_bind)
+        node_form.addRow("Auth Token:", self.ent_node_auth)
+        node_form.addRow("GitHub app updates:", self.cmb_github_interval)
+        node_form.addRow("Watchdog interval:", self.spn_watchdog_interval)
+        node_form.addRow("DCS server exe:", self.ent_node_exe)
+        node_form.addRow("Process names:", self.ent_node_process_names)
+        node_form.addRow(self.chk_preserve)
+        node_form.addRow(self.chk_reboot)
+        node_form.addRow(self.chk_watchdog)
+        node_form.addRow(self.chk_auto_restart)
+        layout.addWidget(node_box)
+
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
+
+        buttons = QHBoxLayout()
+        self.btn_save = QPushButton(" Save locally ")
+        self.btn_save.setStyleSheet(
+            f"background-color: {STYLE_BTN_EDIT}; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.btn_save.clicked.connect(lambda: self.save_form_data(push_to_node=False))
+        self.btn_push = QPushButton(" Save & Push to Node 💾 ")
+        self.btn_push.setStyleSheet(
+            f"background-color: {STYLE_BTN_ADD}; color: white; font-weight: bold; padding: 8px;"
+        )
+        self.btn_push.clicked.connect(lambda: self.save_form_data(push_to_node=True))
+        self.btn_push.setEnabled(False)
+        buttons.addWidget(self.btn_save)
+        buttons.addWidget(self.btn_push)
+        outer.addLayout(buttons)
+
+        self._fill_node_settings_form(dict(NODE_SETTINGS_DEFAULTS))
+        self.ent_node_auth.setText(cached_auth_token)
+        ip, port = self.ent_ip.text().strip(), self.ent_port.text().strip()
+
+        def _fetch():
+            answer = send_socket_command(ip, port, "GET_SETTINGS")
+            global_signals.node_settings_loaded.emit(answer)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+        self.dialog.exec_()
+
+    def _fill_node_settings_form(self, settings: dict):
+        data = sanitize_node_settings(settings, NODE_SETTINGS_DEFAULTS)
+        self.ent_node_dcs.setText(str(data.get("dcs_main_folder", "")))
+        self.ent_node_bind.setText(str(data.get("bind_address", "0.0.0.0")))
+        self.ent_node_auth.setText(str(data.get("auth_token", "")))
+        self.ent_node_exe.setText(str(data.get("dcs_server_exe", "")))
+        names = data.get("dcs_server_process_names") or []
+        if isinstance(names, list):
+            self.ent_node_process_names.setText(", ".join(str(n) for n in names if n))
+        else:
+            self.ent_node_process_names.setText(str(names))
+        self.cmb_github_interval.setCurrentText(github_interval_label(data.get("github_check_interval")))
+        try:
+            self.spn_watchdog_interval.setValue(int(data.get("watchdog_interval_seconds") or 300))
+        except (TypeError, ValueError):
+            self.spn_watchdog_interval.setValue(300)
+        self.chk_preserve.setChecked(bool(data.get("preserve_mission_scripting", True)))
+        self.chk_reboot.setChecked(bool(data.get("reboot_after_deployment", True)))
+        self.chk_watchdog.setChecked(bool(data.get("watchdog_enabled", True)))
+        self.chk_auto_restart.setChecked(bool(data.get("auto_restart_dcs", True)))
+
+    def _collect_node_settings_from_form(self):
+        return {
+            "dcs_main_folder": self.ent_node_dcs.text().strip(),
+            "network_port": self.ent_port.text().strip(),
+            "bind_address": self.ent_node_bind.text().strip() or "0.0.0.0",
+            "auth_token": self.ent_node_auth.text().strip(),
+            "reboot_after_deployment": self.chk_reboot.isChecked(),
+            "github_check_interval": github_interval_seconds(self.cmb_github_interval.currentText()),
+            "watchdog_enabled": self.chk_watchdog.isChecked(),
+            "watchdog_interval_seconds": self.spn_watchdog_interval.value(),
+            "auto_restart_dcs": self.chk_auto_restart.isChecked(),
+            "preserve_mission_scripting": self.chk_preserve.isChecked(),
+            "dcs_server_exe": self.ent_node_exe.text().strip(),
+            "dcs_server_process_names": self.ent_node_process_names.text().strip(),
+        }
+
+    def _on_node_settings_loaded(self, answer):
+        dialog = getattr(self, "dialog", None)
+        if dialog is None or not dialog.isVisible():
+            return
+        if not hasattr(self, "lbl_node_settings_status"):
+            return
+        if not answer or not str(answer).startswith("{"):
+            text = str(answer or "")
+            if "UNKNOWN_COMMAND" in text:
+                self.lbl_node_settings_status.setText(
+                    "This Node is too old for remote settings. Update the Node, then try again."
+                )
+            elif not answer:
+                self.lbl_node_settings_status.setText(
+                    "Node unreachable. Connection fields can still be saved locally."
+                )
+            else:
+                self.lbl_node_settings_status.setText(
+                    f"Could not load Node settings: {text[:120]}"
+                )
+            self.btn_push.setEnabled(False)
+            return
+        try:
+            payload = json.loads(answer)
+        except Exception:
+            self.lbl_node_settings_status.setText("Could not parse Node settings.")
+            self.btn_push.setEnabled(False)
+            return
+        if payload.get("status") == "UNAUTHORIZED":
+            self.lbl_node_settings_status.setText(
+                "Unauthorized. Set the same auth token in Control Panel and on the Node."
+            )
+            self.btn_push.setEnabled(False)
+            return
+        settings = payload.get("settings") or {}
+        self._fill_node_settings_form(settings)
+        node_port = str(settings.get("network_port") or "").strip()
+        if node_port:
+            self.ent_port.setText(node_port)
+        self.lbl_node_settings_status.setText("Loaded live settings from the Node.")
+        self.btn_push.setEnabled(True)
+
+    def _on_node_settings_pushed(self, result):
+        dialog = getattr(self, "dialog", None)
+        if result is None:
+            if hasattr(self, "btn_push"):
+                self.btn_push.setEnabled(True)
+            if hasattr(self, "lbl_node_settings_status"):
+                self.lbl_node_settings_status.setText("Push failed — Node did not answer.")
+            QMessageBox.warning(
+                self,
+                "Push failed",
+                "The Node did not answer. Local connection was saved; settings were not pushed.",
+            )
+            return
+        if isinstance(result, str) and result.startswith("{"):
+            try:
+                payload = json.loads(result)
+            except Exception:
+                QMessageBox.warning(self, "Push failed", f"Unexpected Node reply:\n{result[:300]}")
+                return
+            if payload.get("status") == "ACK":
+                applied = payload.get("settings") or {}
+                new_port = str(applied.get("network_port") or self.ent_port.text().strip())
+                if new_port:
+                    self.ent_port.setText(new_port)
+                    if self.selected_row_index is not None:
+                        global_servers[self.selected_row_index]["port"] = new_port
+                        save_config_to_file()
+                QMessageBox.information(
+                    self,
+                    "Node settings",
+                    "Settings were pushed to the Node and applied.",
+                )
+                if dialog is not None:
+                    dialog.close()
+                self.selected_row_index = None
+                self.load_table_data()
+                return
+            QMessageBox.warning(
+                self,
+                "Push failed",
+                payload.get("message") or json.dumps(payload)[:300],
+            )
+            if hasattr(self, "btn_push"):
+                self.btn_push.setEnabled(True)
+            return
+        if "UNKNOWN_COMMAND" in str(result):
+            if hasattr(self, "btn_push"):
+                self.btn_push.setEnabled(True)
+            QMessageBox.warning(
+                self,
+                "Push failed",
+                "This Node is too old for remote settings. Update the Node, then try again.",
+            )
+            return
+        if hasattr(self, "btn_push"):
+            self.btn_push.setEnabled(True)
+        QMessageBox.warning(self, "Push failed", f"Unexpected Node reply:\n{str(result)[:300]}")
+
+    def save_form_data(self, push_to_node=False):
         n, ip, p = self.ent_name.text().strip(), self.ent_ip.text().strip(), self.ent_port.text().strip()
-        if not n or not ip or not p: return
-        is_edit = hasattr(self, 'selected_row_index') and self.selected_row_index is not None and "Edit" in self.dialog.windowTitle()
+        if not n or not ip or not p:
+            return
+        is_edit = (
+            hasattr(self, "selected_row_index")
+            and self.selected_row_index is not None
+            and "Edit" in self.dialog.windowTitle()
+        )
         for idx, s in enumerate(global_servers):
-            if is_edit and idx == self.selected_row_index: continue
+            if is_edit and idx == self.selected_row_index:
+                continue
             if s["ip"].lower() == ip.lower() and str(s["port"]) == str(p):
-                QMessageBox.critical(self, "Error", "Server already exists!"); return
-        if is_edit: global_servers[self.selected_row_index] = {"name": n, "ip": ip, "port": p}
-        else: global_servers.append({"name": n, "ip": ip, "port": p})
-        save_config_to_file(); self.selected_row_index = None; self.load_table_data(); self.dialog.close()
+                QMessageBox.critical(self, "Error", "Server already exists!")
+                return
+        record = {"name": n, "ip": ip, "port": p}
+        if is_edit:
+            global_servers[self.selected_row_index] = record
+        else:
+            global_servers.append(record)
+        save_config_to_file()
+        if not push_to_node:
+            self.selected_row_index = None
+            self.load_table_data()
+            self.dialog.close()
+            return
+
+        settings = sanitize_node_settings(self._collect_node_settings_from_form())
+        payload = "SET_SETTINGS " + json.dumps(settings, ensure_ascii=False, separators=(",", ":"))
+        self.btn_push.setEnabled(False)
+        self.lbl_node_settings_status.setText("Pushing settings to the Node...")
+
+        def _push():
+            answer = send_socket_command(ip, p, payload)
+            global_signals.node_settings_pushed.emit(answer)
+
+        threading.Thread(target=_push, daemon=True).start()
 
     def remove_server(self):
         if self.selected_row_index is not None and QMessageBox.question(self, "Delete", "Permanently remove server?") == QMessageBox.Yes:

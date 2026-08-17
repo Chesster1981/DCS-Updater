@@ -26,6 +26,10 @@ from dcs_ru_common import (
     scrape_dcs_latest_version,
     wrap_command,
     github_api_headers,
+    NODE_SETTINGS_DEFAULTS,
+    github_interval_label,
+    github_interval_seconds,
+    sanitize_node_settings,
 )
 from brand_assets import (
     BRAND_ASSET_VERSION,
@@ -55,7 +59,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.46"
+CURRENT_NODE_VERSION = "2.1.47"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -158,34 +162,75 @@ def get_resource_path(relative_path):
 
 def load_node_settings():
     absolute_config_path = os.path.join(application_path, CONFIG_FILE)
-    fallback_defaults = {
-        "dcs_main_folder": r"D:\DCS",
-        "preserve_mission_scripting": True,
-        "network_port": "1015",
-        "bind_address": "0.0.0.0",
-        "auth_token": "",
-        "reboot_after_deployment": True,
-        "github_check_interval": 43200,
-        "watchdog_enabled": True,
-        "watchdog_interval_seconds": WATCHDOG_DEFAULT_INTERVAL,
-        "auto_restart_dcs": True,
-        "dcs_server_exe": "",
-        "dcs_server_process_names": [],
-    }
+    fallback_defaults = dict(NODE_SETTINGS_DEFAULTS)
     if os.path.exists(absolute_config_path):
         try:
             with open(absolute_config_path, "r", encoding="utf-8") as f:
                 loaded_data = json.load(f)
                 if isinstance(loaded_data, dict):
-                    for key, val in fallback_defaults.items():
-                        if key not in loaded_data:
-                            loaded_data[key] = val
-                    return loaded_data
+                    return sanitize_node_settings({}, loaded_data)
         except Exception as e:
             logging.error(f"Failed to read config layout: {e}")
     return fallback_defaults
 
 handle_single_instance_takeover()
+
+
+def write_node_settings_file(settings: dict) -> str:
+    absolute_config_path = os.path.join(application_path, CONFIG_FILE)
+    with open(absolute_config_path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=4, ensure_ascii=False)
+    return absolute_config_path
+
+
+def sync_settings_widgets(settings: dict):
+    """Mirror saved settings onto the Node settings form if it exists."""
+
+    def _apply():
+        try:
+            ent_dcs.delete(0, tk.END)
+            ent_dcs.insert(0, str(settings.get("dcs_main_folder", r"D:\DCS")))
+            ent_port.delete(0, tk.END)
+            ent_port.insert(0, str(settings.get("network_port", "1015")))
+            ent_bind.delete(0, tk.END)
+            ent_bind.insert(0, str(settings.get("bind_address", "0.0.0.0")))
+            ent_auth.delete(0, tk.END)
+            ent_auth.insert(0, str(settings.get("auth_token", "")))
+            opt_update_var.set(github_interval_label(settings.get("github_check_interval", 43200)))
+            v_preserve.set(bool(settings.get("preserve_mission_scripting", True)))
+            v_reboot.set(bool(settings.get("reboot_after_deployment", True)))
+            v_watchdog.set(bool(settings.get("watchdog_enabled", True)))
+            v_auto_restart.set(bool(settings.get("auto_restart_dcs", True)))
+        except Exception:
+            pass
+
+    try:
+        if "root" in globals() and root.winfo_exists():
+            root.after(0, _apply)
+            return
+    except Exception:
+        pass
+    _apply()
+
+
+def apply_node_settings(incoming: dict, source="ui"):
+    """Write sanitized settings and restart the listener if bind/port changed."""
+    existing = load_node_settings()
+    merged = sanitize_node_settings(incoming, existing)
+    old_port = str(existing.get("network_port", "1015"))
+    old_bind = str(existing.get("bind_address", "0.0.0.0"))
+    write_node_settings_file(merged)
+    sync_settings_widgets(merged)
+    new_port = str(merged.get("network_port", "1015"))
+    new_bind = str(merged.get("bind_address", "0.0.0.0"))
+    listener_restart = new_port != old_port or new_bind != old_bind
+    tag = "REMOTE" if source == "remote" else "SETTINGS"
+    append_activity_log(f"[{tag}] Node settings saved.")
+    if listener_restart:
+        append_activity_log(f"[{tag}] Restarting listener on {new_bind}:{new_port}...")
+        start_or_restart_listener(new_port, new_bind)
+    return merged, listener_restart
+
 
 # =========================================================================
 # BLOCK 2 OF 6: ASYNCHRONOUS HTML WEB SCRAPER, DISK PARSING & SEPARATE AUTO-SWAP PROCESS
@@ -1106,7 +1151,7 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
             try:
                 # Reload token so settings changes apply without full restart of process
                 live_token = str(load_node_settings().get("auth_token", "")).strip()
-                data = conn.recv(1024)
+                data = conn.recv(65536)
                 if not data:
                     conn.close()
                     continue
@@ -1134,6 +1179,58 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                     }
                     conn.send((json.dumps(response) + "\n").encode("utf-8"))
                     conn.close()
+                elif command == "GET_SETTINGS":
+                    response = {
+                        "status": "ACK",
+                        "settings": load_node_settings(),
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                elif command.startswith("SET_SETTINGS"):
+                    if is_swapping:
+                        conn.send((json.dumps({
+                            "status": "REJECTED_BUSY",
+                            "task": "Updating",
+                        }) + "\n").encode("utf-8"))
+                        conn.close()
+                    else:
+                        raw_payload = command[len("SET_SETTINGS"):].strip()
+                        try:
+                            incoming = json.loads(raw_payload) if raw_payload else {}
+                            if not isinstance(incoming, dict):
+                                raise ValueError("settings payload must be a JSON object")
+                        except Exception as e:
+                            conn.send((json.dumps({
+                                "status": "ERROR",
+                                "message": f"Invalid settings JSON: {e}",
+                            }) + "\n").encode("utf-8"))
+                            conn.close()
+                        else:
+                            existing = load_node_settings()
+                            merged = sanitize_node_settings(incoming, existing)
+                            old_port = str(existing.get("network_port", "1015"))
+                            old_bind = str(existing.get("bind_address", "0.0.0.0"))
+                            write_node_settings_file(merged)
+                            listener_restart = (
+                                str(merged.get("network_port", "1015")) != old_port
+                                or str(merged.get("bind_address", "0.0.0.0")) != old_bind
+                            )
+                            conn.send((json.dumps({
+                                "status": "ACK",
+                                "settings": merged,
+                                "listener_restart": listener_restart,
+                            }) + "\n").encode("utf-8"))
+                            conn.close()
+                            append_activity_log("[REMOTE] Node settings updated from Control Panel.")
+                            sync_settings_widgets(merged)
+                            if listener_restart:
+                                def _restart_after_settings():
+                                    time.sleep(0.2)
+                                    start_or_restart_listener(
+                                        merged.get("network_port"),
+                                        merged.get("bind_address"),
+                                    )
+                                threading.Thread(target=_restart_after_settings, daemon=True).start()
                 elif command == "TRIGGER_DCS_UPDATE":
                     if node_state["active_task"] == "Idle":
                         response = {"status": "OK_STARTING"}
@@ -1300,10 +1397,7 @@ def show_settings_frame():
         ent_auth.insert(0, str(cfg.get("auth_token", "")))
 
         saved_seconds = int(cfg.get("github_check_interval", 43200))
-        if saved_seconds == 600: opt_update_var.set("Every 10 minutes")
-        elif saved_seconds == 3600: opt_update_var.set("Every 1 Hour")
-        elif saved_seconds == 43200: opt_update_var.set("Every 12 Hours")
-        else: opt_update_var.set("Disabled")
+        opt_update_var.set(github_interval_label(saved_seconds))
         
         v_preserve.set(bool(cfg.get("preserve_mission_scripting", True)))
         v_reboot.set(bool(cfg.get("reboot_after_deployment", True)))
@@ -1316,29 +1410,18 @@ def show_settings_frame():
         show_main_frame()
 
 def save_settings_to_file():
-    menu_string = opt_update_var.get()
-    if "10 minutes" in menu_string: seconds = 600
-    elif "1 Hour" in menu_string: seconds = 3600
-    elif "12 Hours" in menu_string: seconds = 43200
-    else: seconds = -1
-    
-    current_settings = {
+    incoming = {
         "dcs_main_folder": ent_dcs.get(),
         "preserve_mission_scripting": v_preserve.get(),
         "network_port": ent_port.get(),
         "bind_address": ent_bind.get().strip() or "0.0.0.0",
         "auth_token": ent_auth.get().strip(),
         "reboot_after_deployment": v_reboot.get(),
-        "github_check_interval": seconds,
+        "github_check_interval": github_interval_seconds(opt_update_var.get()),
         "watchdog_enabled": v_watchdog.get(),
-        "watchdog_interval_seconds": WATCHDOG_DEFAULT_INTERVAL,
         "auto_restart_dcs": v_auto_restart.get(),
     }
-    absolute_config_path = os.path.join(application_path, CONFIG_FILE)
-    with open(absolute_config_path, "w", encoding="utf-8") as f:
-        json.dump(current_settings, f, indent=4, ensure_ascii=False)
-
-    start_or_restart_listener(current_settings["network_port"], current_settings["bind_address"])
+    apply_node_settings(incoming, source="ui")
     show_main_frame()
 
 def create_tray_image():

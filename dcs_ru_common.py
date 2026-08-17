@@ -42,6 +42,111 @@ DEFAULT_MASTER_CONFIG: dict[str, Any] = {
     },
 }
 
+NODE_SETTINGS_DEFAULTS: dict[str, Any] = {
+    "dcs_main_folder": r"D:\DCS",
+    "preserve_mission_scripting": True,
+    "network_port": "1015",
+    "bind_address": "0.0.0.0",
+    "auth_token": "",
+    "reboot_after_deployment": True,
+    "github_check_interval": 43200,
+    "watchdog_enabled": True,
+    "watchdog_interval_seconds": 300,
+    "auto_restart_dcs": True,
+    "dcs_server_exe": "",
+    "dcs_server_process_names": [],
+}
+
+NODE_GITHUB_INTERVAL_CHOICES: tuple[tuple[int, str], ...] = (
+    (600, "Every 10 minutes"),
+    (3600, "Every 1 Hour"),
+    (43200, "Every 12 Hours"),
+    (-1, "Disabled"),
+)
+
+
+def github_interval_label(seconds: Any) -> str:
+    try:
+        value = int(seconds)
+    except (TypeError, ValueError):
+        value = 43200
+    for choice, label in NODE_GITHUB_INTERVAL_CHOICES:
+        if choice == value:
+            return label
+    return "Every 12 Hours"
+
+
+def github_interval_seconds(label: str) -> int:
+    text = str(label or "")
+    for seconds, choice in NODE_GITHUB_INTERVAL_CHOICES:
+        if choice == text:
+            return seconds
+    if "10 minutes" in text:
+        return 600
+    if "1 Hour" in text:
+        return 3600
+    if "12 Hours" in text:
+        return 43200
+    return -1
+
+
+def sanitize_node_settings(
+    incoming: Optional[dict] = None,
+    existing: Optional[dict] = None,
+) -> dict[str, Any]:
+    """Merge known Node settings with defaults. Unknown keys on existing are kept."""
+    merged: dict[str, Any] = dict(NODE_SETTINGS_DEFAULTS)
+    if isinstance(existing, dict):
+        for key, value in existing.items():
+            merged[key] = value
+    if not isinstance(incoming, dict):
+        return merged
+
+    bool_keys = {
+        "preserve_mission_scripting",
+        "reboot_after_deployment",
+        "watchdog_enabled",
+        "auto_restart_dcs",
+    }
+    for key in NODE_SETTINGS_DEFAULTS:
+        if key not in incoming:
+            continue
+        value = incoming[key]
+        if key in bool_keys:
+            if isinstance(value, str):
+                merged[key] = value.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                merged[key] = bool(value)
+        elif key == "github_check_interval":
+            try:
+                merged[key] = int(value)
+            except (TypeError, ValueError):
+                merged[key] = NODE_SETTINGS_DEFAULTS[key]
+        elif key == "watchdog_interval_seconds":
+            try:
+                seconds = int(value)
+            except (TypeError, ValueError):
+                seconds = NODE_SETTINGS_DEFAULTS[key]
+            merged[key] = max(60, seconds)
+        elif key == "network_port":
+            text = str(value).strip()
+            try:
+                port = int(text)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                merged[key] = str(port)
+        elif key == "dcs_server_process_names":
+            if isinstance(value, str):
+                merged[key] = [part.strip() for part in value.split(",") if part.strip()]
+            elif isinstance(value, list):
+                merged[key] = [str(part).strip() for part in value if str(part).strip()]
+        elif key == "bind_address":
+            merged[key] = str(value).strip() or "0.0.0.0"
+        elif key in ("dcs_main_folder", "auth_token", "dcs_server_exe"):
+            merged[key] = str(value).strip() if value is not None else ""
+    return merged
+
 
 def wrap_command(command: str, auth_token: Optional[str] = None) -> str:
     """Build a wire payload. When auth_token is set: TOKEN|COMMAND\\n"""
