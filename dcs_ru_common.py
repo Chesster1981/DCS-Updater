@@ -27,6 +27,34 @@ DCS_UPDATE_URLS = (
     "https://www.digitalcombatsimulator.com/en/news/",
 )
 
+SRS_GITHUB_REPO = "ciribob/DCS-SimpleRadioStandalone"
+SRS_AUTOCONNECT_LUA = "DCS-SRS-AutoConnectGameGUI.lua"
+_UNKNOWN_SRS_VERSIONS = frozenset({"", "unknown", "missing", "not set", "—", "-"})
+
+
+def normalize_release_tag(value: Any) -> str:
+    return str(value or "").strip().lstrip("vV").strip()
+
+
+def parse_srs_autoconnect_version_line(line: str) -> str:
+    """Installed SRS version is the first line of DCS-SRS-AutoConnectGameGUI.lua."""
+    text = str(line or "").strip()
+    match = re.search(r"(\d+(?:\.\d+){1,})", text)
+    if match:
+        return match.group(1)
+    cleaned = text.lstrip("-").strip()
+    if cleaned.lower().startswith("version"):
+        cleaned = cleaned[7:].strip()
+    return cleaned
+
+
+def srs_version_is_current(installed: Any, latest: Any) -> bool:
+    installed_tag = normalize_release_tag(installed).lower()
+    latest_tag = normalize_release_tag(latest).lower()
+    if installed_tag in _UNKNOWN_SRS_VERSIONS or latest_tag in _UNKNOWN_SRS_VERSIONS:
+        return False
+    return installed_tag == latest_tag
+
 VERSION_PATTERNS = (
     r"Latest stable version is\s*([\d\.]+)",
     r"stable version[^0-9]*([\d]+\.[\d]+\.[\d]+\.[\d]+)",
@@ -55,12 +83,14 @@ NODE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "auto_restart_dcs": True,
     "dcs_server_exe": "",
     "dcs_server_process_names": [],
+    "srs_install_folder": "",
 }
 
 NODE_LOCAL_ONLY_SETTING_KEYS = (
     "dcs_main_folder",
     "dcs_server_exe",
     "dcs_server_process_names",
+    "srs_install_folder",
 )
 
 NODE_GITHUB_INTERVAL_CHOICES: tuple[tuple[int, str], ...] = (
@@ -155,7 +185,7 @@ def sanitize_node_settings(
                 merged[key] = [str(part).strip() for part in value if str(part).strip()]
         elif key == "bind_address":
             merged[key] = str(value).strip() or "0.0.0.0"
-        elif key in ("dcs_main_folder", "auth_token", "dcs_server_exe"):
+        elif key in ("dcs_main_folder", "auth_token", "dcs_server_exe", "srs_install_folder"):
             merged[key] = str(value).strip() if value is not None else ""
     return merged
 
@@ -375,6 +405,40 @@ def github_api_headers(user_agent: str = "DCS-Norway-Remote-Updater") -> dict[st
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def fetch_latest_srs_release(timeout: float = 15.0) -> Optional[dict[str, str]]:
+    """Return {tag, name, url} for DCS-SimpleRadioStandalone-x.x.x.x.zip, or None."""
+    url = f"https://api.github.com/repos/{SRS_GITHUB_REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers=github_api_headers("DCS-Norway-Remote-Updater"),
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        logger.warning("SRS GitHub latest release failed: %s", e)
+        return None
+    tag = str(data.get("tag_name") or "").lstrip("vV").strip()
+    zip_asset = None
+    for asset in data.get("assets") or []:
+        name = str(asset.get("name") or "")
+        lowered = name.lower()
+        if lowered.startswith("dcs-simpleradiostandalone-") and lowered.endswith(".zip"):
+            zip_asset = asset
+            break
+    if zip_asset is None:
+        logger.warning("SRS release %s has no DCS-SimpleRadioStandalone-*.zip asset", tag)
+        return None
+    download_url = str(zip_asset.get("browser_download_url") or "")
+    if not tag or not download_url:
+        return None
+    return {
+        "tag": tag,
+        "name": str(zip_asset.get("name") or ""),
+        "url": download_url,
+    }
 
 
 def get_discord_bot_token() -> Optional[str]:

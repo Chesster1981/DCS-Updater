@@ -58,7 +58,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.48"
+CONTROL_PANEL_VERSION = "2.1.49"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -98,17 +98,21 @@ STYLE_BTN_ADD      = "#195C2E"
 STYLE_BTN_EDIT     = "#1A5A99" 
 STYLE_BTN_REMOVE   = "#8A2B2B" 
 STYLE_BTN_DEPLOY   = "#00912E" 
+STYLE_BTN_SRS      = "#0A84FF" 
 
 STYLE_BTN_ADD_HOVER    = "#227C3F" 
 STYLE_BTN_EDIT_HOVER   = "#247ACC" 
 STYLE_BTN_REMOVE_HOVER = "#A83636" 
 STYLE_BTN_DEPLOY_HOVER = "#00B339" 
+STYLE_BTN_SRS_HOVER    = "#409CFF" 
 # ==============================================================================
 # PART 2 OF 5: NETWORK INFRASTRUCTURE, ASYNCHRONOUS STATUS ENGINE & SIGNALS
 # ==============================================================================
 class ClusterSignals(QObject):
     node_updated = Signal(str, str, str, str, str)
+    srs_versions_updated = Signal(str, str, str)
     cloud_version_updated = Signal(str)
+    srs_cloud_version_updated = Signal(str)
     append_log = Signal(str)
     deployment_state_changed = Signal(bool)
     timeout_triggered = Signal(str, object)
@@ -124,6 +128,7 @@ global_signals = ClusterSignals()
 global_servers = []
 is_deployment_running = False
 cached_latest_cloud_version = "Fetching..."
+cached_latest_srs_version = "Fetching..."
 cached_auth_token = ""
 cached_discord_meta = {"panel_channel_id": None, "panel_message_id": None}
 
@@ -203,6 +208,22 @@ def parse_socket_response(answer):
         return "OFFLINE", "UNKNOWN", "Unknown", "Idle", ""
 
 
+def parse_srs_from_ping(answer):
+    if not answer or not str(answer).startswith("{"):
+        return "—", "Unknown"
+    try:
+        data = json.loads(answer)
+        if data.get("status") == "UNAUTHORIZED":
+            return "—", "—"
+        installed = str(data.get("srs_installed_version") or "").strip() or "—"
+        latest = str(data.get("srs_latest_version") or "").strip() or "Unknown"
+        if not data.get("srs_configured") and installed in ("", "Not set", "—"):
+            installed = "Not set"
+        return installed, latest
+    except Exception:
+        return "—", "Unknown"
+
+
 def send_socket_command(ip, port, command_str):
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -222,12 +243,16 @@ def test_single_system_background(index, ip, port, window_ref=None):
     row_id_str = str(index)
     answer = send_socket_command(ip, port, "PING_STATUS")
     status, local_ver, cloud_ver, active_task, node_ver = parse_socket_response(answer)
+    srs_installed, srs_latest = parse_srs_from_ping(answer)
     if status == "ONLINE" and cloud_ver not in ("Unknown", "Fetching..."):
         global_signals.cloud_version_updated.emit(cloud_ver)
     # Still accept cloud version when DCS is down — node agent is alive
     if status == "DCS DOWN" and cloud_ver not in ("Unknown", "Fetching..."):
         global_signals.cloud_version_updated.emit(cloud_ver)
+    if srs_latest not in ("Unknown", "Fetching...", "—", ""):
+        global_signals.srs_cloud_version_updated.emit(srs_latest)
     global_signals.node_updated.emit(row_id_str, status, local_ver, active_task, node_ver)
+    global_signals.srs_versions_updated.emit(row_id_str, srs_installed, srs_latest)
 
 def automatic_status_monitor(window_ref=None):
     while True:
@@ -310,8 +335,8 @@ class MainWindow(QMainWindow):
         self.main_layout.addLayout(self.header_layout)
         
         self.table = QTableWidget()
-        self.table.setColumnCount(7) 
-        self.table.setHorizontalHeaderLabels(["Select", "Server Name", "IP Address", "Port", "Installed Ver.", "Latest ED Ver.", "Live Status"])
+        self.table.setColumnCount(9) 
+        self.table.setHorizontalHeaderLabels(["Select", "Server Name", "IP Address", "Port", "Installed Ver.", "Latest ED Ver.", "SRS Ver.", "Latest SRS", "Live Status"])
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: #111112; gridline-color: #2C2C30; border: 1px solid #2C2C30; }}"
             f"QTableWidget::item {{ color: {STYLE_TEXT_WHITE}; selection-color: {STYLE_TEXT_WHITE}; padding: 4px 10px; }}"
@@ -365,11 +390,16 @@ class MainWindow(QMainWindow):
         self.main_layout.addLayout(self.actions_row_layout)
         
         self.deploy_row_layout = QHBoxLayout()
+        self.button_srs = QPushButton(" UPDATE SRS 📻 ")
+        self.button_srs.setStyleSheet(f"QPushButton {{ background-color: {STYLE_BTN_SRS}; color: white; font-size: 13px; font-weight: bold; border-radius: 6px; padding: 22px; border: none; }} QPushButton:hover {{ background-color: {STYLE_BTN_SRS_HOVER}; }}")
+        self.button_srs.setFixedWidth(220)
+        self.button_srs.setFixedHeight(58)
         self.button_deploy = QPushButton(" DEPLOY SEQUENTIAL UPDATES 🚀 ")
         self.button_deploy.setStyleSheet(f"QPushButton {{ background-color: {STYLE_BTN_DEPLOY}; color: white; font-size: 13px; font-weight: bold; border-radius: 6px; padding: 22px; border: none; }} QPushButton:hover {{ background-color: {STYLE_BTN_DEPLOY_HOVER}; }}")
         self.button_deploy.setFixedWidth(340)
         self.button_deploy.setFixedHeight(58)
         self.deploy_row_layout.addStretch()
+        self.deploy_row_layout.addWidget(self.button_srs, 0, Qt.AlignRight)
         self.deploy_row_layout.addWidget(self.button_deploy, 0, Qt.AlignRight)
         self.main_layout.addLayout(self.deploy_row_layout)
         
@@ -383,7 +413,9 @@ class MainWindow(QMainWindow):
         self.main_layout.addWidget(self.log_console)
         
         global_signals.node_updated.connect(self.slot_node_updated)
+        global_signals.srs_versions_updated.connect(self.slot_srs_versions_updated)
         global_signals.cloud_version_updated.connect(self.slot_cloud_version_updated)
+        global_signals.srs_cloud_version_updated.connect(self.slot_srs_cloud_version_updated)
         global_signals.append_log.connect(self.slot_append_log)
         global_signals.deployment_state_changed.connect(self.slot_deployment_state_changed)
         global_signals.control_update_check_finished.connect(self._finish_update_check)
@@ -398,6 +430,7 @@ class MainWindow(QMainWindow):
         self.btn_edit.clicked.connect(lambda: self.show_form_dialog(edit_mode=True))
         self.btn_remove.clicked.connect(self.remove_server)
         self.button_deploy.clicked.connect(self.confirm_and_deploy)
+        self.button_srs.clicked.connect(self.confirm_and_update_srs)
         self._fit_timer = QTimer(self)
         self._fit_timer.setSingleShot(True)
         self._fit_timer.setInterval(50)
@@ -675,7 +708,7 @@ class MainWindow(QMainWindow):
         node_form.addRow(self.chk_reboot)
         node_form.addRow(self.chk_watchdog)
         node_form.addRow(self.chk_auto_restart)
-        note = QLabel("DCS folder, server exe and process names are set locally on the Node.")
+        note = QLabel("DCS folder, SRS folder, server exe and process names are set locally on the Node.")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {STYLE_TEXT_MUTED}; font-size: 11px;")
         node_form.addRow(note)
@@ -891,7 +924,12 @@ class MainWindow(QMainWindow):
             self.table.setItem(idx, 1, QTableWidgetItem(s["name"]))
             self.table.setItem(idx, 2, QTableWidgetItem(s["ip"]))
             self.table.setItem(idx, 3, QTableWidgetItem(s["port"]))
-            for col, name, txt, color in [(4, "ver_text", "FETCHING...", STYLE_STATUS_WARN), (5, "cloud_text", cached_latest_cloud_version, STYLE_TEXT_WHITE)]:
+            for col, name, txt, color in [
+                (4, "ver_text", "FETCHING...", STYLE_STATUS_WARN),
+                (5, "cloud_text", cached_latest_cloud_version, STYLE_TEXT_WHITE),
+                (6, "srs_ver_text", "FETCHING...", STYLE_STATUS_WARN),
+                (7, "srs_cloud_text", cached_latest_srs_version, STYLE_TEXT_WHITE),
+            ]:
                 w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(CELL_TEXT_PAD, 0, CELL_TEXT_PAD, 0)
                 lbl = QLabel(txt); lbl.setObjectName(name)
                 lbl.setAlignment(Qt.AlignCenter)
@@ -906,7 +944,7 @@ class MainWindow(QMainWindow):
             st.setWordWrap(False)
             st.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
             sl.addWidget(lf); sl.addWidget(st); sl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); sc.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
-            self.table.setCellWidget(idx, 6, sc)
+            self.table.setCellWidget(idx, 8, sc)
         for idx in range(self.table.rowCount()):
             self.table.setRowHeight(idx, TABLE_ROW_HEIGHT)
         self.fit_table_and_window()
@@ -956,7 +994,7 @@ class MainWindow(QMainWindow):
             width = self._text_pixel_width(title, header.font()) + header_pad
             if col == 0:
                 width = max(width, 52)
-            elif col in (4, 5):
+            elif col in (4, 5, 6, 7):
                 for row in range(self.table.rowCount()):
                     cell = self.table.cellWidget(row, col)
                     if cell is None:
@@ -968,9 +1006,9 @@ class MainWindow(QMainWindow):
                         width,
                         self._text_pixel_width(lbl.text(), lbl.font()) + CELL_TEXT_PAD * 2 + 8,
                     )
-            elif col == 6:
+            elif col == 8:
                 for row in range(self.table.rowCount()):
-                    cell = self.table.cellWidget(row, 6)
+                    cell = self.table.cellWidget(row, 8)
                     if cell is None:
                         continue
                     st = cell.findChild(QLabel, "status_text")
@@ -985,9 +1023,9 @@ class MainWindow(QMainWindow):
                         continue
                     font = self.table.font()
                     width = max(width, self._text_pixel_width(item.text(), font) + item_pad)
-            if col in (4, 5):
+            if col in (4, 5, 6, 7):
                 width = int(round(width * 1.20))
-            elif col == 6:
+            elif col == 8:
                 width = int(round(width * 1.10))
             widths.append(width)
         return widths
@@ -1073,7 +1111,7 @@ class MainWindow(QMainWindow):
             display_name = base_name
         self.table.setItem(idx, 1, QTableWidgetItem(display_name))
         
-        sc = self.table.cellWidget(idx, 6)
+        sc = self.table.cellWidget(idx, 8)
         if sc:
             lf, st = sc.findChild(QFrame, "status_lamp"), sc.findChild(QLabel, "status_text")
             if lf and st:
@@ -1153,13 +1191,64 @@ class MainWindow(QMainWindow):
                     
                 ver_lbl.setStyleSheet(f"color: {cv}; font-weight: bold; background: transparent;")
 
+    @Slot(str, str, str)
+    def slot_srs_versions_updated(self, row_id_str, srs_installed, srs_latest):
+        global cached_latest_srs_version
+        idx = int(row_id_str)
+        if idx >= self.table.rowCount():
+            return
+        latest_clean = str(srs_latest or "").strip()
+        if latest_clean not in ("", "Unknown", "Fetching...", "—"):
+            cached_latest_srs_version = latest_clean
+        inst_clean = str(srs_installed or "").strip()
+        vc = self.table.cellWidget(idx, 6)
+        if vc and (lbl := vc.findChild(QLabel, "srs_ver_text")):
+            lbl.setText(inst_clean or "—")
+            if inst_clean in ("UNKNOWN", "FETCHING...", "Missing", "Not set", "—", ""):
+                cv = STYLE_STATUS_WARN
+            elif latest_clean in ("Fetching...", "Unknown", "", "—"):
+                cv = STYLE_STATUS_GREEN
+            elif inst_clean != latest_clean:
+                cv = STYLE_STATUS_RED
+            else:
+                cv = STYLE_STATUS_GREEN
+            lbl.setStyleSheet(f"color: {cv}; font-weight: bold; background: transparent;")
+        cc = self.table.cellWidget(idx, 7)
+        if cc and (cloud_lbl := cc.findChild(QLabel, "srs_cloud_text")):
+            cloud_lbl.setText(cached_latest_srs_version)
+        self.schedule_fit()
+
+    @Slot(str)
+    def slot_srs_cloud_version_updated(self, version_str):
+        global cached_latest_srs_version
+        cached_latest_srs_version = version_str
+        for i in range(self.table.rowCount()):
+            cc = self.table.cellWidget(i, 7)
+            if cc and (cloud_lbl := cc.findChild(QLabel, "srs_cloud_text")):
+                cloud_lbl.setText(version_str)
+            vc = self.table.cellWidget(i, 6)
+            if vc and (ver_lbl := vc.findChild(QLabel, "srs_ver_text")):
+                current_inst = str(ver_lbl.text()).strip()
+                cloud_clean = str(version_str).strip()
+                if current_inst in ("UNKNOWN", "FETCHING...", "Missing", "Not set", "—"):
+                    cv = STYLE_STATUS_WARN
+                elif cloud_clean in ("Fetching...", "Unknown"):
+                    cv = STYLE_STATUS_GREEN
+                elif current_inst != cloud_clean:
+                    cv = STYLE_STATUS_RED
+                else:
+                    cv = STYLE_STATUS_GREEN
+                ver_lbl.setStyleSheet(f"color: {cv}; font-weight: bold; background: transparent;")
+        self.schedule_fit()
+
     @Slot(str)
     def slot_append_log(self, text): 
         self.log_console.append(f"[{datetime.now().strftime('%H:%M:%S')}] {text}")
 
     @Slot(bool)
     def slot_deployment_state_changed(self, run):
-        for b in [self.button_deploy, self.btn_add, self.btn_edit, self.btn_remove]: b.setEnabled(not run)
+        for b in [self.button_deploy, self.button_srs, self.btn_add, self.btn_edit, self.btn_remove]:
+            b.setEnabled(not run)
 
     @Slot(str, object)
     def slot_handle_timeout(self, server_name, response_container):
@@ -1254,6 +1343,8 @@ class MainWindow(QMainWindow):
                 if final_chk:
                     status, inst, _, task, node_ver = parse_socket_response(final_chk)
                     global_signals.node_updated.emit(str(idx), status, inst, task, node_ver)
+                    srs_installed, srs_latest = parse_srs_from_ping(final_chk)
+                    global_signals.srs_versions_updated.emit(str(idx), srs_installed, srs_latest)
                 else:
                     global_signals.node_updated.emit(str(idx), "OFFLINE", "FETCHING...", "Rebooting", "")
                     
@@ -1261,10 +1352,113 @@ class MainWindow(QMainWindow):
         is_deployment_running = False
         global_signals.deployment_state_changed.emit(False)
 
+    def run_sequential_srs_thread(self):
+        global is_deployment_running
+        is_deployment_running = True
+        global_signals.deployment_state_changed.emit(True)
+        global_signals.append_log.emit("=== STARTING SEQUENTIAL SRS SERVER UPDATES ===")
+
+        for idx in range(self.table.rowCount()):
+            cw = self.table.cellWidget(idx, 0)
+            if cw and (cb := cw.findChild(QCheckBox)) and not cb.isChecked():
+                continue
+
+            sd = global_servers[idx]
+            n, ip, p = sd["name"], sd["ip"], sd["port"]
+            global_signals.append_log.emit(f" [QUEUE] SRS update ▶️ {n} ({ip}:{p})...")
+            global_signals.node_updated.emit(str(idx), "ONLINE", "FETCHING...", "Updating SRS", "")
+
+            try:
+                ans = send_socket_command(ip, p, "TRIGGER_SRS_UPDATE")
+                if not ans:
+                    global_signals.append_log.emit(f" [ ❌ {n}] Node did not answer.")
+                    continue
+                if "UNKNOWN_COMMAND" in str(ans):
+                    global_signals.append_log.emit(f" [ ❌ {n}] Node is too old for SRS updates.")
+                    continue
+                if ans.startswith("{"):
+                    res_json = json.loads(ans)
+                    if res_json.get("status") == "UNAUTHORIZED":
+                        global_signals.append_log.emit(
+                            f" [ 🔐 {n}] Unauthorized — set the same auth_token in Control Panel and on this Node."
+                        )
+                        global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                        continue
+                    if res_json.get("status") == "REJECTED_BUSY":
+                        global_signals.append_log.emit(f" [ ⚠️ {n}] Node busy: {res_json.get('task', 'unknown')}")
+                        continue
+                    if res_json.get("status") == "ERROR":
+                        global_signals.append_log.emit(
+                            f" [ ❌ {n}] {res_json.get('message') or 'SRS install folder is not set on this Node.'}"
+                        )
+                        continue
+                    if res_json.get("status") != "OK_STARTING":
+                        global_signals.append_log.emit(f" [ ❌ {n}] Request rejected by node.")
+                        continue
+                elif "OK_STARTING" not in ans:
+                    global_signals.append_log.emit(f" [ ❌ {n}] Request rejected by node.")
+                    continue
+
+                global_signals.append_log.emit(f" [ ✅ {n}] SRS update triggered. Waiting for Idle...")
+                finished = False
+                while not finished:
+                    start_time = time.time()
+                    while time.time() - start_time < 1800:
+                        chk = send_socket_command(ip, p, "PING_STATUS")
+                        if chk and chk.startswith("{"):
+                            response_json = json.loads(chk)
+                            if response_json.get("status") == "UNAUTHORIZED":
+                                global_signals.append_log.emit(f" [ 🔐 {n}] Unauthorized during monitor.")
+                                global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                                finished = True
+                                break
+                            local_task = response_json.get("active_task", "Idle")
+                            local_ver = response_json.get("installed_version", "Unknown")
+                            node_ver = response_json.get("node_version", "1.0")
+                            global_signals.node_updated.emit(str(idx), "ONLINE", local_ver, local_task, node_ver)
+                            srs_installed, srs_latest = parse_srs_from_ping(chk)
+                            global_signals.srs_versions_updated.emit(str(idx), srs_installed, srs_latest)
+                            if local_task == "Idle":
+                                global_signals.append_log.emit(f" [ 🎉 {n}] SRS update finished.")
+                                finished = True
+                                break
+                        time.sleep(DEPLOY_CHECK_INTERVAL)
+                    if finished:
+                        break
+                    global_signals.append_log.emit(f" [ ⏳ {n}] SRS update taking unusually long. Prompting operator...")
+                    res_box = {"event": threading.Event(), "action": "skip"}
+                    global_signals.timeout_triggered.emit(n, res_box)
+                    res_box["event"].wait()
+                    if res_box["action"] == "skip":
+                        global_signals.append_log.emit(f" [ ⏭️ {n}] Operator skipped wait. Moving to next server.")
+                        break
+                    global_signals.append_log.emit(f" [ ⏳ {n}] Operator extended wait time. Continuing monitor...")
+            except Exception as e:
+                global_signals.append_log.emit(f" [ ❌ {n}] SRS sequential step failed: {e}")
+            finally:
+                final_chk = send_socket_command(ip, p, "PING_STATUS")
+                if final_chk:
+                    status, inst, _, task, node_ver = parse_socket_response(final_chk)
+                    global_signals.node_updated.emit(str(idx), status, inst, task, node_ver)
+                    srs_installed, srs_latest = parse_srs_from_ping(final_chk)
+                    global_signals.srs_versions_updated.emit(str(idx), srs_installed, srs_latest)
+                else:
+                    global_signals.append_log.emit(f" [ ❌ {n}] Node went offline during SRS update.")
+                    global_signals.node_updated.emit(str(idx), "OFFLINE", "FETCHING...", "Idle", "")
+
+        global_signals.append_log.emit("\n=== ALL SEQUENTIAL SRS UPDATES COMPLETED ===")
+        is_deployment_running = False
+        global_signals.deployment_state_changed.emit(False)
+
     def confirm_and_deploy(self):
         if QMessageBox.question(self, " Confirm ⚠️ ", "Execute sequential cluster updates?") == QMessageBox.Yes:
             global_signals.timeout_triggered.connect(self.slot_handle_timeout)
             threading.Thread(target=self.run_sequential_deployment_thread, daemon=True).start()
+
+    def confirm_and_update_srs(self):
+        if QMessageBox.question(self, " Confirm ⚠️ ", "Update SRS Server on the checked machines?") == QMessageBox.Yes:
+            global_signals.timeout_triggered.connect(self.slot_handle_timeout)
+            threading.Thread(target=self.run_sequential_srs_thread, daemon=True).start()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

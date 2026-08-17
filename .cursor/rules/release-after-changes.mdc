@@ -15,6 +15,7 @@ When you finish a batch of code changes for this project (DCS Updater):
    - `dist/DCS.Norway.Remote.Updater.Node.exe`
    - `dist/DCS.Norway.Remote.Updater.Control.Panel.exe`
    - `DCS_RU_Discord_Bot.py`
+   - `dcs_ru_common.py`
 6. Return the release URL when done.
 
 Do this automatically at the end of the work — do not wait to be asked for a release tag unless the user explicitly says to skip the release.

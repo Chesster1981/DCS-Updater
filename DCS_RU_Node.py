@@ -13,6 +13,7 @@ import subprocess
 import ctypes
 import re
 import shutil
+import zipfile
 import tkinter as tk
 from tkinter import messagebox, scrolledtext, filedialog
 from datetime import datetime
@@ -30,6 +31,10 @@ from dcs_ru_common import (
     github_interval_label,
     github_interval_seconds,
     sanitize_node_settings,
+    fetch_latest_srs_release,
+    parse_srs_autoconnect_version_line,
+    srs_version_is_current,
+    SRS_AUTOCONNECT_LUA,
 )
 from brand_assets import (
     BRAND_ASSET_VERSION,
@@ -59,7 +64,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.48"
+CURRENT_NODE_VERSION = "2.1.49"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -89,6 +94,8 @@ DCS_STARTUP_GRACE_SECONDS = 600  # process may exist minutes before the DCS port
 DCS_DOWN_GRACE_SECONDS = 300  # wait before auto-restart after DCS goes unhealthy/dead
 DCS_PORT_BASE = 10300
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
+SRS_PROCESS_IMAGES = ("SR-Server.exe", "SRS-Server.exe", "SR_Server.exe")
+SRS_PRESERVE_FILENAMES = ("server.cfg", "banned.txt")
 
 # DCS health states reported to Control Panel / Discord
 DCS_HEALTH_NEVER_STARTED = "NEVER_STARTED"
@@ -190,6 +197,8 @@ def sync_settings_widgets(settings: dict):
         try:
             ent_dcs.delete(0, tk.END)
             ent_dcs.insert(0, str(settings.get("dcs_main_folder", r"D:\DCS")))
+            ent_srs.delete(0, tk.END)
+            ent_srs.insert(0, str(settings.get("srs_install_folder", "")))
             ent_port.delete(0, tk.END)
             ent_port.insert(0, str(settings.get("network_port", "1015")))
             ent_bind.delete(0, tk.END)
@@ -237,6 +246,8 @@ def apply_node_settings(incoming: dict, source="ui"):
 # =========================================================================
 last_cloud_check_timestamp = 0.0
 last_github_node_check_timestamp = 0.0
+last_srs_github_check_timestamp = 0.0
+cached_srs_latest_tag = "Unknown"
 is_swapping = False  # NEW: Global safety flag to permanently freeze loops during updates
 logging.info("[SYSTEM] Version parsing and deployment framework initialized.")
 
@@ -373,6 +384,7 @@ def github_update_monitor_loop():
             
         cfg = load_node_settings()
         interval = int(cfg.get("github_check_interval", 43200))
+        get_srs_latest_version_cached(allow_fetch=True)
         
         if interval <= 0:
             continue
@@ -1038,6 +1050,292 @@ def force_kill_core_dcs():
                 logging.debug(f"Taskkill command rejected on {image}: {e}")
 
 
+def srs_server_dir(install_root: str) -> str:
+    root = os.path.normpath(str(install_root or "").strip().strip('"'))
+    if not root:
+        return ""
+    if os.path.basename(root).lower() == "server":
+        return root
+    return os.path.join(root, "Server")
+
+
+def srs_install_root(install_root=None) -> str:
+    cfg = load_node_settings()
+    root = install_root if install_root is not None else cfg.get("srs_install_folder", "")
+    return os.path.normpath(str(root or "").strip().strip('"'))
+
+
+def srs_autoconnect_lua_path(install_root: str) -> str:
+    root = srs_install_root(install_root)
+    if not root:
+        return ""
+    preferred = os.path.join(root, "scripts", SRS_AUTOCONNECT_LUA)
+    for scripts_dir in ("scripts", "Scripts"):
+        candidate = os.path.join(root, scripts_dir, SRS_AUTOCONNECT_LUA)
+        if os.path.isfile(candidate):
+            return candidate
+    return preferred
+
+
+def get_srs_installed_version(install_root=None) -> str:
+    root = srs_install_root(install_root)
+    if not root:
+        return "Not set"
+    lua_path = srs_autoconnect_lua_path(root)
+    if not lua_path or not os.path.isfile(lua_path):
+        return "Missing"
+    try:
+        with open(lua_path, encoding="utf-8", errors="replace") as handle:
+            first_line = handle.readline()
+        version = parse_srs_autoconnect_version_line(first_line)
+        return version or "Unknown"
+    except Exception:
+        return "Unknown"
+
+
+def write_srs_installed_version_line(install_root: str, version: str) -> bool:
+    """Keep AutoConnect lua as the version source of truth after a Server extract."""
+    lua_path = srs_autoconnect_lua_path(install_root)
+    if not lua_path or not os.path.isfile(lua_path):
+        return False
+    try:
+        with open(lua_path, encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+        newline = "\r\n" if "\r\n" in content else "\n"
+        lines = content.splitlines()
+        new_first = f"-- Version {version}"
+        if lines:
+            lines[0] = new_first
+        else:
+            lines = [new_first]
+        with open(lua_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(newline.join(lines) + newline)
+        return True
+    except Exception as e:
+        logging.warning("Could not update SRS AutoConnect version line: %s", e)
+        return False
+
+
+def get_srs_latest_version_cached(allow_fetch: bool = True) -> str:
+    global last_srs_github_check_timestamp, cached_srs_latest_tag
+    now = time.time()
+    if last_srs_github_check_timestamp and now - last_srs_github_check_timestamp < 600:
+        return cached_srs_latest_tag
+    if not allow_fetch:
+        return cached_srs_latest_tag
+    last_srs_github_check_timestamp = now
+    release = fetch_latest_srs_release()
+    if release and release.get("tag"):
+        cached_srs_latest_tag = release["tag"]
+    return cached_srs_latest_tag
+
+
+def is_srs_process_running() -> bool:
+    if sys.platform != "win32":
+        return False
+    try:
+        result = subprocess.run(
+            ["tasklist"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            **_hidden_subprocess_kwargs(capture_output=True),
+        )
+        listing = (result.stdout or "").lower()
+        return any(name.lower() in listing for name in SRS_PROCESS_IMAGES)
+    except Exception:
+        return False
+
+
+def force_kill_srs():
+    append_activity_log("[SRS] Stopping SRS Server process...")
+    for image in SRS_PROCESS_IMAGES:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", image],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                **_hidden_subprocess_kwargs(capture_output=True),
+            )
+        except Exception as e:
+            logging.debug("SRS taskkill %s failed: %s", image, e)
+    time.sleep(2)
+
+
+def start_srs_server_process(server_dir: str) -> bool:
+    exe_path = ""
+    for image in SRS_PROCESS_IMAGES:
+        candidate = os.path.join(server_dir, image)
+        if os.path.isfile(candidate):
+            exe_path = candidate
+            break
+    if not exe_path:
+        append_activity_log(f"[SRS] Could not find SR-Server.exe in {server_dir}")
+        return False
+    try:
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(
+            [exe_path],
+            cwd=server_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=flags,
+        )
+        append_activity_log(f"[SRS] Started {os.path.basename(exe_path)}")
+        return True
+    except Exception as e:
+        append_activity_log(f"[SRS] Failed to start SRS Server: {e}")
+        return False
+
+
+def _zip_server_prefix(zf: zipfile.ZipFile) -> str:
+    exe_prefixes = []
+    server_prefixes = []
+    for name in zf.namelist():
+        parts = [part for part in name.replace("\\", "/").split("/") if part]
+        if not parts:
+            continue
+        lower = [part.lower() for part in parts]
+        if lower[-1] in {image.lower() for image in SRS_PROCESS_IMAGES}:
+            parent = parts[:-1]
+            if parent and parent[-1].lower() == "server":
+                exe_prefixes.append("/".join(parent) + "/")
+        if "server" in lower:
+            idx = lower.index("server")
+            server_prefixes.append("/".join(parts[: idx + 1]) + "/")
+    if exe_prefixes:
+        return min(exe_prefixes, key=len)
+    if server_prefixes:
+        return min(server_prefixes, key=len)
+    return ""
+
+
+def _download_url_to_file(url: str, dest_path: str, label: str):
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    headers = github_api_headers("DCS-Norway-Remote-Updater-Node")
+    headers["Accept"] = "application/octet-stream"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=300) as response, open(dest_path, "wb") as out:
+        total = int(response.headers.get("Content-Length") or 0)
+        read = 0
+        last_pct = -10
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            read += len(chunk)
+            if total:
+                pct = int(read * 100 / total)
+                if pct >= last_pct + 10:
+                    append_activity_log(f"[SRS] Downloading {label}: {pct}% ({read // (1024 * 1024)} MB)")
+                    last_pct = pct
+    append_activity_log(f"[SRS] Download complete: {dest_path}")
+
+
+def execute_srs_update_pipeline():
+    config = load_node_settings()
+    install_root = str(config.get("srs_install_folder") or "").strip()
+    dest = srs_server_dir(install_root)
+    if not dest:
+        append_activity_log("[SRS] ERROR: SRS installation folder is not set. Set it in Node Settings.")
+        return
+    if node_state["active_task"] not in ("Idle",):
+        append_activity_log(f"[SRS] Skipping — node busy ({node_state['active_task']}).")
+        return
+
+    node_state["active_task"] = "Updating SRS"
+    append_activity_log(f"\n[SRS] Starting SRS Server update into {dest}")
+    try:
+        release = fetch_latest_srs_release()
+        if not release:
+            append_activity_log("[SRS] ERROR: Could not read the latest SRS GitHub release.")
+            return
+        latest = release["tag"]
+        zip_name = release["name"]
+        zip_url = release["url"]
+        installed = get_srs_installed_version(install_root)
+        append_activity_log(f"[SRS] Installed {installed} | GitHub latest {latest}")
+        if srs_version_is_current(installed, latest):
+            append_activity_log(f"[SRS] Already on {latest} — skipping download.")
+            return
+
+        was_running = is_srs_process_running()
+        if was_running:
+            force_kill_srs()
+
+        tmp_dir = os.path.join(application_path, "srs_update_tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        zip_path = os.path.join(tmp_dir, zip_name)
+        append_activity_log(f"[SRS] Downloading {zip_name} ...")
+        _download_url_to_file(zip_url, zip_path, zip_name)
+
+        preserved = {}
+        os.makedirs(dest, exist_ok=True)
+        for filename in SRS_PRESERVE_FILENAMES:
+            existing = os.path.join(dest, filename)
+            if os.path.isfile(existing):
+                with open(existing, "rb") as handle:
+                    preserved[filename] = handle.read()
+                append_activity_log(f"[SRS] Preserving {filename}")
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            prefix = _zip_server_prefix(zf)
+            if not prefix:
+                append_activity_log("[SRS] ERROR: Zip does not contain a Server folder.")
+                return
+            append_activity_log(f"[SRS] Extracting '{prefix}' to {dest}")
+            for info in zf.infolist():
+                norm = info.filename.replace("\\", "/")
+                if norm == prefix.rstrip("/"):
+                    continue
+                if not (norm.startswith(prefix) or norm + "/" == prefix):
+                    continue
+                rel = norm[len(prefix):]
+                if not rel:
+                    continue
+                target = os.path.join(dest, *rel.split("/"))
+                if info.is_dir() or norm.endswith("/"):
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+
+        for filename, payload in preserved.items():
+            with open(os.path.join(dest, filename), "wb") as handle:
+                handle.write(payload)
+            append_activity_log(f"[SRS] Restored {filename}")
+
+        if write_srs_installed_version_line(install_root, latest):
+            append_activity_log(f"[SRS] Recorded version {latest} in {SRS_AUTOCONNECT_LUA}")
+        else:
+            append_activity_log(
+                f"[SRS] Warning: {SRS_AUTOCONNECT_LUA} not found — installed version cannot be recorded."
+            )
+        global cached_srs_latest_tag, last_srs_github_check_timestamp
+        cached_srs_latest_tag = latest
+        last_srs_github_check_timestamp = time.time()
+
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+
+        if was_running:
+            start_srs_server_process(dest)
+        append_activity_log(f"[SRS] SRS Server updated to {latest} ✅")
+    except Exception as e:
+        append_activity_log(f"[SRS] ERROR during SRS update: {e}")
+        logging.error("SRS update failed: %s", e)
+    finally:
+        node_state["active_task"] = "Idle"
+
+
 # =========================================================================
 # BLOCK 3 OF 6: DEPLOYMENT PIPELINE & EXTENDED NETWORK SOCKET INTERFACE
 # =========================================================================
@@ -1176,6 +1474,9 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         "node_version": CURRENT_NODE_VERSION,
                         "dcs_running": dcs_health == DCS_HEALTH_HEALTHY,
                         "dcs_health": dcs_health,
+                        "srs_configured": bool(str(load_node_settings().get("srs_install_folder") or "").strip()),
+                        "srs_installed_version": get_srs_installed_version(),
+                        "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
                     }
                     conn.send((json.dumps(response) + "\n").encode("utf-8"))
                     conn.close()
@@ -1231,6 +1532,26 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                                         merged.get("bind_address"),
                                     )
                                 threading.Thread(target=_restart_after_settings, daemon=True).start()
+                elif command == "TRIGGER_SRS_UPDATE":
+                    if is_swapping or node_state["active_task"] != "Idle":
+                        response = {
+                            "status": "REJECTED_BUSY",
+                            "task": node_state["active_task"],
+                        }
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                    elif not str(load_node_settings().get("srs_install_folder") or "").strip():
+                        conn.send((json.dumps({
+                            "status": "ERROR",
+                            "message": "SRS install folder is not set on this Node.",
+                        }) + "\n").encode("utf-8"))
+                        conn.close()
+                    else:
+                        response = {"status": "OK_STARTING"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log("[REMOTE] Control Panel requested SRS Server update.")
+                        threading.Thread(target=execute_srs_update_pipeline, daemon=True).start()
                 elif command == "TRIGGER_DCS_UPDATE":
                     if node_state["active_task"] == "Idle":
                         response = {"status": "OK_STARTING"}
@@ -1340,6 +1661,13 @@ def browse_dcs_folder(entry_field):
         entry_field.delete(0, tk.END)
         entry_field.insert(0, os.path.normpath(folder))
 
+
+def browse_srs_folder(entry_field):
+    folder = filedialog.askdirectory(title="Select SRS Installation Folder (root, Server is a subfolder)")
+    if folder:
+        entry_field.delete(0, tk.END)
+        entry_field.insert(0, os.path.normpath(folder))
+
 def append_activity_log(text):
     """Write to file/console always; update the Tk log from the GUI thread only."""
     logging.info(text)
@@ -1363,6 +1691,22 @@ def append_activity_log(text):
 def trigger_local_update():
     if messagebox.askyesno("Confirm", "Update DCS on this machine now?"):
         threading.Thread(target=execute_deployment_pipeline, daemon=True).start()
+
+
+def trigger_local_srs_update():
+    cfg = load_node_settings()
+    if not str(cfg.get("srs_install_folder") or "").strip():
+        messagebox.showwarning(
+            "SRS",
+            "Set the SRS installation folder in Settings first.\n"
+            "The Server folder from the GitHub zip is extracted into that folder\\Server.",
+        )
+        return
+    if node_state["active_task"] != "Idle":
+        messagebox.showwarning("Busy", f"Node is busy ({node_state['active_task']}).")
+        return
+    if messagebox.askyesno("Confirm", "Update SRS Server on this machine now?"):
+        threading.Thread(target=execute_srs_update_pipeline, daemon=True).start()
 
 def force_github_update_check():
     """NEW: Forces an immediate GitHub update check from the settings panel."""
@@ -1389,6 +1733,8 @@ def show_settings_frame():
         cfg = load_node_settings()
         ent_dcs.delete(0, tk.END)
         ent_dcs.insert(0, str(cfg.get("dcs_main_folder", r"D:\DCS")))
+        ent_srs.delete(0, tk.END)
+        ent_srs.insert(0, str(cfg.get("srs_install_folder", "")))
         ent_port.delete(0, tk.END)
         ent_port.insert(0, str(cfg.get("network_port", "1015")))
         ent_bind.delete(0, tk.END)
@@ -1412,6 +1758,7 @@ def show_settings_frame():
 def save_settings_to_file():
     incoming = {
         "dcs_main_folder": ent_dcs.get(),
+        "srs_install_folder": ent_srs.get().strip(),
         "preserve_mission_scripting": v_preserve.get(),
         "network_port": ent_port.get(),
         "bind_address": ent_bind.get().strip() or "0.0.0.0",
@@ -1549,6 +1896,24 @@ btn_local_update = tk.Button(
 )
 btn_local_update.pack(anchor="e", pady=(12, 0))
 
+btn_local_srs_update = tk.Button(
+    right_column,
+    text=" 📻 UPDATE SRS NOW",
+    font=("Arial", 10, "bold"),
+    bg="#0A84FF",
+    fg="white",
+    activebackground="#409CFF",
+    activeforeground="white",
+    padx=16,
+    pady=10,
+    command=trigger_local_srs_update,
+    relief="flat",
+    bd=0,
+    highlightthickness=0,
+    cursor="hand2",
+)
+btn_local_srs_update.pack(anchor="e", pady=(8, 0))
+
 tk.Label(frame_main, text="Activity Log:", font=("Arial", 9), fg="#8E8E93", bg="#1C1C1F").pack(anchor="w", padx=15, pady=(15, 0))
 log_window = scrolledtext.ScrolledText(frame_main, width=64, height=12, font=("Consolas", 9), bg="#111112", fg="#30D158", insertbackground="white")
 log_window.pack(pady=5, padx=15, fill="both", expand=True)
@@ -1565,21 +1930,27 @@ ent_dcs.grid(row=0, column=1, pady=6, padx=5)
 
 tk.Button(grid_f, text="Browse...", command=lambda: browse_dcs_folder(ent_dcs), bg="#3A3A3C", fg="white", relief="flat").grid(row=0, column=2, pady=6, padx=2)
 
+tk.Label(grid_f, text="SRS Install Folder:", fg="white", bg="#1C1C1F").grid(row=1, column=0, sticky="w", pady=6)
+ent_srs = tk.Entry(grid_f, width=35, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1)
+ent_srs.grid(row=1, column=1, pady=6, padx=5)
+tk.Button(grid_f, text="Browse...", command=lambda: browse_srs_folder(ent_srs), bg="#3A3A3C", fg="white", relief="flat").grid(row=1, column=2, pady=6, padx=2)
+tk.Label(grid_f, text="Server is extracted into \\Server", fg="#8E8E93", bg="#1C1C1F", font=("Arial", 8)).grid(row=1, column=3, sticky="w")
+
 # =========================================================================
 # BLOCK 6 OF 6: PORTS, AUTO-UPDATE DROPDOWN, CHECKBOXES & CORE TKINTER MAINLOOP
 # =========================================================================
-tk.Label(grid_f, text="Listening Port:", fg="white", bg="#1C1C1F").grid(row=1, column=0, sticky="w", pady=6)
+tk.Label(grid_f, text="Listening Port:", fg="white", bg="#1C1C1F").grid(row=2, column=0, sticky="w", pady=6)
 ent_port = tk.Entry(grid_f, width=12, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1)
-ent_port.grid(row=1, column=1, sticky="w", pady=6, padx=5)
+ent_port.grid(row=2, column=1, sticky="w", pady=6, padx=5)
 
-tk.Label(grid_f, text="Bind Address:", fg="white", bg="#1C1C1F").grid(row=2, column=0, sticky="w", pady=6)
+tk.Label(grid_f, text="Bind Address:", fg="white", bg="#1C1C1F").grid(row=3, column=0, sticky="w", pady=6)
 ent_bind = tk.Entry(grid_f, width=18, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1)
-ent_bind.grid(row=2, column=1, sticky="w", pady=6, padx=5)
-tk.Label(grid_f, text="LAN IP (not 0.0.0.0)", fg="#8E8E93", bg="#1C1C1F", font=("Arial", 8)).grid(row=2, column=2, sticky="w")
+ent_bind.grid(row=3, column=1, sticky="w", pady=6, padx=5)
+tk.Label(grid_f, text="LAN IP (not 0.0.0.0)", fg="#8E8E93", bg="#1C1C1F", font=("Arial", 8)).grid(row=3, column=2, sticky="w")
 
-tk.Label(grid_f, text="Auth Token:", fg="white", bg="#1C1C1F").grid(row=3, column=0, sticky="w", pady=6)
+tk.Label(grid_f, text="Auth Token:", fg="white", bg="#1C1C1F").grid(row=4, column=0, sticky="w", pady=6)
 ent_auth = tk.Entry(grid_f, width=28, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1, show="*")
-ent_auth.grid(row=3, column=1, columnspan=2, sticky="w", pady=6, padx=5)
+ent_auth.grid(row=4, column=1, columnspan=2, sticky="w", pady=6, padx=5)
 
 tk.Label(frame_settings, text="Check for GitHub app updates:", fg="white", bg="#1C1C1F").pack(anchor="w", pady=(10, 2))
 
@@ -1632,6 +2003,7 @@ get_dcs_versions_local()
 
 threading.Thread(target=github_update_monitor_loop, daemon=True).start()
 threading.Thread(target=dcs_watchdog_loop, daemon=True).start()
+threading.Thread(target=lambda: get_srs_latest_version_cached(allow_fetch=True), daemon=True).start()
 refresh_dcs_health_state()
 
 root.after(100, lambda: root.withdraw())

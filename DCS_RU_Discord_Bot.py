@@ -20,13 +20,14 @@ from dcs_ru_common import (
     load_master_config,
     save_master_config,
     wrap_command,
+    fetch_latest_srs_release,
 )
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.48"
+CURRENT_BOT_VERSION = "2.1.49"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -172,6 +173,8 @@ class DCSClusterBot(commands.Bot):
         self.panel_message_id = None
         self.cached_dcs_version = "Unknown"
         self.last_cache_time = 0
+        self.cached_srs_version = "Unknown"
+        self.last_srs_cache_time = 0
         self.auth_token = ""
         self._restoring_panel = False
         self._self_updating = False
@@ -277,6 +280,20 @@ class DCSClusterBot(commands.Bot):
             logger.error("Failed to execute HTML scraping against DCS update gateway: %s", e)
 
         return self.cached_dcs_version
+
+    async def fetch_latest_srs_release_cached(self):
+        current_time = asyncio.get_event_loop().time()
+        if self.cached_srs_version != "Unknown" and (current_time - self.last_srs_cache_time < 900):
+            return self.cached_srs_version
+        try:
+            release = await asyncio.to_thread(fetch_latest_srs_release)
+            if release and release.get("tag"):
+                self.cached_srs_version = release["tag"]
+                self.last_srs_cache_time = current_time
+                logger.info("SRS GitHub latest: v%s", self.cached_srs_version)
+        except Exception as e:
+            logger.warning("SRS GitHub latest fetch failed: %s", e)
+        return self.cached_srs_version
 
     @staticmethod
     def _version_tuple(version_str: str):
@@ -1261,13 +1278,14 @@ def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
     return cleaned[: width - 1] + "…"
 
 
-def format_server_status_box(status_text: str, ver_info: str, task_info: str) -> str:
-    """Fixed three-line status block so every server tile is the same height."""
+def format_server_status_box(status_text: str, ver_info: str, task_info: str, srs_info: str = "—") -> str:
+    """Fixed four-line status block so every server tile is the same height."""
     status_text = PANEL_STATUS_SHORT.get(status_text, status_text)
     task_info = PANEL_TASK_SHORT.get(task_info, task_info)
     rows = [
         f"ℹ️ {_panel_line(status_text)}",
         f"⚙️ {_panel_line(ver_info)}",
+        f"📻 {_panel_line(srs_info)}",
         f"🖥️ {_panel_line(task_info)}",
     ]
     return "```yaml\n" + "\n".join(rows) + "\n```"
@@ -1276,6 +1294,7 @@ def format_server_status_box(status_text: str, ver_info: str, task_info: str) ->
 def classify_node_answer(answer):
     status_text = STATUS_UP_TO_DATE
     ver_info = "Unknown"
+    srs_info = "—"
     task_info = "Ready"
     is_outdated = False
     icon = "🟢"
@@ -1294,6 +1313,9 @@ def classify_node_answer(answer):
                 dcs_health = str(res.get("dcs_health", "")).strip().upper()
                 dcs_running = res.get("dcs_running", True)
                 active_task = res.get("active_task", "Idle")
+                srs_info = str(res.get("srs_installed_version") or "").strip() or "—"
+                if not res.get("srs_configured") and srs_info in ("", "Not set", "—"):
+                    srs_info = "Not set"
 
                 if dcs_health == "STARTING":
                     status_text = "DCS STARTING"
@@ -1342,6 +1364,7 @@ def classify_node_answer(answer):
     return {
         "status_text": status_text,
         "ver_info": ver_info,
+        "srs_info": srs_info,
         "task_info": task_info,
         "is_outdated": is_outdated,
         "icon": icon,
@@ -1366,6 +1389,7 @@ class LiveControlPanelView(discord.ui.View):
         self.all_nodes_cached = nodes
 
         dcs_latest_release = await self.bot.fetch_latest_dcs_release()
+        srs_latest_release = await self.bot.fetch_latest_srs_release_cached()
         current_time_str = datetime.now().strftime("%H:%M")
 
         embed = discord.Embed(
@@ -1376,6 +1400,7 @@ class LiveControlPanelView(discord.ui.View):
             text=(
                 f"Updated Today at {current_time_str}\n"
                 f"ED Release Version: {dcs_latest_release}\n"
+                f"SRS Release Version: {srs_latest_release}\n"
                 f"Bot version: {CURRENT_BOT_VERSION}"
             )
         )
@@ -1417,7 +1442,12 @@ class LiveControlPanelView(discord.ui.View):
                     )
                 )
 
-            boxed_value = format_server_status_box(status_text, ver_info, task_info)
+            boxed_value = format_server_status_box(
+                status_text,
+                ver_info,
+                task_info,
+                classified.get("srs_info", "—"),
+            )
 
             field_name = f"{icon}\u2001{node['name']}\u2001\u2001\u2001\u2001\u2001\u2001"
 
