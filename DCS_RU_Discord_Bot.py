@@ -24,18 +24,27 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.21"
+CURRENT_BOT_VERSION = "2.1.22"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
 BOT_GITHUB_CHECK_DELAY_SECONDS = 20
 BOT_GITHUB_CHECK_HOURS = 1
+# Temporary: only DM this Discord name while testing. Set to None to notify all
+# members who can see the panel channel.
+STATUS_ALERT_TEST_USERNAME = "Chesster"
+STATUS_UP_TO_DATE = "UP TO DATE"
+STATUS_RUNNING = {"UP TO DATE", "UPDATE READY"}
+STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
+STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
+HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
 
 
 class DCSClusterBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.members = True
         super().__init__(command_prefix="!", intents=intents)
 
         self.config_path = "master_config.json"
@@ -51,6 +60,8 @@ class DCSClusterBot(commands.Bot):
         self.auth_token = ""
         self._restoring_panel = False
         self._self_updating = False
+        self._last_node_status = {}
+        self._status_alert_lock = asyncio.Lock()
 
     def load_cluster_config(self):
         data = load_master_config(self.config_path)
@@ -337,6 +348,138 @@ class DCSClusterBot(commands.Bot):
         except Exception as e:
             logger.error("Error purging historic channel messages: %s", e)
 
+    @staticmethod
+    def _member_matches_alert_name(member, wanted_name):
+        wanted = str(wanted_name or "").strip().lower()
+        if not wanted:
+            return False
+        names = [
+            getattr(member, "name", "") or "",
+            getattr(member, "global_name", None) or "",
+            getattr(member, "display_name", None) or "",
+            getattr(member, "nick", None) or "",
+        ]
+        for name in names:
+            lowered = name.strip().lower()
+            if lowered == wanted or lowered.startswith(wanted):
+                return True
+        return False
+
+    def _describe_status_alert(self, prev, curr):
+        if prev is None:
+            return None
+
+        prev_status = prev.get("status_text") or ""
+        curr_status = curr.get("status_text") or ""
+        left_up_to_date = prev_status == STATUS_UP_TO_DATE and curr_status != STATUS_UP_TO_DATE
+
+        prev_health = str(prev.get("dcs_health") or "").strip().upper()
+        curr_health = str(curr.get("dcs_health") or "").strip().upper()
+        prev_running = prev_status in STATUS_RUNNING or prev_health == "HEALTHY"
+        curr_down = curr_status in STATUS_DOWN or curr_health in HEALTH_CRASHED
+        crashed = prev_running and curr_down and prev_status not in STATUS_BOOT
+
+        if not left_up_to_date and not crashed:
+            return None
+
+        name = curr.get("name") or "Unknown server"
+        icon = curr.get("icon") or ""
+        lines = [f"**{name}**"]
+        if crashed:
+            lines.append("DCS_server.exe ser ut til å ha krasjet eller sluttet å svare.")
+        if left_up_to_date:
+            lines.append(
+                f"Status endret fra :green_circle: **{STATUS_UP_TO_DATE}** "
+                f"til {icon} **{curr_status}**."
+            )
+        else:
+            lines.append(f"Ny status: {icon} **{curr_status}**.")
+        ver_info = curr.get("ver_info")
+        if ver_info and ver_info != "Unknown":
+            lines.append(f"Versjon: `{ver_info}`")
+        task_info = curr.get("task_info")
+        if task_info:
+            lines.append(f"Detalj: {task_info}")
+        return "\n".join(lines)
+
+    async def _status_alert_recipients(self, guild):
+        if guild is None:
+            return []
+
+        channel = None
+        try:
+            channel = await self.get_panel_channel()
+        except Exception:
+            channel = None
+
+        if not guild.chunked:
+            try:
+                await guild.chunk()
+            except Exception as e:
+                logger.warning("Could not chunk guild members for status alerts: %s", e)
+
+        members = list(guild.members)
+        if STATUS_ALERT_TEST_USERNAME and not any(
+            self._member_matches_alert_name(member, STATUS_ALERT_TEST_USERNAME)
+            for member in members
+            if not member.bot
+        ):
+            try:
+                async for member in guild.fetch_members(limit=None):
+                    members.append(member)
+            except Exception as e:
+                logger.warning("Could not fetch guild members for status alerts: %s", e)
+
+        recipients = []
+        seen = set()
+        for member in members:
+            if member.bot or member.id in seen:
+                continue
+            if channel is not None and not STATUS_ALERT_TEST_USERNAME:
+                perms = channel.permissions_for(member)
+                if not getattr(perms, "view_channel", False):
+                    continue
+            if STATUS_ALERT_TEST_USERNAME and not self._member_matches_alert_name(
+                member, STATUS_ALERT_TEST_USERNAME
+            ):
+                continue
+            seen.add(member.id)
+            recipients.append(member)
+        return recipients
+
+    async def notify_status_changes(self, snapshots, guild):
+        async with self._status_alert_lock:
+            problems = []
+            for snap in snapshots:
+                key = snap.get("key")
+                if not key:
+                    continue
+                prev = self._last_node_status.get(key)
+                self._last_node_status[key] = snap
+                text = self._describe_status_alert(prev, snap)
+                if text:
+                    problems.append(text)
+            if not problems:
+                return
+            body = "🚨 **DCS Norway — servervarsel**\n\n" + "\n\n".join(problems)
+
+        recipients = await self._status_alert_recipients(guild)
+        if not recipients:
+            target = STATUS_ALERT_TEST_USERNAME or "panel channel members"
+            logger.warning("Status alert had no DM recipients (looking for %s).", target)
+            logger.info("Status alert content:\n%s", body)
+            return
+
+        for member in recipients:
+            try:
+                await member.send(body)
+                logger.info("Sent status alert DM to %s (%s)", member.display_name, member.id)
+            except discord.Forbidden:
+                logger.warning("Cannot DM %s (%s) — DMs closed.", member.display_name, member.id)
+            except Exception as e:
+                logger.warning("Failed to DM %s (%s): %s", member.display_name, member.id, e)
+            await asyncio.sleep(0.4)
+
     async def send_socket_command(self, ip, port, command_str):
         payload = wrap_command(command_str, self.auth_token)
         try:
@@ -468,6 +611,83 @@ def has_dcs_management_permission():
     return app_commands.check(predicate)
 
 
+def classify_node_answer(answer):
+    status_text = STATUS_UP_TO_DATE
+    ver_info = "Unknown"
+    task_info = "Ready"
+    is_outdated = False
+    icon = "🟢"
+    dcs_health = ""
+    dcs_running = None
+
+    if answer and answer.startswith("{"):
+        try:
+            res = json.loads(answer)
+            if res.get("status") == "UNAUTHORIZED":
+                status_text = "UNAUTHORIZED"
+                icon = "🔐"
+            else:
+                installed_ver = res.get("installed_version", "Unknown")
+                latest_ver = res.get("latest_cloud_version", installed_ver)
+                dcs_health = str(res.get("dcs_health", "")).strip().upper()
+                dcs_running = res.get("dcs_running", True)
+                active_task = res.get("active_task", "Idle")
+
+                if dcs_health == "STARTING":
+                    status_text = "DCS STARTING"
+                    ver_info = f"{installed_ver}"
+                    icon = "⏳"
+                    task_info = "Waiting for DCS port after boot"
+                elif dcs_health == "NEVER_STARTED":
+                    status_text = "DCS NOT STARTED"
+                    ver_info = f"{installed_ver}"
+                    icon = "⏸️"
+                    task_info = (
+                        "Restarting..."
+                        if active_task == "Restarting DCS"
+                        else "Waiting for manual/server boot start"
+                    )
+                elif dcs_running is False or dcs_health in HEALTH_CRASHED:
+                    status_text = "DCS DOWN"
+                    ver_info = f"{installed_ver}"
+                    icon = "🛑"
+                    if active_task == "Restarting DCS":
+                        task_info = "Restarting..."
+                    elif dcs_health == "UNHEALTHY":
+                        task_info = "Process up, port not responding"
+                    elif dcs_health == "DEAD":
+                        task_info = "Server stopped/crashed"
+                    else:
+                        task_info = "DCS_server.exe stopped"
+                elif str(installed_ver).strip() != str(latest_ver).strip() and latest_ver != "Unknown":
+                    status_text = "UPDATE READY"
+                    ver_info = f"{installed_ver}"
+                    icon = "⚠️"
+                    is_outdated = True
+                    task_info = "Ready" if active_task == "Idle" else active_task
+                else:
+                    status_text = STATUS_UP_TO_DATE
+                    ver_info = f"{installed_ver}"
+                    icon = "🟢"
+                    task_info = "Ready" if active_task == "Idle" else active_task
+        except Exception:
+            status_text = "OFFLINE"
+            icon = "🔴"
+    else:
+        status_text = "OFFLINE"
+        icon = "🔴"
+
+    return {
+        "status_text": status_text,
+        "ver_info": ver_info,
+        "task_info": task_info,
+        "is_outdated": is_outdated,
+        "icon": icon,
+        "dcs_health": dcs_health,
+        "dcs_running": dcs_running,
+    }
+
+
 # ==================== INTERACTIVE MULTI-SELECT PANEL ENGINE ====================
 
 
@@ -498,72 +718,24 @@ class LiveControlPanelView(discord.ui.View):
             embed.title = "🛸 DCS Norway Live Control Panel"
 
         options = []
+        snapshots = []
         tasks_list = [self.bot.send_socket_command(n["ip"], n["port"], "PING_STATUS") for n in nodes]
         responses = await asyncio.gather(*tasks_list)
 
         for idx, (node, answer) in enumerate(zip(nodes, responses)):
-            status_text = "UP TO DATE"
-            ver_info = "Unknown"
-            task_info = "Ready"
-            is_outdated = False
-            icon = "🟢"
-
-            if answer and answer.startswith("{"):
-                try:
-                    res = json.loads(answer)
-                    if res.get("status") == "UNAUTHORIZED":
-                        status_text = "UNAUTHORIZED"
-                        icon = "🔐"
-                    else:
-                        installed_ver = res.get("installed_version", "Unknown")
-                        latest_ver = res.get("latest_cloud_version", installed_ver)
-                        dcs_health = str(res.get("dcs_health", "")).strip().upper()
-                        dcs_running = res.get("dcs_running", True)
-                        active_task = res.get("active_task", "Idle")
-
-                        if dcs_health == "STARTING":
-                            status_text = "DCS STARTING"
-                            ver_info = f"{installed_ver}"
-                            icon = "⏳"
-                            task_info = "Waiting for DCS port after boot"
-                        elif dcs_health == "NEVER_STARTED":
-                            status_text = "DCS NOT STARTED"
-                            ver_info = f"{installed_ver}"
-                            icon = "⏸️"
-                            task_info = (
-                                "Restarting..."
-                                if active_task == "Restarting DCS"
-                                else "Waiting for manual/server boot start"
-                            )
-                        elif dcs_running is False or dcs_health in ("DEAD", "UNHEALTHY"):
-                            status_text = "DCS DOWN"
-                            ver_info = f"{installed_ver}"
-                            icon = "🛑"
-                            if active_task == "Restarting DCS":
-                                task_info = "Restarting..."
-                            elif dcs_health == "UNHEALTHY":
-                                task_info = "Process up, port not responding"
-                            elif dcs_health == "DEAD":
-                                task_info = "Server stopped/crashed"
-                            else:
-                                task_info = "DCS_server.exe stopped"
-                        elif str(installed_ver).strip() != str(latest_ver).strip() and latest_ver != "Unknown":
-                            status_text = "UPDATE READY"
-                            ver_info = f"{installed_ver}"
-                            icon = "⚠️"
-                            is_outdated = True
-                            task_info = "Ready" if active_task == "Idle" else active_task
-                        else:
-                            status_text = "UP TO DATE"
-                            ver_info = f"{installed_ver}"
-                            icon = "🟢"
-                            task_info = "Ready" if active_task == "Idle" else active_task
-                except Exception:
-                    status_text = "OFFLINE"
-                    icon = "🔴"
-            else:
-                status_text = "OFFLINE"
-                icon = "🔴"
+            classified = classify_node_answer(answer)
+            status_text = classified["status_text"]
+            ver_info = classified["ver_info"]
+            task_info = classified["task_info"]
+            is_outdated = classified["is_outdated"]
+            icon = classified["icon"]
+            snapshots.append(
+                {
+                    "key": f"{node.get('ip')}:{node.get('port')}",
+                    "name": node["name"],
+                    **classified,
+                }
+            )
 
             if is_outdated:
                 options.append(
@@ -614,6 +786,11 @@ class LiveControlPanelView(discord.ui.View):
             self.btn_deploy_selected.label = "✅ All Servers Up To Date"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
             self.select_menu = None
+
+        try:
+            await self.bot.notify_status_changes(snapshots, guild)
+        except Exception as e:
+            logger.error("Failed to send status alert DMs: %s", e)
 
         return embed
 
