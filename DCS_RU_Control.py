@@ -50,13 +50,14 @@ from dcs_ru_common import (
     github_api_headers,
 )
 
-CONTROL_PANEL_VERSION = "2.1.38"
+CONTROL_PANEL_VERSION = "2.1.39"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
 TABLE_ROW_HEIGHT = 32
 WINDOW_MAX_SCREEN_WIDTH_FRACTION = 0.5
 WINDOW_MAX_SCREEN_HEIGHT_FRACTION = 0.75
+CELL_TEXT_PAD = 8
 CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS = 2500
 CONTROL_PANEL_UPDATE_INTERVAL_MS = 60 * 60 * 1000
 
@@ -613,15 +614,19 @@ class MainWindow(QMainWindow):
             self.table.setItem(idx, 2, QTableWidgetItem(s["ip"]))
             self.table.setItem(idx, 3, QTableWidgetItem(s["port"]))
             for col, name, txt, color in [(4, "ver_text", "FETCHING...", STYLE_STATUS_WARN), (5, "cloud_text", cached_latest_cloud_version, STYLE_TEXT_WHITE)]:
-                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(6,0,6,0); lbl = QLabel(txt); lbl.setObjectName(name)
-                lbl.setStyleSheet(f"color: {color}; font-weight: bold; background: transparent;"); l.addWidget(lbl)
-                l.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); w.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
+                w = QWidget(); l = QHBoxLayout(w); l.setContentsMargins(CELL_TEXT_PAD, 0, CELL_TEXT_PAD, 0)
+                lbl = QLabel(txt); lbl.setObjectName(name)
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet(f"color: {color}; font-weight: bold; background: transparent;")
+                l.addWidget(lbl, 0, Qt.AlignCenter)
+                l.setAlignment(Qt.AlignCenter)
+                w.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
                 self.table.setCellWidget(idx, col, w)
-            sc = QWidget(); sl = QHBoxLayout(sc); sl.setContentsMargins(8,0,8,0); sl.setSpacing(10)
+            sc = QWidget(); sl = QHBoxLayout(sc); sl.setContentsMargins(CELL_TEXT_PAD, 0, CELL_TEXT_PAD, 0); sl.setSpacing(8)
             lf = QFrame(); lf.setObjectName("status_lamp"); lf.setStyleSheet(f"background-color: {STYLE_STATUS_WARN}; border-radius: 8px;"); lf.setFixedSize(16,16)
             st = QLabel("CHECKING"); st.setObjectName("status_text"); st.setStyleSheet(f"color: {STYLE_STATUS_WARN}; font-weight: bold; background: transparent;")
             st.setWordWrap(False)
-            st.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+            st.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
             sl.addWidget(lf); sl.addWidget(st); sl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); sc.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
             self.table.setCellWidget(idx, 6, sc)
         for idx in range(self.table.rowCount()):
@@ -668,7 +673,6 @@ class MainWindow(QMainWindow):
             if col == 0:
                 width = max(width, 48)
             elif col in (4, 5):
-                width = max(width, 160)
                 for row in range(self.table.rowCount()):
                     cell = self.table.cellWidget(row, col)
                     if cell is None:
@@ -676,9 +680,9 @@ class MainWindow(QMainWindow):
                     lbl = cell.findChild(QLabel)
                     if lbl is None:
                         continue
-                    width = max(width, lbl.fontMetrics().horizontalAdvance(lbl.text()) + 20)
+                    text_w = lbl.fontMetrics().boundingRect(lbl.text()).width()
+                    width = max(width, text_w + CELL_TEXT_PAD * 2)
             elif col == 6:
-                width = max(width, 120)
                 for row in range(self.table.rowCount()):
                     cell = self.table.cellWidget(row, 6)
                     if cell is None:
@@ -686,8 +690,9 @@ class MainWindow(QMainWindow):
                     st = cell.findChild(QLabel, "status_text")
                     if st is None:
                         continue
-                    text_w = st.fontMetrics().horizontalAdvance(st.text())
-                    width = max(width, text_w + 16 + 16 + 10 + 16)
+                    text_w = st.fontMetrics().boundingRect(st.text()).width()
+                    # lamp + spacing + equal side pads + extra for bold glyph overflow
+                    width = max(width, text_w + 16 + 8 + CELL_TEXT_PAD * 2 + 6)
             else:
                 for row in range(self.table.rowCount()):
                     item = self.table.item(row, col)
@@ -800,6 +805,7 @@ class MainWindow(QMainWindow):
                     label = status if active_task == "Idle" else f"{status} ({active_task})"
                 lf.setStyleSheet(f"background-color: {c}; border-radius: 8px;")
                 st.setText(label)
+                st.setMinimumWidth(st.fontMetrics().boundingRect(label).width() + 4)
                 tip = active_task if active_task not in ("Idle",) else status
                 st.setToolTip(tip)
                 sc.setToolTip(tip)
