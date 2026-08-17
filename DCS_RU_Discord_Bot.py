@@ -26,7 +26,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.45"
+CURRENT_BOT_VERSION = "2.1.46"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -41,7 +41,7 @@ STATUS_RESTART_WAIT_SECONDS = 600
 STATUS_LOG_FILE = "dcs_ru_server_status.log"
 STATUS_LOG_REPEAT_SECONDS = 60
 ATTENTION_REPLY_TIMEOUT_SECONDS = 300
-ATTENTION_QUESTION = "Are you available to attend the issue ?"
+ATTENTION_QUESTION = "Are you available to attend the issue ? Please reply (Yes/No)"
 ATTENTION_YES_REPLIES = {"ja", "yes"}
 ATTENTION_NO_REPLIES = {"no", "nei"}
 STATUS_MESSAGE_DISMISS_SECONDS = 10
@@ -183,6 +183,8 @@ class DCSClusterBot(commands.Bot):
         self._attention_wait = None
         self._attention_issue_body = ""
         self._attention_stop = asyncio.Event()
+        self._attention_contacted = []
+        self._attention_server_names = []
 
     def dismiss_status_message_later(self, message):
         """Delete a transient Discord status message after a short delay."""
@@ -806,6 +808,42 @@ class DCSClusterBot(commands.Bot):
                 return True
         return bool(self._pending_status_alerts)
 
+    def _remember_attention_contact(self, member):
+        if member is None:
+            return
+        seen = {existing.id for existing in self._attention_contacted}
+        if member.id not in seen:
+            self._attention_contacted.append(member)
+
+    def _attention_server_label(self):
+        names = [name for name in self._attention_server_names if name]
+        if len(names) == 1:
+            return f"**{names[0]}** is"
+        if len(names) > 1:
+            listed = ", ".join(f"**{name}**" for name in names)
+            return f"{listed} are"
+        return "The server is"
+
+    async def _notify_servers_back_online(self):
+        members = list(self._attention_contacted)
+        self._attention_contacted = []
+        if not members:
+            return
+        body = (
+            f"✅ {self._attention_server_label()} back in **ONLINE** status.\n"
+            "No further action is required."
+        )
+        for member in members:
+            try:
+                await member.send(body)
+                logger.info("Sent ONLINE recovery DM to %s", member.display_name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to send ONLINE recovery DM to %s: %s",
+                    getattr(member, "display_name", member),
+                    e,
+                )
+
     async def _cancel_attention_round(self, reason=""):
         if reason:
             logger.info("Stopping attention DM round (%s)", reason)
@@ -816,9 +854,16 @@ class DCSClusterBot(commands.Bot):
             event = wait.get("event")
             if event is not None and not event.is_set():
                 event.set()
+        if "recovered" in str(reason or "").lower():
+            await self._notify_servers_back_online()
 
     async def _start_attention_round(self, body, guild):
         self._attention_issue_body = body
+        self._attention_server_names = [
+            snap.get("name")
+            for snap in self._last_node_status.values()
+            if snap.get("name") and not self._is_server_online(snap)
+        ]
         task = self._attention_task
         if task is not None and not task.done():
             logger.info("Attention DM round already running — updated issue body")
@@ -858,6 +903,7 @@ class DCSClusterBot(commands.Bot):
             try:
                 await member.send(dm_body)
                 contacted.append(member)
+                self._remember_attention_contact(member)
                 logger.info(
                     "Attention DM sent to %s (%s / %s) status=%s",
                     member.display_name,
