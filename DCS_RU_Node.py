@@ -31,7 +31,7 @@ from brand_assets import (
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.17"
+CURRENT_NODE_VERSION = "2.1.18"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -56,11 +56,14 @@ DCS_SERVER_PROCESS_STEMS = frozenset({
 })
 DCS_PROCESSES = [DCS_CLIENT_PROCESS, DCS_SERVER_PROCESS_DEFAULT]
 WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
+WATCHDOG_STARTUP_DELAY_SECONDS = 300  # wait one interval after Node boot
+DCS_STARTUP_GRACE_SECONDS = 600  # process may exist minutes before the DCS port opens
 DCS_PORT_BASE = 10300
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 
 # DCS health states reported to Control Panel / Discord
 DCS_HEALTH_NEVER_STARTED = "NEVER_STARTED"
+DCS_HEALTH_STARTING = "STARTING"
 DCS_HEALTH_HEALTHY = "HEALTHY"
 DCS_HEALTH_UNHEALTHY = "UNHEALTHY"
 DCS_HEALTH_DEAD = "DEAD"
@@ -73,6 +76,7 @@ node_state = {
     "dcs_running": False,
     "dcs_health": DCS_HEALTH_NEVER_STARTED,
     "dcs_ever_healthy": False,
+    "dcs_process_seen_at": None,
 }
 
 _watchdog_restart_times = []
@@ -633,22 +637,31 @@ def has_dcs_crash_dialog() -> bool:
 
 def evaluate_dcs_health(node_port) -> str:
     """
-    Classify DCS server state:
+    Classify DCS server state on every scan (nothing is locked from the first check):
     - HEALTHY: listening port (primary) and no crash dialog
-    - UNHEALTHY: crash dialog, or server process alive but port closed
+    - STARTING: process seen but port not open yet, and DCS was never healthy this boot
+    - UNHEALTHY: crash dialog, or process alive / port closed after a prior healthy run
     - DEAD: process/port gone after having been healthy before
-    - NEVER_STARTED: never healthy since Node boot
+    - NEVER_STARTED: never seen a dedicated-server process this boot
     """
     config = load_node_settings()
     port_up = is_dcs_port_listening(node_port)
     crash_dialog = has_dcs_crash_dialog()
     process_up = is_dcs_server_process_running(config)
 
+    if process_up and node_state.get("dcs_process_seen_at") is None:
+        node_state["dcs_process_seen_at"] = time.time()
+
     if crash_dialog:
         return DCS_HEALTH_UNHEALTHY
     if port_up:
         return DCS_HEALTH_HEALTHY
     if process_up:
+        if node_state.get("dcs_ever_healthy"):
+            return DCS_HEALTH_UNHEALTHY
+        seen_at = node_state.get("dcs_process_seen_at") or time.time()
+        if time.time() - seen_at < DCS_STARTUP_GRACE_SECONDS:
+            return DCS_HEALTH_STARTING
         return DCS_HEALTH_UNHEALTHY
     if node_state.get("dcs_ever_healthy"):
         return DCS_HEALTH_DEAD
@@ -750,9 +763,9 @@ def force_kill_dcs_server(node_port=None):
 
 def attempt_dcs_auto_restart(health: str, node_port) -> bool:
     """Restart DCS only after it was previously healthy (not on fresh boot)."""
-    if health == DCS_HEALTH_NEVER_STARTED:
+    if health in (DCS_HEALTH_NEVER_STARTED, DCS_HEALTH_STARTING):
         append_activity_log(
-            "[WATCHDOG] DCS has not been started since Node boot — skipping auto-restart."
+            "[WATCHDOG] DCS has not finished starting since Node boot — skipping auto-restart."
         )
         return False
     if not node_state.get("dcs_ever_healthy"):
@@ -791,7 +804,10 @@ def attempt_dcs_auto_restart(health: str, node_port) -> bool:
 
 def dcs_watchdog_loop():
     """Every N seconds: verify DCS health (process + port); restart only after prior healthy run."""
-    time.sleep(30)  # allow boot / first login before first check
+    append_activity_log(
+        f"[WATCHDOG] Waiting {WATCHDOG_STARTUP_DELAY_SECONDS}s after Node boot before first DCS health scan."
+    )
+    time.sleep(WATCHDOG_STARTUP_DELAY_SECONDS)
     while True:
         try:
             if is_swapping:
@@ -825,6 +841,11 @@ def dcs_watchdog_loop():
             elif health == DCS_HEALTH_NEVER_STARTED:
                 append_activity_log(
                     f"[WATCHDOG] DCS not running (never started since Node boot, port {dcs_port})."
+                )
+            elif health == DCS_HEALTH_STARTING:
+                append_activity_log(
+                    f"[WATCHDOG] DCS starting — {describe_running_dcs_server_processes(cfg)}; "
+                    f"waiting for port {dcs_port}."
                 )
             elif health == DCS_HEALTH_UNHEALTHY:
                 append_activity_log(

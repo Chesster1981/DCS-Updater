@@ -394,7 +394,12 @@ class LiveControlPanelView(discord.ui.View):
                         dcs_running = res.get("dcs_running", True)
                         active_task = res.get("active_task", "Idle")
 
-                        if dcs_health == "NEVER_STARTED":
+                        if dcs_health == "STARTING":
+                            status_text = "DCS STARTING"
+                            ver_info = f"{installed_ver}"
+                            icon = "⏳"
+                            task_info = "Waiting for DCS port after boot"
+                        elif dcs_health == "NEVER_STARTED":
                             status_text = "DCS NOT STARTED"
                             ver_info = f"{installed_ver}"
                             icon = "⏸️"

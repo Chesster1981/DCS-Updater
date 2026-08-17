@@ -44,7 +44,7 @@ def get_resource_path(relative_path):
 
 from dcs_ru_common import load_master_config, save_master_config, wrap_command, scrape_dcs_latest_version
 
-CONTROL_PANEL_VERSION = "2.1.17"
+CONTROL_PANEL_VERSION = "2.1.18"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 # Extra padding beyond layout margins when locking width to table columns
@@ -146,6 +146,10 @@ def parse_socket_response(answer):
 
             if dcs_health == "HEALTHY" or dcs_running is True:
                 status = "ONLINE"
+            elif dcs_health == "STARTING":
+                status = "STARTING"
+                if active_task == "Idle":
+                    active_task = "DCS starting (waiting for port)"
             elif dcs_health == "NEVER_STARTED":
                 status = "ONLINE"
                 if active_task == "Idle":
@@ -695,7 +699,7 @@ class MainWindow(QMainWindow):
         if idx >= self.table.rowCount(): return
         
         base_name = global_servers[idx]["name"]
-        if status in ("ONLINE", "DCS DOWN") and node_ver:
+        if status in ("ONLINE", "DCS DOWN", "STARTING") and node_ver:
             display_name = f"{base_name} (Node v{node_ver})"
         else:
             display_name = base_name
@@ -708,6 +712,9 @@ class MainWindow(QMainWindow):
                 if status == "ONLINE":
                     c = STYLE_STATUS_GREEN
                     label = status if active_task == "Idle" else f"{status} ({active_task})"
+                elif status == "STARTING":
+                    c = STYLE_STATUS_WARN
+                    label = "STARTING"
                 elif status == "DCS DOWN":
                     c = STYLE_STATUS_WARN
                     # Keep column compact; details go in tooltip
