@@ -25,7 +25,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.23"
+CURRENT_BOT_VERSION = "2.1.24"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -709,7 +709,13 @@ class LiveControlPanelView(discord.ui.View):
             description="\n```🛡️ Operational System Status for DCS World Servers```\n",
             color=discord.Color.from_rgb(26, 132, 255),
         )
-        embed.set_footer(text=f"Updated Today at {current_time_str}\nED Release Version: {dcs_latest_release}")
+        embed.set_footer(
+            text=(
+                f"Updated Today at {current_time_str}\n"
+                f"ED Release Version: {dcs_latest_release}\n"
+                f"Bot version: {CURRENT_BOT_VERSION}"
+            )
+        )
 
         if guild and guild.icon:
             embed.set_author(name="🛸 DCS Norway Live Control Panel", icon_url=guild.icon.url)
