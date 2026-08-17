@@ -25,7 +25,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.25"
+CURRENT_BOT_VERSION = "2.1.26"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -693,6 +693,26 @@ def has_dcs_management_permission():
     return app_commands.check(predicate)
 
 
+PANEL_BOX_LINE_WIDTH = 20
+
+
+def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
+    cleaned = " ".join(str(text or "").split())
+    if len(cleaned) <= width:
+        return cleaned
+    return cleaned[: width - 1] + "…"
+
+
+def format_server_status_box(status_text: str, ver_info: str, task_info: str) -> str:
+    """Fixed three-line status block so every server tile is the same height."""
+    rows = [
+        f"ℹ️ {_panel_line(status_text)}",
+        f"⚙️ {_panel_line(ver_info)}",
+        f"🖥️ {_panel_line(task_info)}",
+    ]
+    return "```yaml\n" + "\n".join(rows) + "\n```"
+
+
 def classify_node_answer(answer):
     status_text = STATUS_UP_TO_DATE
     ver_info = "Unknown"
@@ -719,7 +739,7 @@ def classify_node_answer(answer):
                     status_text = "DCS STARTING"
                     ver_info = f"{installed_ver}"
                     icon = "⏳"
-                    task_info = "Waiting for DCS port after boot"
+                    task_info = "Awaiting DCS port"
                 elif dcs_health == "NEVER_STARTED":
                     status_text = "DCS NOT STARTED"
                     ver_info = f"{installed_ver}"
@@ -727,7 +747,7 @@ def classify_node_answer(answer):
                     task_info = (
                         "Restarting..."
                         if active_task == "Restarting DCS"
-                        else "Waiting for manual/server boot start"
+                        else "Awaiting server boot"
                     )
                 elif dcs_running is False or dcs_health in HEALTH_CRASHED:
                     status_text = "DCS DOWN"
@@ -736,11 +756,11 @@ def classify_node_answer(answer):
                     if active_task == "Restarting DCS":
                         task_info = "Restarting..."
                     elif dcs_health == "UNHEALTHY":
-                        task_info = "Process up, port not responding"
+                        task_info = "Port not responding"
                     elif dcs_health == "DEAD":
                         task_info = "Server stopped/crashed"
                     else:
-                        task_info = "DCS_server.exe stopped"
+                        task_info = "DCS_server stopped"
                 elif str(installed_ver).strip() != str(latest_ver).strip() and latest_ver != "Unknown":
                     status_text = "UPDATE READY"
                     ver_info = f"{installed_ver}"
@@ -835,13 +855,7 @@ class LiveControlPanelView(discord.ui.View):
                     )
                 )
 
-            boxed_value = (
-                f"```yaml\n"
-                f"ℹ️ {status_text:<18}\n"
-                f"⚙️ {ver_info:<18}\n"
-                f"🖥️ {task_info:<18}\n"
-                f"```"
-            )
+            boxed_value = format_server_status_box(status_text, ver_info, task_info)
 
             field_name = f"{icon}\u2001{node['name']}\u2001\u2001\u2001\u2001\u2001\u2001"
 
