@@ -55,7 +55,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.31"
+CURRENT_NODE_VERSION = "2.1.32"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -82,6 +82,7 @@ DCS_PROCESSES = [DCS_CLIENT_PROCESS, DCS_SERVER_PROCESS_DEFAULT]
 WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
 WATCHDOG_STARTUP_DELAY_SECONDS = 300  # wait one interval after Node boot
 DCS_STARTUP_GRACE_SECONDS = 600  # process may exist minutes before the DCS port opens
+DCS_DOWN_GRACE_SECONDS = 300  # wait before auto-restart after DCS goes unhealthy/dead
 DCS_PORT_BASE = 10300
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 
@@ -101,6 +102,7 @@ node_state = {
     "dcs_health": DCS_HEALTH_NEVER_STARTED,
     "dcs_ever_healthy": False,
     "dcs_process_seen_at": None,
+    "dcs_down_since": None,
 }
 
 _watchdog_restart_times = []
@@ -729,9 +731,23 @@ def refresh_dcs_health_state(node_port=None):
     health = evaluate_dcs_health(node_port)
     if health == DCS_HEALTH_HEALTHY:
         node_state["dcs_ever_healthy"] = True
+        node_state["dcs_down_since"] = None
+    elif health in (DCS_HEALTH_UNHEALTHY, DCS_HEALTH_DEAD) and node_state.get("dcs_ever_healthy"):
+        if node_state.get("dcs_down_since") is None:
+            node_state["dcs_down_since"] = time.time()
+    else:
+        node_state["dcs_down_since"] = None
     node_state["dcs_health"] = health
     node_state["dcs_running"] = health == DCS_HEALTH_HEALTHY
     return health
+
+
+def dcs_down_grace_elapsed() -> bool:
+    """True when DCS has been unhealthy/dead long enough to allow auto-restart."""
+    down_since = node_state.get("dcs_down_since")
+    if down_since is None:
+        return False
+    return (time.time() - down_since) >= DCS_DOWN_GRACE_SECONDS
 
 
 def can_auto_restart_dcs() -> bool:
@@ -907,13 +923,29 @@ def dcs_watchdog_loop():
                     f"but port {dcs_port} not responding."
                 )
                 if bool(cfg.get("auto_restart_dcs", True)):
-                    attempt_dcs_auto_restart(health, node_port)
+                    if dcs_down_grace_elapsed():
+                        attempt_dcs_auto_restart(health, node_port)
+                    else:
+                        down_since = node_state.get("dcs_down_since") or time.time()
+                        remaining = max(0, int(DCS_DOWN_GRACE_SECONDS - (time.time() - down_since)))
+                        append_activity_log(
+                            f"[WATCHDOG] Waiting {remaining}s grace before auto-restart "
+                            f"(allows scheduled/manual DCS stop)."
+                        )
                 else:
                     append_activity_log("[WATCHDOG] Auto-restart disabled in settings.")
             elif health == DCS_HEALTH_DEAD:
                 append_activity_log(f"[WATCHDOG] DCS stopped/crashed (port {dcs_port}).")
                 if bool(cfg.get("auto_restart_dcs", True)):
-                    attempt_dcs_auto_restart(health, node_port)
+                    if dcs_down_grace_elapsed():
+                        attempt_dcs_auto_restart(health, node_port)
+                    else:
+                        down_since = node_state.get("dcs_down_since") or time.time()
+                        remaining = max(0, int(DCS_DOWN_GRACE_SECONDS - (time.time() - down_since)))
+                        append_activity_log(
+                            f"[WATCHDOG] Waiting {remaining}s grace before auto-restart "
+                            f"(allows scheduled/manual DCS stop)."
+                        )
                 else:
                     append_activity_log("[WATCHDOG] Auto-restart disabled in settings.")
 

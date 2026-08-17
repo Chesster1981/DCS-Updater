@@ -26,7 +26,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.31"
+CURRENT_BOT_VERSION = "2.1.32"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -36,7 +36,7 @@ BOT_GITHUB_CHECK_MINUTES = 5
 # members who can see the panel channel.
 STATUS_ALERT_TEST_USERNAME = "Chesster"
 STATUS_ALERT_TEST_NAME_ALIASES = ("Chesster", "Chesster1981")
-STATUS_ALERT_DELAY_SECONDS = 120
+STATUS_ALERT_DELAY_SECONDS = 300
 STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY"}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
