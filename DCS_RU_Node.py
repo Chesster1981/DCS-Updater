@@ -50,7 +50,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.20"
+CURRENT_NODE_VERSION = "2.1.21"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -1034,14 +1034,16 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
         server_socket.bind((bind_host, port))
         server_socket.listen(5)
         is_listening = True
-        auth_note = "auth ON" if auth_token else "auth OFF (set auth_token in settings)"
-        append_activity_log(f" Listener active on {bind_host}:{port} ({auth_note})...")
-        if bind_host == "0.0.0.0":
-            append_activity_log(" [SECURITY] Bound to all interfaces. Prefer a LAN IP or firewall lock-down.")
     except Exception as e:
+        logging.error("Could not bind network listener to %s:%s: %s", bind_host, port, e)
         append_activity_log(f" ERROR: Could not bind network listener to ❌ {bind_host}:{port}: {e}")
         is_listening = False
         return
+
+    auth_note = "auth ON" if auth_token else "auth OFF (set auth_token in settings)"
+    append_activity_log(f" Listener active on {bind_host}:{port} ({auth_note})...")
+    if bind_host == "0.0.0.0":
+        append_activity_log(" [SECURITY] Bound to all interfaces. Prefer a LAN IP or firewall lock-down.")
 
     while is_listening:
         try:
@@ -1161,9 +1163,24 @@ def browse_dcs_folder(entry_field):
         entry_field.insert(0, os.path.normpath(folder))
 
 def append_activity_log(text):
-    if 'log_window' in globals() and log_window.winfo_exists():
-        log_window.insert(tk.END, text + "\n")
-        log_window.see(tk.END)
+    """Write to file/console always; update the Tk log from the GUI thread only."""
+    logging.info(text)
+
+    def _write_to_widget():
+        try:
+            if "log_window" in globals() and log_window.winfo_exists():
+                log_window.insert(tk.END, text + "\n")
+                log_window.see(tk.END)
+        except Exception:
+            pass
+
+    try:
+        if "root" in globals() and root.winfo_exists():
+            root.after(0, _write_to_widget)
+            return
+    except Exception:
+        pass
+    _write_to_widget()
 
 def trigger_local_update():
     if messagebox.askyesno("Confirm", "Update DCS on this machine now?"):
