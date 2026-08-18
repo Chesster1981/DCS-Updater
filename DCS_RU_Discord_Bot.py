@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.51"
+CURRENT_BOT_VERSION = "2.1.52"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -58,10 +58,9 @@ STILL_ACTIVE = 259
 
 
 def _bot_pid_path():
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    base = os.path.join(appdata, "DCS_Norway_Discord_Bot")
+    os.makedirs(base, exist_ok=True)
     return os.path.join(base, BOT_PID_FILE)
 
 
@@ -466,6 +465,16 @@ class DCSClusterBot(commands.Bot):
                 )
             except Exception as e:
                 logger.warning("Guild slash sync failed for %s: %s", target_guild.name, e)
+
+    def _owns_panel_refresh(self) -> bool:
+        """Only the PID-file owner may edit the live panel (avoids dual-bot flicker)."""
+        path = _bot_pid_path()
+        try:
+            if os.path.exists(path):
+                return int(open(path, encoding="utf-8").read().strip()) == os.getpid()
+        except Exception:
+            pass
+        return True
 
     async def setup_hook(self):
         await self.sync_slash_commands()
@@ -1307,6 +1316,8 @@ class DCSClusterBot(commands.Bot):
 
     @tasks.loop(seconds=30)
     async def persistent_panel_refresh_loop(self):
+        if not self._owns_panel_refresh():
+            return
         if self.active_panel_view and self.panel_channel_id and self.panel_message_id:
             try:
                 await self.active_panel_view.refresh_panel()
@@ -1438,24 +1449,35 @@ def classify_node_answer(answer, srs_latest_release=None):
                 needs_srs_update = srs_configured and is_srs_outdated(
                     srs_installed_raw, srs_latest
                 )
+                is_outdated = needs_dcs_update or needs_srs_update
+                ver_info = f"{installed_ver}"
 
-                if dcs_health == "STARTING":
-                    status_text = "DCS STARTING"
-                    ver_info = f"{installed_ver}"
-                    icon = "⏳"
+                if active_task == "Restarting DCS":
+                    task_info = "Restarting..."
+                elif active_task != "Idle":
+                    task_info = active_task
+                elif dcs_health == "NEVER_STARTED":
+                    task_info = "Awaiting server boot"
+                elif dcs_health == "STARTING":
                     task_info = "Awaiting DCS port"
+                else:
+                    task_info = "Ready"
+
+                # Pending updates take priority over DCS health in the panel status line.
+                if needs_dcs_update:
+                    status_text = "UPDATE READY"
+                    icon = "⚠️"
+                elif needs_srs_update:
+                    status_text = STATUS_SRS_OUTDATED
+                    icon = "⚠️"
+                elif dcs_health == "STARTING":
+                    status_text = "DCS STARTING"
+                    icon = "⏳"
                 elif dcs_health == "NEVER_STARTED":
                     status_text = "DCS NOT STARTED"
-                    ver_info = f"{installed_ver}"
                     icon = "⏸️"
-                    task_info = (
-                        "Restarting..."
-                        if active_task == "Restarting DCS"
-                        else "Awaiting server boot"
-                    )
                 elif dcs_running is False or dcs_health in HEALTH_CRASHED:
                     status_text = "DCS DOWN"
-                    ver_info = f"{installed_ver}"
                     icon = "🛑"
                     if active_task == "Restarting DCS":
                         task_info = "Restarting..."
@@ -1465,23 +1487,9 @@ def classify_node_answer(answer, srs_latest_release=None):
                         task_info = "Server stopped/crashed"
                     else:
                         task_info = "DCS_server stopped"
-                elif needs_dcs_update:
-                    status_text = "UPDATE READY"
-                    ver_info = f"{installed_ver}"
-                    icon = "⚠️"
-                    is_outdated = True
-                    task_info = "Ready" if active_task == "Idle" else active_task
-                elif needs_srs_update:
-                    status_text = STATUS_SRS_OUTDATED
-                    ver_info = f"{installed_ver}"
-                    icon = "⚠️"
-                    is_outdated = True
-                    task_info = "Ready" if active_task == "Idle" else active_task
                 else:
                     status_text = STATUS_UP_TO_DATE
-                    ver_info = f"{installed_ver}"
                     icon = "🟢"
-                    task_info = "Ready" if active_task == "Idle" else active_task
         except Exception:
             status_text = "OFFLINE"
             icon = "🔴"
