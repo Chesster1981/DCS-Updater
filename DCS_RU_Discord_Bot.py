@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.49"
+CURRENT_BOT_VERSION = "2.1.50"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -48,7 +48,8 @@ ATTENTION_NO_REPLIES = {"no", "nei"}
 STATUS_MESSAGE_DISMISS_SECONDS = 10
 BOT_PID_FILE = "dcs_ru_discord_bot.pid"
 STATUS_UP_TO_DATE = "UP TO DATE"
-STATUS_RUNNING = {"UP TO DATE", "UPDATE READY"}
+STATUS_SRS_OUTDATED = "SRS OUTDATED"
+STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
 STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
@@ -1151,61 +1152,147 @@ class DCSClusterBot(commands.Bot):
             self.deployment_queue.task_done()
             self.is_processing_queue = False
 
+    async def _monitor_node_task_until_idle(
+        self,
+        node,
+        status_msg,
+        name,
+        *,
+        success_text,
+        timeout_seconds=900,
+        done_tasks=("Rebooting", "Idle"),
+    ):
+        start_time = asyncio.get_event_loop().time()
+        while True:
+            if asyncio.get_event_loop().time() - start_time > timeout_seconds:
+                await status_msg.edit(
+                    content=f"⏰ **[{name}]** Update exceeded {timeout_seconds // 60} minutes (Timeout reached)."
+                )
+                return False
+
+            chk = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
+            if chk is None:
+                await status_msg.edit(content=f"🎉 **[{name}]** Connection closed. Server completed sequence!")
+                return True
+
+            if chk.startswith("{"):
+                try:
+                    res = json.loads(chk)
+                    if res.get("active_task", "Idle") in done_tasks:
+                        await status_msg.edit(content=success_text)
+                        return True
+                except Exception:
+                    pass
+            await asyncio.sleep(4)
+
+    async def _run_dcs_update(self, node, channel, status_msg, name):
+        ans = await self.send_socket_command(node["ip"], node["port"], "TRIGGER_DCS_UPDATE")
+
+        if not ans:
+            await status_msg.edit(content=f"❌ **[{name}]** Connection timeout. Node did not respond.")
+            return False
+
+        try:
+            res_json = json.loads(ans)
+            if res_json.get("status") == "UNAUTHORIZED":
+                await status_msg.edit(
+                    content=f"🔐 **[{name}]** Unauthorized — check shared auth_token on Bot and Node."
+                )
+                return False
+            if res_json.get("status") == "REJECTED_BUSY":
+                await status_msg.edit(content=f"⚠️ **[{name}]** Server busy executing: `{res_json.get('task')}`.")
+                return False
+            if res_json.get("status") != "OK_STARTING":
+                await status_msg.edit(content=f"❌ **[{name}]** Rejected with status: `{res_json.get('status')}`.")
+                return False
+        except Exception:
+            await status_msg.edit(content=f"❌ **[{name}]** Error parsing JSON response payload.")
+            return False
+
+        await status_msg.edit(content=f"🚀 **[{name}]** DCS update authorized! Downloading patch payload...")
+        await asyncio.sleep(15)
+        return await self._monitor_node_task_until_idle(
+            node,
+            status_msg,
+            name,
+            success_text=f"🎉 **[{name}]** DCS update successfully completed and verified!",
+            timeout_seconds=900,
+            done_tasks=("Rebooting", "Idle"),
+        )
+
+    async def _run_srs_update(self, node, channel, status_msg, name):
+        ans = await self.send_socket_command(node["ip"], node["port"], "TRIGGER_SRS_UPDATE")
+
+        if not ans:
+            await status_msg.edit(content=f"❌ **[{name}]** Connection timeout. Node did not respond.")
+            return False
+
+        if "UNKNOWN_COMMAND" in str(ans):
+            await status_msg.edit(content=f"❌ **[{name}]** Node is too old for SRS updates.")
+            return False
+
+        try:
+            res_json = json.loads(ans)
+            if res_json.get("status") == "UNAUTHORIZED":
+                await status_msg.edit(
+                    content=f"🔐 **[{name}]** Unauthorized — check shared auth_token on Bot and Node."
+                )
+                return False
+            if res_json.get("status") == "REJECTED_BUSY":
+                await status_msg.edit(content=f"⚠️ **[{name}]** Server busy executing: `{res_json.get('task')}`.")
+                return False
+            if res_json.get("status") == "ERROR":
+                await status_msg.edit(
+                    content=f"❌ **[{name}]** {res_json.get('message') or 'SRS install folder is not set on this Node.'}"
+                )
+                return False
+            if res_json.get("status") != "OK_STARTING":
+                await status_msg.edit(content=f"❌ **[{name}]** Rejected with status: `{res_json.get('status')}`.")
+                return False
+        except Exception:
+            await status_msg.edit(content=f"❌ **[{name}]** Error parsing JSON response payload.")
+            return False
+
+        await status_msg.edit(content=f"📻 **[{name}]** SRS update authorized! Installing latest release...")
+        return await self._monitor_node_task_until_idle(
+            node,
+            status_msg,
+            name,
+            success_text=f"🎉 **[{name}]** SRS update successfully completed and verified!",
+            timeout_seconds=1800,
+            done_tasks=("Idle",),
+        )
+
     async def execute_node_deployment(self, task_data):
         node = task_data["node"]
         channel = task_data["channel"]
         name = node["name"]
+        srs_latest = await self.fetch_latest_srs_release_cached()
 
-        status_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
+        status_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` to check update requirements...")
+        status_messages = [status_msg]
         try:
-            ans = await self.send_socket_command(node["ip"], node["port"], "TRIGGER_DCS_UPDATE")
+            ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
+            classified = classify_node_answer(ping, srs_latest_release=srs_latest)
+            needs_dcs = classified.get("needs_dcs_update", False)
+            needs_srs = classified.get("needs_srs_update", False)
 
-            if not ans:
-                await status_msg.edit(content=f"❌ **[{name}]** Connection timeout. Node did not respond.")
+            if not needs_dcs and not needs_srs:
+                await status_msg.edit(content=f"✅ **[{name}]** Already up to date — nothing to deploy.")
                 return
 
-            try:
-                res_json = json.loads(ans)
-                if res_json.get("status") == "UNAUTHORIZED":
-                    await status_msg.edit(
-                        content=f"🔐 **[{name}]** Unauthorized — check shared auth_token on Bot and Node."
-                    )
-                    return
-                if res_json.get("status") == "REJECTED_BUSY":
-                    await status_msg.edit(content=f"⚠️ **[{name}]** Server busy executing: `{res_json.get('task')}`.")
-                    return
-                if res_json.get("status") != "OK_STARTING":
-                    await status_msg.edit(content=f"❌ **[{name}]** Rejected with status: `{res_json.get('status')}`.")
-                    return
-            except Exception:
-                await status_msg.edit(content=f"❌ **[{name}]** Error parsing JSON response payload.")
-                return
+            if needs_dcs:
+                await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
+                await self._run_dcs_update(node, channel, status_msg, name)
 
-            await status_msg.edit(content=f"🚀 **[{name}]** DCS update authorized! Downloading patch payload...")
-            await asyncio.sleep(15)
-
-            start_time = asyncio.get_event_loop().time()
-            while True:
-                if asyncio.get_event_loop().time() - start_time > 900:
-                    await status_msg.edit(content=f"⏰ **[{name}]** Deployment exceeded 15 minutes (Timeout reached).")
-                    break
-
-                chk = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
-                if chk is None:
-                    await status_msg.edit(content=f"🎉 **[{name}]** Connection closed. Server completed sequence!")
-                    break
-
-                if chk.startswith("{"):
-                    try:
-                        res = json.loads(chk)
-                        if res.get("active_task", "Idle") in ["Rebooting", "Idle"]:
-                            await status_msg.edit(
-                                content=f"🎉 **[{name}]** DCS update successfully completed and verified!"
-                            )
-                            break
-                    except Exception:
-                        pass
-                await asyncio.sleep(4)
+            if needs_srs:
+                if needs_dcs:
+                    srs_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                    status_messages.append(srs_msg)
+                    await self._run_srs_update(node, channel, srs_msg, name)
+                else:
+                    await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                    await self._run_srs_update(node, channel, status_msg, name)
 
             if self.active_panel_view:
                 try:
@@ -1213,7 +1300,8 @@ class DCSClusterBot(commands.Bot):
                 except Exception:
                     pass
         finally:
-            self.dismiss_status_message_later(status_msg)
+            for msg in status_messages:
+                self.dismiss_status_message_later(msg)
 
     @tasks.loop(seconds=30)
     async def persistent_panel_refresh_loop(self):
@@ -1261,6 +1349,7 @@ PANEL_BOX_LINE_WIDTH = 13
 PANEL_STATUS_SHORT = {
     "DCS NOT STARTED": "NOT STARTED",
     "DCS STARTING": "STARTING",
+    "SRS OUTDATED": "SRS OUTDATED",
 }
 PANEL_TASK_SHORT = {
     "Awaiting server boot": "Boot pending",
@@ -1291,12 +1380,30 @@ def format_server_status_box(status_text: str, ver_info: str, task_info: str, sr
     return "```yaml\n" + "\n".join(rows) + "\n```"
 
 
-def classify_node_answer(answer):
+SRS_UNKNOWN_INSTALLED = frozenset(
+    {"UNKNOWN", "FETCHING...", "MISSING", "NOT SET", "Not set", "—", ""}
+)
+SRS_UNKNOWN_LATEST = frozenset({"Unknown", "Fetching...", "—", ""})
+
+
+def is_srs_outdated(installed: str, latest: str) -> bool:
+    inst = str(installed or "").strip()
+    lat = str(latest or "").strip()
+    if not inst or inst.upper() in {v.upper() for v in SRS_UNKNOWN_INSTALLED} or inst in SRS_UNKNOWN_INSTALLED:
+        return False
+    if not lat or lat in SRS_UNKNOWN_LATEST:
+        return False
+    return inst != lat
+
+
+def classify_node_answer(answer, srs_latest_release=None):
     status_text = STATUS_UP_TO_DATE
     ver_info = "Unknown"
     srs_info = "—"
     task_info = "Ready"
     is_outdated = False
+    needs_dcs_update = False
+    needs_srs_update = False
     icon = "🟢"
     dcs_health = ""
     dcs_running = None
@@ -1313,9 +1420,22 @@ def classify_node_answer(answer):
                 dcs_health = str(res.get("dcs_health", "")).strip().upper()
                 dcs_running = res.get("dcs_running", True)
                 active_task = res.get("active_task", "Idle")
-                srs_info = str(res.get("srs_installed_version") or "").strip() or "—"
-                if not res.get("srs_configured") and srs_info in ("", "Not set", "—"):
+                srs_installed_raw = str(res.get("srs_installed_version") or "").strip()
+                srs_configured = bool(res.get("srs_configured", True))
+                srs_info = srs_installed_raw or "—"
+                if not srs_configured and srs_info in ("", "Not set", "—"):
                     srs_info = "Not set"
+
+                srs_latest = str(
+                    srs_latest_release or res.get("srs_latest_version") or ""
+                ).strip()
+                needs_dcs_update = (
+                    str(installed_ver).strip() != str(latest_ver).strip()
+                    and latest_ver != "Unknown"
+                )
+                needs_srs_update = srs_configured and is_srs_outdated(
+                    srs_installed_raw, srs_latest
+                )
 
                 if dcs_health == "STARTING":
                     status_text = "DCS STARTING"
@@ -1343,8 +1463,14 @@ def classify_node_answer(answer):
                         task_info = "Server stopped/crashed"
                     else:
                         task_info = "DCS_server stopped"
-                elif str(installed_ver).strip() != str(latest_ver).strip() and latest_ver != "Unknown":
+                elif needs_dcs_update:
                     status_text = "UPDATE READY"
+                    ver_info = f"{installed_ver}"
+                    icon = "⚠️"
+                    is_outdated = True
+                    task_info = "Ready" if active_task == "Idle" else active_task
+                elif needs_srs_update:
+                    status_text = STATUS_SRS_OUTDATED
                     ver_info = f"{installed_ver}"
                     icon = "⚠️"
                     is_outdated = True
@@ -1367,6 +1493,8 @@ def classify_node_answer(answer):
         "srs_info": srs_info,
         "task_info": task_info,
         "is_outdated": is_outdated,
+        "needs_dcs_update": needs_dcs_update,
+        "needs_srs_update": needs_srs_update,
         "icon": icon,
         "dcs_health": dcs_health,
         "dcs_running": dcs_running,
@@ -1416,7 +1544,7 @@ class LiveControlPanelView(discord.ui.View):
         responses = await asyncio.gather(*tasks_list)
 
         for idx, (node, answer) in enumerate(zip(nodes, responses)):
-            classified = classify_node_answer(answer)
+            classified = classify_node_answer(answer, srs_latest_release=srs_latest_release)
             status_text = classified["status_text"]
             ver_info = classified["ver_info"]
             task_info = classified["task_info"]
