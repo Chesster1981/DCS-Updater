@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.54"
+CURRENT_BOT_VERSION = "2.1.55"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -77,18 +77,6 @@ Flyt: 5 min grace → automatisk DCS-restart via node → 10 min venting → DM 
 
 **Andre symboler**
 🛸 Panel-tittel · ⏳ / 🎉 / ❌ Meldinger under deploy-kø"""
-# Discord channel topic/description limit is 1024 characters.
-PANEL_CHANNEL_TOPIC = """Privat kanal for oversikt og oppdatering av DCS-servere. Live-panelet gjenopprettes automatisk ved bot-restart.
-
-Status-ikon: 🟢 UP TO DATE · ⚠️ UPDATE READY (DCS) · ⚠️ SRS OUTDATED · ⏸️ NOT STARTED · ⏳ STARTING · 🛑 DCS DOWN · 🔐 UNAUTHORIZED · 🔴 OFFLINE
-
-Status-boks: ℹ️ status · ⚙️ DCS-versjon · 📻 SRS-versjon · 🖥️ oppgave (Ready / Boot pending / Updating)
-
-Knapper: 🔄 Refresh · 🚀 Execute Selected (DCS og/eller SRS) · dropdown (valg beholdes ved 30s refresh)
-
-Deploy: kun SRS, kun DCS, eller DCS først deretter SRS. Idle servere kan få SRS-oppdatering.
-
-DM-varsel kun ved OFFLINE/DCS DOWN — ikke når en ny DCS- eller SRS-release blir tilgjengelig."""
 # Set to a Discord username to DM only that person while testing.
 # None = page panel-channel members one at a time (online first).
 STATUS_ALERT_TEST_USERNAME = None
@@ -638,35 +626,10 @@ class DCSClusterBot(commands.Bot):
         except Exception as e:
             logger.error("Error purging historic channel messages: %s", e)
 
-    async def ensure_panel_channel_topic(self, channel):
-        """Keep the Discord channel description in sync with current panel logic."""
-        if channel is None or not hasattr(channel, "edit"):
-            return
-        topic = PANEL_CHANNEL_TOPIC.strip()
-        if len(topic) > 1024:
-            topic = topic[:1021] + "..."
-        current = (getattr(channel, "topic", None) or "").strip()
-        if current == topic:
-            return
-        try:
-            await channel.edit(topic=topic, reason="Refresh DCS panel channel description")
-            logger.info(
-                "Updated channel topic for #%s",
-                getattr(channel, "name", channel.id),
-            )
-        except discord.Forbidden:
-            logger.warning(
-                "Cannot update channel description for #%s — bot needs Manage Channels.",
-                getattr(channel, "name", channel.id),
-            )
-        except Exception as e:
-            logger.warning("Failed to update channel description: %s", e)
-
     async def ensure_panel_channel_guide(self, channel):
-        """Refresh the pinned legend and the channel description after restart/init."""
+        """Refresh the pinned legend message after restart/init."""
         if channel is None:
             return None
-        await self.ensure_panel_channel_topic(channel)
         body = f"{PANEL_CHANNEL_GUIDE_MARKER}\n{PANEL_CHANNEL_GUIDE}"
         try:
             async for message in channel.history(limit=30):
@@ -1881,7 +1844,7 @@ class LiveControlPanelView(discord.ui.View):
 
 @bot.tree.command(
     name="dcs-panel-guide",
-    description="Oppdater festet hjelpetekst og kanalbeskrivelse for oppdateringspanelet.",
+    description="Oppdater festet hjelpetekst for oppdateringspanelet.",
 )
 @has_dcs_management_permission()
 async def dcs_panel_guide(interaction: discord.Interaction):
