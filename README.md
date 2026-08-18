@@ -86,7 +86,7 @@ $env:DISCORD_BOT_TOKEN = "..."
 python DCS_RU_Discord_Bot.py
 ```
 
-In Discord: `/dcs-panel-init` pins the live panel. Channel/message IDs are stored in `master_config.json` and restored on restart.
+In Discord: `/dcs-panel-init` pins the live panel. `/dcs-panel-guide` refreshes the pinned legend in the channel. Channel/message IDs are stored in `master_config.json` and restored on restart.
 
 ## TCP protocol
 

@@ -27,12 +27,56 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.52"
+CURRENT_BOT_VERSION = "2.1.53"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
 BOT_GITHUB_CHECK_DELAY_SECONDS = 20
 BOT_GITHUB_CHECK_MINUTES = 5
+PANEL_CHANNEL_GUIDE_MARKER = "<!-- dcs-panel-guide -->"
+PANEL_CHANNEL_GUIDE = """**DCS Norway — oppdateringspanel**
+
+Bruk `/dcs-panel-init` for å opprette eller gjenopprette live-panelet nederst i kanalen.
+
+**Status-ikon ved servernavn**
+🟢 **UP TO DATE** — Node svarer, DCS er OK (eller idle med vilje), DCS- og SRS-versjon matcher GitHub-release.
+⚠️ **UPDATE READY** — DCS er installert, men ED-versjonen henger etter siste release.
+⚠️ **SRS OUTDATED** — SRS-versjonen henger etter siste GitHub-release (gjelder også idle servere der DCS aldri er startet).
+⏸️ **NOT STARTED** — DCS har aldri vært startet på noden (bevisst idle). Hvis SRS er utdatert vises **SRS OUTDATED** i stedet.
+⏳ **STARTING** — DCS-prosess kjører, men port svarer ikke ennå.
+🛑 **DCS DOWN** — Node online, men DCS_server.exe har krasjet, stoppet eller svarer ikke.
+🔐 **UNAUTHORIZED** — auth_token stemmer ikke mellom bot og node.
+🔴 **OFFLINE** — Ingen svar fra node (nede, feil IP/port eller brannmur).
+
+**I status-boksen under hver server**
+ℹ️ Status-tekst (f.eks. UP TO DATE, SRS OUTDATED, DCS DOWN)
+⚙️ Installert DCS-versjon
+📻 Installert SRS-versjon (fra `scripts/DCS-SRS-AutoConnectGameGUI.lua` på noden)
+🖥️ Oppgave / maskinstatus (f.eks. Ready, Boot pending, Updating SRS)
+
+**Footer under panelet**
+ED Release Version — siste DCS World-versjon fra ED
+SRS Release Version — siste SRS fra GitHub (ciribob/DCS-SimpleRadioStandalone)
+Bot version — versjon av denne Discord-boten
+
+**Knapper og meny**
+🔄 **Refresh Server Status** — manuell oppdatering av panelet
+🚀 **Execute Selected Update(s)** — start deploy-kø for valgte servere (DCS og/eller SRS etter behov)
+Dropdown — velg én eller flere servere som trenger oppdatering. Valget beholdes ved automatisk refresh (hvert 30 s).
+✅ **All Servers Up To Date** — ingen servere trenger oppdatering akkurat nå
+
+**Deploy-logikk**
+• Kun SRS utdatert → kun SRS-oppdatering (`TRIGGER_SRS_UPDATE`), DCS røres ikke.
+• Kun DCS utdatert → kun DCS-oppdatering.
+• Begge utdatert → DCS først, deretter SRS.
+• Idle server (DCS ikke startet) kan fortsatt få SRS-oppdatering.
+
+**DM-varsler (oppmerksomhets-runde)**
+Sendes ved **OFFLINE**, **DCS DOWN** og lignende driftsproblemer — ikke når en ny DCS- eller SRS-release blir tilgjengelig.
+Flyt: 5 min grace → automatisk DCS-restart via node → 10 min venting → DM til kanalmedlemmer hvis server fortsatt ikke er online.
+
+**Andre symboler**
+🛸 Panel-tittel · ⏳ / 🎉 / ❌ Meldinger under deploy-kø"""
 # Set to a Discord username to DM only that person while testing.
 # None = page panel-channel members one at a time (online first).
 STATUS_ALERT_TEST_USERNAME = None
@@ -569,6 +613,8 @@ class DCSClusterBot(commands.Bot):
         try:
             async for message in channel.history(limit=50):
                 if message.author.id == self.user.id:
+                    if PANEL_CHANNEL_GUIDE_MARKER in (message.content or ""):
+                        continue
                     if message.embeds or message.components:
                         try:
                             await message.delete()
@@ -577,6 +623,32 @@ class DCSClusterBot(commands.Bot):
                             pass
         except Exception as e:
             logger.error("Error purging historic channel messages: %s", e)
+
+    async def ensure_panel_channel_guide(self, channel):
+        """Post or refresh the pinned channel legend (plain text, not purged with panel)."""
+        body = f"{PANEL_CHANNEL_GUIDE_MARKER}\n{PANEL_CHANNEL_GUIDE}"
+        try:
+            async for message in channel.history(limit=30):
+                if message.author.id == self.user.id and PANEL_CHANNEL_GUIDE_MARKER in (
+                    message.content or ""
+                ):
+                    if message.content != body:
+                        await message.edit(content=body)
+                    try:
+                        await message.pin()
+                    except Exception:
+                        pass
+                    return message
+            message = await channel.send(body)
+            try:
+                await message.pin()
+            except Exception:
+                pass
+            logger.info("Posted panel channel guide in #%s", getattr(channel, "name", channel.id))
+            return message
+        except Exception as e:
+            logger.error("Failed to ensure panel channel guide: %s", e)
+            return None
 
     @staticmethod
     def _member_matches_alert_name(member, wanted_name):
@@ -1766,11 +1838,32 @@ class LiveControlPanelView(discord.ui.View):
 # ==================== INITIALIZATION COMMAND ====================
 
 
+@bot.tree.command(
+    name="dcs-panel-guide",
+    description="Oppdater den festede hjelpeteksten for oppdateringspanelet i denne kanalen.",
+)
+@has_dcs_management_permission()
+async def dcs_panel_guide(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    message = await bot.ensure_panel_channel_guide(interaction.channel)
+    if message:
+        await interaction.followup.send(
+            "✅ Hjelpetekst oppdatert og festet i kanalen.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            "❌ Kunne ikke oppdatere hjelpeteksten. Sjekk bot-loggen.",
+            ephemeral=True,
+        )
+
+
 @bot.tree.command(name="dcs-panel-init", description="Pins the permanent live dashboard into this channel.")
 @has_dcs_management_permission()
 async def dcs_panel_init(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     await bot.purge_old_bot_messages(interaction.channel)
+    await bot.ensure_panel_channel_guide(interaction.channel)
 
     view = LiveControlPanelView(bot)
     bot.add_view(view)
