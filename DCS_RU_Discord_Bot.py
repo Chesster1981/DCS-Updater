@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.50"
+CURRENT_BOT_VERSION = "2.1.51"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -47,6 +47,7 @@ ATTENTION_YES_REPLIES = {"ja", "yes"}
 ATTENTION_NO_REPLIES = {"no", "nei"}
 STATUS_MESSAGE_DISMISS_SECONDS = 10
 BOT_PID_FILE = "dcs_ru_discord_bot.pid"
+DISCORD_SELECT_MAX_OPTIONS = 25
 STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_SRS_OUTDATED = "SRS OUTDATED"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED}
@@ -172,6 +173,7 @@ class DCSClusterBot(commands.Bot):
         self.active_panel_view = None
         self.panel_channel_id = None
         self.panel_message_id = None
+        self.panel_selected_server_names = []
         self.cached_dcs_version = "Unknown"
         self.last_cache_time = 0
         self.cached_srs_version = "Unknown"
@@ -1510,7 +1512,83 @@ class LiveControlPanelView(discord.ui.View):
         self.bot = bot_instance
         self.all_nodes_cached = []
         self.select_menu = None
-        self.currently_selected_server_names = []
+        self.currently_selected_server_names = list(
+            getattr(bot_instance, "panel_selected_server_names", []) or []
+        )
+
+    def _selection_names(self):
+        names = getattr(self.bot, "panel_selected_server_names", None)
+        if names is not None:
+            return list(names)
+        return list(self.currently_selected_server_names or [])
+
+    def _set_selection(self, names):
+        ordered = []
+        seen = set()
+        for name in names or []:
+            if name and name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        self.currently_selected_server_names = ordered
+        self.bot.panel_selected_server_names = list(ordered)
+
+    def _apply_deploy_button_state(self, has_outdated):
+        selected_count = len(self._selection_names())
+        if not has_outdated:
+            self.btn_deploy_selected.disabled = True
+            self.btn_deploy_selected.label = "✅ All Servers Up To Date"
+            self.btn_deploy_selected.style = discord.ButtonStyle.secondary
+            return
+        if selected_count:
+            self.btn_deploy_selected.disabled = False
+            self.btn_deploy_selected.label = f"🚀 Execute {selected_count} Selected Update(s)"
+            self.btn_deploy_selected.style = discord.ButtonStyle.danger
+        else:
+            self.btn_deploy_selected.disabled = True
+            self.btn_deploy_selected.label = "🚀 Execute Selected Updates"
+            self.btn_deploy_selected.style = discord.ButtonStyle.secondary
+
+    def _rebuild_select_menu(self, options):
+        if self.select_menu in self.children:
+            self.remove_item(self.select_menu)
+
+        if not options:
+            self.select_menu = None
+            self._set_selection([])
+            self._apply_deploy_button_state(has_outdated=False)
+            return
+
+        options = options[:DISCORD_SELECT_MAX_OPTIONS]
+        valid_values = {opt.value for opt in options}
+        still_selected = [name for name in self._selection_names() if name in valid_values]
+        self._set_selection(still_selected)
+        selected_set = set(still_selected)
+        for opt in options:
+            opt.default = opt.value in selected_set
+
+        self.select_menu = discord.ui.Select(
+            placeholder="Check one or multiple servers to queue for update...",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=1,
+            custom_id="dcs_panel:select",
+        )
+        self.select_menu.callback = self.select_menu_callback
+        self.add_item(self.select_menu)
+        self._apply_deploy_button_state(has_outdated=True)
+
+    async def _edit_panel_view_only(self):
+        if not (self.bot.panel_channel_id and self.bot.panel_message_id):
+            return
+        try:
+            channel = self.bot.get_channel(int(self.bot.panel_channel_id))
+            if channel is None:
+                channel = await self.bot.fetch_channel(int(self.bot.panel_channel_id))
+            message = await channel.fetch_message(int(self.bot.panel_message_id))
+            await message.edit(view=self)
+        except Exception as e:
+            logger.error("Failed to update panel selection view: %s", e)
 
     async def generate_embed(self, guild=None):
         nodes = self.bot.load_cluster_nodes()
@@ -1585,29 +1663,7 @@ class LiveControlPanelView(discord.ui.View):
                 for _ in range(3):
                     embed.add_field(name="\u2001", value="\u2001", inline=True)
 
-        if self.select_menu in self.children:
-            self.remove_item(self.select_menu)
-
-        if options:
-            self.select_menu = discord.ui.Select(
-                placeholder="Check one or multiple servers to queue for update...",
-                min_values=1,
-                max_values=len(options),
-                options=options,
-                row=1,
-                custom_id="dcs_panel:select",
-            )
-            self.select_menu.callback = self.select_menu_callback
-            self.add_item(self.select_menu)
-
-            self.btn_deploy_selected.disabled = False
-            self.btn_deploy_selected.label = f"🚀 Execute {len(options)} Selected Update(s)"
-            self.btn_deploy_selected.style = discord.ButtonStyle.danger
-        else:
-            self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "✅ All Servers Up To Date"
-            self.btn_deploy_selected.style = discord.ButtonStyle.secondary
-            self.select_menu = None
+        self._rebuild_select_menu(options)
 
         try:
             await self.bot.notify_status_changes(snapshots, guild)
@@ -1618,12 +1674,25 @@ class LiveControlPanelView(discord.ui.View):
 
     async def select_menu_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        self.currently_selected_server_names = self.select_menu.values
-        selected_text = ", ".join(self.currently_selected_server_names)
-        confirm = await interaction.followup.send(
-            f"✅ Selected for deployment: **{selected_text}**.", ephemeral=True
-        )
+        self._set_selection(list(self.select_menu.values))
+        selected = self._selection_names()
+        if not selected:
+            confirm = await interaction.followup.send(
+                "☑️ Cleared server selection.", ephemeral=True
+            )
+        else:
+            selected_text = ", ".join(selected)
+            confirm = await interaction.followup.send(
+                f"✅ Selected for deployment: **{selected_text}**.", ephemeral=True
+            )
         self.bot.dismiss_status_message_later(confirm)
+
+        if self.select_menu is not None:
+            selected_set = set(selected)
+            for opt in self.select_menu.options:
+                opt.default = opt.value in selected_set
+        self._apply_deploy_button_state(has_outdated=self.select_menu is not None)
+        await self._edit_panel_view_only()
 
     async def refresh_panel(self):
         if self.bot.panel_channel_id and self.bot.panel_message_id:
@@ -1662,7 +1731,8 @@ class LiveControlPanelView(discord.ui.View):
     async def btn_deploy_selected(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
 
-        if not self.currently_selected_server_names:
+        selected = self._selection_names()
+        if not selected:
             warn = await interaction.followup.send(
                 "⚠️ You must select at least one server from the menu dropdown!",
                 ephemeral=True,
@@ -1672,16 +1742,16 @@ class LiveControlPanelView(discord.ui.View):
 
         log_msg = await interaction.channel.send(
             f"🚨 **[DEPLOYMENT LOG]** Initiating sequential cluster updates for: "
-            f"**{', '.join(self.currently_selected_server_names)}**."
+            f"**{', '.join(selected)}**."
         )
         self.bot.dismiss_status_message_later(log_msg)
 
-        for server_name in self.currently_selected_server_names:
+        for server_name in selected:
             matched_node = next((n for n in self.all_nodes_cached if n["name"] == server_name), None)
             if matched_node:
                 await self.bot.deployment_queue.put({"node": matched_node, "channel": interaction.channel})
 
-        self.currently_selected_server_names = []
+        self._set_selection([])
         await self.refresh_panel()
 
 
