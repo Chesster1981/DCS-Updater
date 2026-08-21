@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.59"
+CURRENT_BOT_VERSION = "2.1.60"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -42,8 +42,9 @@ Bruk `/dcs-panel-init` for å opprette eller gjenopprette live-panelet nederst i
 🟢 **UP TO DATE** — Node svarer, DCS er OK (eller idle med vilje), SRS kjører (når konfigurert), versjoner matcher.
 ⚠️ **UPDATE READY** — DCS-versjonen henger etter siste ED-release.
 ⚠️ **SRS OUTDATED** — SRS-versjonen henger etter siste GitHub-release.
-⚠️ **SRS DOWN** — SRS er konfigurert på noden, men SR-Server-prosessen kjører ikke (DCS er OK).
-🛑 **SRS + DCS DOWN** — både SRS og DCS er nede (DCS krasjet/stoppet eller aldri startet).
+⚠️ **SRS DOWN** — SRS er konfigurert på noden, men SR-Server-prosessen kjører ikke (DCS er OK). Caution.
+⚠️ **SRS + DCS DOWN** — både SRS og DCS er nede, men DCS har aldri kjørt (NEVER_STARTED). Caution.
+🛑 **SRS + DCS DOWN** — både SRS og DCS er nede etter at DCS har kjørt (UNHEALTHY/DEAD). Rødt.
 ⏸️ **NOT STARTED** — DCS har aldri vært startet på noden (bevisst idle). Gul status (oppdatering/SRS) overstyrer dette.
 ⏳ **STARTING** — DCS-prosess kjører, men port svarer ikke ennå.
 🛑 **DCS DOWN** — DCS har kjørt og deretter krasjet/stoppet (UNHEALTHY/DEAD), mens SRS kjører.
@@ -63,9 +64,9 @@ Bot version — versjon av denne Discord-boten
 
 **Knapper og meny**
 🔄 **Refresh Server Status** — manuell oppdatering av panelet
-🚀 **Execute Selected Update(s)** — start deploy-kø for valgte servere (DCS og/eller SRS etter behov)
-Dropdown — velg én eller flere servere som trenger oppdatering. Valget beholdes ved automatisk refresh (hvert 30 s).
-✅ **All Servers Up To Date** — ingen servere trenger oppdatering akkurat nå
+🚀 **Choose Update / Restart / Reboot** — åpner valgmeny for valgte servere (update, restart DCS/SRS eller reboot)
+Dropdown — velg én eller flere servere med gul/rød status. Valget beholdes ved automatisk refresh (hvert 30 s).
+✅ **All clear** — ingen gul/rød servere akkurat nå
 
 **Deploy-logikk**
 • Kun SRS utdatert → kun SRS-oppdatering (`TRIGGER_SRS_UPDATE`), DCS røres ikke.
@@ -106,7 +107,7 @@ STATUS_SRS_OUTDATED = "SRS OUTDATED"
 STATUS_SRS_DOWN = "SRS DOWN"
 STATUS_SRS_AND_DCS_DOWN = "SRS + DCS DOWN"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED, STATUS_SRS_DOWN}
-STATUS_DOWN = {"DCS DOWN", STATUS_SRS_AND_DCS_DOWN, "OFFLINE"}
+STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
 STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
 TASK_AWAITING_OPERATOR = "Awaiting operator action"
@@ -1735,7 +1736,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                     icon = "⚠️"
                 elif srs_down and dcs_not_running:
                     status_text = STATUS_SRS_AND_DCS_DOWN
-                    icon = "🛑"
+                    # Red only if DCS has run before and then failed.
+                    icon = "🛑" if dcs_crashed else "⚠️"
                     if active_task == "Idle":
                         task_info = TASK_AWAITING_OPERATOR
                 elif srs_down:
@@ -1938,16 +1940,19 @@ class LiveControlPanelView(discord.ui.View):
         selected_count = len(self._selection_names())
         if not has_actionable:
             self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "✅ All Servers Up To Date"
+            self.btn_deploy_selected.label = "✅ All clear"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
             return
         if selected_count:
             self.btn_deploy_selected.disabled = False
-            self.btn_deploy_selected.label = f"🚀 Execute {selected_count} Selected Action(s)"
-            self.btn_deploy_selected.style = discord.ButtonStyle.danger
+            noun = "server" if selected_count == 1 else "servers"
+            self.btn_deploy_selected.label = (
+                f"🎯 Choose Update / Restart / Reboot ({selected_count} {noun})"
+            )
+            self.btn_deploy_selected.style = discord.ButtonStyle.primary
         else:
             self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "🚀 Execute Selected Actions"
+            self.btn_deploy_selected.label = "Select server(s) below first"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
     def _rebuild_select_menu(self, options):
@@ -2124,7 +2129,7 @@ class LiveControlPanelView(discord.ui.View):
             await self.bot.restore_or_recreate_panel()
 
     @discord.ui.button(
-        label="🚀 Execute Selected Actions",
+        label="Select server(s) below first",
         style=discord.ButtonStyle.secondary,
         row=0,
         disabled=True,
@@ -2190,19 +2195,19 @@ async def dcs_update_wiki(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
-        name="⚠️ Yellow",
+        name="⚠️ Yellow (Caution)",
         value=(
-            "**UPDATE READY** — DCS behind ED release\n"
-            "**SRS OUTDATED** — SRS behind GitHub release\n"
-            "**SRS DOWN** — SRS configured but not running (DCS OK)"
+            "**UPDATE READY** / **SRS OUTDATED** — version mismatch\n"
+            "**SRS DOWN** — SRS not running (DCS OK)\n"
+            "**SRS + DCS DOWN** — both down, but DCS never started"
         ),
         inline=False,
     )
     embed.add_field(
         name="🛑 Red",
         value=(
-            "**DCS DOWN** — DCS UNHEALTHY/DEAD while SRS is up\n"
-            "**SRS + DCS DOWN** — both SRS and DCS are down"
+            "**DCS DOWN** — DCS was running, then UNHEALTHY/DEAD\n"
+            "**SRS + DCS DOWN** — both down after DCS had been running"
         ),
         inline=False,
     )
@@ -2227,7 +2232,7 @@ async def dcs_update_wiki(interaction: discord.Interaction):
     embed.add_field(
         name="Panel actions (yellow/red)",
         value=(
-            "Select affected servers, then **Execute Selected Actions**:\n"
+            "Select affected servers, then **Choose Update / Restart / Reboot**:\n"
             "• **Update** — DCS and/or SRS install\n"
             "• **Restart DCS** / **Restart SRS**\n"
             "• **Reboot Windows** (confirmation required)"
