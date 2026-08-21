@@ -9,6 +9,8 @@ import socket
 import threading
 import json
 import logging
+import html
+import re
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QObject, Signal, Slot, QTimer
@@ -58,7 +60,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.71"
+CONTROL_PANEL_VERSION = "2.1.72"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -161,38 +163,148 @@ _LIVE_STATUS_REDUNDANT_TASKS = frozenset({
 })
 
 
+def _dcs_live_key(data) -> str:
+    dcs_health = str(data.get("dcs_health", "")).strip().upper()
+    if dcs_health == "HEALTHY" or data.get("dcs_running") is True:
+        return "up"
+    if dcs_health == "STARTING":
+        return "starting"
+    if dcs_health == "NEVER_STARTED":
+        return "off"
+    if dcs_health == "UNHEALTHY":
+        return "noport"
+    if dcs_health == "DEAD" or data.get("dcs_running") is False:
+        return "down"
+    return "unknown"
+
+
+def _srs_live_key(data) -> str:
+    if "srs_configured" not in data and "srs_running" not in data:
+        return "unknown"
+    if not data.get("srs_configured"):
+        return "na"
+    if data.get("srs_running"):
+        return "up"
+    return "down"
+
+
+_LIVE_KEY_TIP = {
+    "up": "up",
+    "off": "off",
+    "starting": "starting",
+    "down": "down",
+    "noport": "no port",
+    "na": "n/a",
+    "unknown": "?",
+}
+
+
 def format_live_services(data):
-    """Compact DCS/SRS process line for the Live Status column."""
+    """
+    Compact Live Status payload: 'DCS|off · SRS|up'
+    Display shows only 'DCS · SRS'; color + tooltip carry the state.
+    """
     if not isinstance(data, dict) or data.get("status") == "UNAUTHORIZED":
         return ""
-    dcs_health = str(data.get("dcs_health", "")).strip().upper()
-    if dcs_health == "HEALTHY":
-        dcs = "DCS up"
-    elif dcs_health == "STARTING":
-        dcs = "DCS starting"
-    elif dcs_health == "NEVER_STARTED":
-        dcs = "DCS off"
-    elif dcs_health == "UNHEALTHY":
-        dcs = "DCS no port"
-    elif dcs_health == "DEAD":
-        dcs = "DCS down"
-    elif data.get("dcs_running") is True:
-        dcs = "DCS up"
-    elif data.get("dcs_running") is False:
-        dcs = "DCS down"
-    else:
-        dcs = "DCS ?"
+    return f"DCS|{_dcs_live_key(data)} · SRS|{_srs_live_key(data)}"
 
-    if "srs_configured" in data or "srs_running" in data:
-        if not data.get("srs_configured"):
-            srs = "SRS n/a"
-        elif data.get("srs_running"):
-            srs = "SRS up"
-        else:
-            srs = "SRS down"
-    else:
-        srs = "SRS ?"
-    return f"{dcs} · {srs}"
+
+def live_service_key_color(key: str) -> str:
+    k = str(key or "").strip().lower()
+    if k == "up":
+        return STYLE_STATUS_GREEN
+    if k == "na":
+        return STYLE_TEXT_MUTED
+    return STYLE_STATUS_WARN
+
+
+def _parse_live_service_token(token: str):
+    """'DCS|off' or legacy 'DCS off' -> (name, key)."""
+    raw = str(token or "").strip()
+    if "|" in raw:
+        name, _, key = raw.partition("|")
+        return name.strip(), (key.strip().lower() or "unknown")
+    parts = raw.split(None, 1)
+    if len(parts) == 2 and parts[0].upper() in ("DCS", "SRS"):
+        word = parts[1].strip().lower()
+        legacy = {
+            "up": "up",
+            "off": "off",
+            "starting": "starting",
+            "down": "down",
+            "no port": "noport",
+            "n/a": "na",
+            "?": "unknown",
+        }
+        return parts[0], legacy.get(word, "unknown")
+    if raw.upper() in ("DCS", "SRS"):
+        return raw, "unknown"
+    return raw, "unknown"
+
+
+def format_live_status_display(label: str):
+    """
+    Build plain + rich-text Live Status (names only; color = state).
+    Returns (plain_text, rich_or_plain, uses_rich_text, tip_detail).
+    """
+    plain_in = str(label or "")
+    if "·" not in plain_in:
+        return plain_in, plain_in, False, plain_in
+
+    task_suffix = ""
+    core = plain_in
+    if " (" in plain_in and plain_in.endswith(")"):
+        split_at = plain_in.rfind(" (")
+        core = plain_in[:split_at]
+        task_suffix = plain_in[split_at:]
+
+    tokens = [p.strip() for p in core.split("·") if p.strip()]
+    parsed = [_parse_live_service_token(t) for t in tokens]
+    if len(parsed) < 2 or not any(n.upper() in ("DCS", "SRS") for n, _ in parsed):
+        return plain_in, plain_in, False, plain_in
+
+    names = [name for name, _ in parsed]
+    plain = " · ".join(names)
+    tip_bits = [f"{name} {_LIVE_KEY_TIP.get(key, key)}" for name, key in parsed]
+    tip_detail = " · ".join(tip_bits)
+
+    spans = []
+    for name, key in parsed:
+        color = live_service_key_color(key)
+        spans.append(
+            f'<span style="color:{color}; font-weight:700;">{html.escape(name)}</span>'
+        )
+    rich = '<span style="color:#8E8E93; font-weight:700;"> · </span>'.join(spans)
+    if task_suffix:
+        plain = f"{plain}{task_suffix}"
+        tip_detail = f"{tip_detail}{task_suffix}"
+        rich += (
+            f'<span style="color:{STYLE_STATUS_WARN}; font-weight:700;">'
+            f"{html.escape(task_suffix)}</span>"
+        )
+    return plain, rich, True, tip_detail
+
+
+def _status_label_plain_text(label_widget) -> str:
+    plain = label_widget.property("plain_status")
+    if plain:
+        return str(plain)
+    text = str(label_widget.text() or "")
+    if "<" in text and ">" in text:
+        return re.sub(r"<[^>]+>", "", text)
+    return text
+
+
+def _live_services_need_warn(live: str) -> bool:
+    live_l = str(live or "").lower()
+    warn_keys = ("|off", "|starting", "|down", "|noport", "|unknown", "|na")
+    if any(k in live_l for k in warn_keys):
+        return True
+    # Legacy plaintext forms
+    return any(
+        s in live_l
+        for s in ("dcs off", "dcs starting", "dcs down", "dcs no port", "srs down", "srs n/a")
+    )
 
 
 def parse_socket_response(answer):
@@ -1251,7 +1363,7 @@ class MainWindow(QMainWindow):
                     st = cell.findChild(QLabel, "status_text")
                     if st is None:
                         continue
-                    text_w = self._text_pixel_width(st.text(), st.font())
+                    text_w = self._text_pixel_width(_status_label_plain_text(st), st.font())
                     width = max(width, text_w + 16 + 8 + CELL_TEXT_PAD * 2 + 12)
             else:
                 for row in range(self.table.rowCount()):
@@ -1364,10 +1476,9 @@ class MainWindow(QMainWindow):
                     c = STYLE_STATUS_RED
 
                 live = (live_services or "").strip()
+                tip_live = ""
                 if live and status not in ("OFFLINE", "UNAUTHORIZED"):
-                    if "SRS down" in live or "DCS down" in live or "DCS no port" in live:
-                        c = STYLE_STATUS_WARN
-                    elif "DCS starting" in live or "DCS off" in live:
+                    if _live_services_need_warn(live):
                         c = STYLE_STATUS_WARN
                     label = live
                     if active_task and active_task not in _LIVE_STATUS_REDUNDANT_TASKS:
@@ -1383,14 +1494,35 @@ class MainWindow(QMainWindow):
                 else:
                     label = status if active_task == "Idle" else f"{status} ({active_task})"
 
+                plain, rich, uses_rich, tip_live = format_live_status_display(label)
+                if not tip_live:
+                    tip_live = plain
+
                 lf.setStyleSheet(f"background-color: {c}; border-radius: 8px;")
-                st.setText(label)
-                st.setMinimumWidth(st.fontMetrics().boundingRect(label).width() + 4)
-                tip_parts = [p for p in (live, active_task if active_task not in ("Idle",) else "", status) if p]
-                tip = " | ".join(dict.fromkeys(tip_parts))  # unique, preserve order
+                st.setProperty("plain_status", plain)
+                if uses_rich:
+                    st.setTextFormat(Qt.RichText)
+                    st.setText(rich)
+                    st.setStyleSheet("font-weight: bold; background: transparent;")
+                else:
+                    st.setTextFormat(Qt.PlainText)
+                    st.setText(plain)
+                    st.setStyleSheet(
+                        f"color: {c}; font-weight: bold; background: transparent;"
+                    )
+                st.setMinimumWidth(st.fontMetrics().boundingRect(plain).width() + 4)
+                tip_parts = [
+                    p
+                    for p in (
+                        tip_live,
+                        active_task if active_task not in ("Idle",) else "",
+                        status,
+                    )
+                    if p
+                ]
+                tip = " | ".join(dict.fromkeys(tip_parts))
                 st.setToolTip(tip)
                 sc.setToolTip(tip)
-                st.setStyleSheet(f"color: {c}; font-weight: bold; background: transparent;")
                 
         vc = self.table.cellWidget(idx, 4)
         if vc:
