@@ -88,12 +88,18 @@ python DCS_RU_Discord_Bot.py
 
 In Discord: `/dcs-panel-init` pins the live panel. On every bot restart the panel and pinned legend are refreshed automatically. `/dcs-panel-guide` refreshes the pinned legend. `/dcs-update-wiki` shows an ephemeral status-logic wiki that auto-dismisses when you switch channel, go offline, press Lukk, or after 15 minutes. Yellow/red servers can be selected for Update, Restart DCS, Restart SRS, or Reboot. Channel/message IDs are stored in `master_config.json`.
 
+In the Control Panel: right-click a server row for **Start / Restart DCS**, **Start / Restart SRS**, or **Reboot Windows** (same Node commands as Discord).
+
 ## TCP protocol
 
 | Command | Response |
 |---------|----------|
-| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_running` |
+| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_running`, SRS fields |
 | `TRIGGER_DCS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `UNAUTHORIZED` |
+| `TRIGGER_SRS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `ERROR` / `UNAUTHORIZED` |
+| `OPERATOR_RESTART_DCS` | Start/restart DCS (no hourly auto-restart limit) |
+| `RESTART_SRS` | Start/restart SRS Server |
+| `REBOOT_WINDOWS` | Schedule host reboot (~10s) |
 | `EXIT_NODE` | `ACK_EXIT` (localhost + auth when a token is set) |
 
 With auth: `mytoken|PING_STATUS`

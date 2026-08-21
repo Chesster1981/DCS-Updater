@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QPushButton, QLabel, QLineEdit,
     QTextEdit, QHeaderView, QMessageBox, QFrame, QCheckBox, QSizePolicy, QStyle,
     QAbstractScrollArea, QDialog, QFormLayout, QComboBox, QSpinBox, QScrollArea,
-    QGroupBox,
+    QGroupBox, QMenu,
 )
 from PySide6.QtGui import QFont, QPixmap, QIcon, QFontMetrics
 
@@ -58,7 +58,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.57"
+CONTROL_PANEL_VERSION = "2.1.58"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -350,6 +350,8 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.itemClicked.connect(self.handle_row_click)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustIgnored)
         self.table.setTextElideMode(Qt.ElideNone)
@@ -452,6 +454,168 @@ class MainWindow(QMainWindow):
 
     def handle_row_click(self, item):
         self.selected_row_index = item.row()
+
+    def _attach_row_context_menu(self, widget, row):
+        widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        widget.customContextMenuRequested.connect(
+            lambda pos, r=row, w=widget: self._show_server_context_menu(
+                r, w.mapToGlobal(pos)
+            )
+        )
+
+    def _on_table_context_menu(self, pos):
+        row = self.table.indexAt(pos).row()
+        if row < 0:
+            return
+        self._show_server_context_menu(row, self.table.viewport().mapToGlobal(pos))
+
+    def _show_server_context_menu(self, row, global_pos):
+        if row < 0 or row >= len(global_servers):
+            return
+        self.selected_row_index = row
+        self.table.selectRow(row)
+        server = global_servers[row]
+        name = server.get("name", f"Server {row + 1}")
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background-color: {STYLE_BG_CELL}; color: {STYLE_TEXT_WHITE}; "
+            f"border: 1px solid #2C2C30; padding: 4px; }}"
+            f"QMenu::item {{ padding: 6px 18px; }}"
+            f"QMenu::item:selected {{ background-color: {STYLE_ACCENT_BLUE}; }}"
+            f"QMenu::item:disabled {{ color: {STYLE_TEXT_MUTED}; }}"
+            f"QMenu::separator {{ height: 1px; background: #2C2C30; margin: 4px 8px; }}"
+        )
+        title = menu.addAction(f"{name}")
+        title.setEnabled(False)
+        menu.addSeparator()
+        act_dcs = menu.addAction("Start / Restart DCS")
+        act_srs = menu.addAction("Start / Restart SRS")
+        act_reboot = menu.addAction("Reboot Windows")
+        if is_deployment_running:
+            act_dcs.setEnabled(False)
+            act_srs.setEnabled(False)
+            act_reboot.setEnabled(False)
+
+        chosen = menu.exec(global_pos)
+        if chosen is act_dcs:
+            self._confirm_and_run_operator_action(row, "OPERATOR_RESTART_DCS", "Start / Restart DCS")
+        elif chosen is act_srs:
+            self._confirm_and_run_operator_action(row, "RESTART_SRS", "Start / Restart SRS")
+        elif chosen is act_reboot:
+            self._confirm_and_run_operator_action(
+                row,
+                "REBOOT_WINDOWS",
+                "Reboot Windows",
+                confirm_text=(
+                    f"Reboot Windows on '{name}'?\n\n"
+                    "The host will restart in about 10 seconds."
+                ),
+            )
+
+    def _confirm_and_run_operator_action(self, row, command, label, confirm_text=None):
+        if row < 0 or row >= len(global_servers):
+            return
+        if is_deployment_running:
+            QMessageBox.warning(self, "Busy", "A deployment is already running.")
+            return
+        server = global_servers[row]
+        name = server.get("name", f"Server {row + 1}")
+        text = confirm_text or f"Run '{label}' on '{name}'?"
+        if QMessageBox.question(self, " Confirm ⚠️ ", text) != QMessageBox.Yes:
+            return
+        threading.Thread(
+            target=self._run_operator_action_thread,
+            args=(row, command, label),
+            daemon=True,
+        ).start()
+
+    def _run_operator_action_thread(self, row, command, label):
+        global is_deployment_running
+        if row < 0 or row >= len(global_servers):
+            return
+        is_deployment_running = True
+        global_signals.deployment_state_changed.emit(True)
+        sd = global_servers[row]
+        n, ip, p = sd["name"], sd["ip"], sd["port"]
+        global_signals.append_log.emit(f" [ACTION] {label} ▶️ {n} ({ip}:{p})...")
+        global_signals.node_updated.emit(str(row), "ONLINE", "FETCHING...", label, "")
+        try:
+            ans = send_socket_command(ip, p, command)
+            if not ans:
+                global_signals.append_log.emit(f" [ ❌ {n}] Node did not answer.")
+                return
+            if "UNKNOWN_COMMAND" in str(ans):
+                global_signals.append_log.emit(
+                    f" [ ❌ {n}] Node is too old for `{command}` — update the Node first."
+                )
+                return
+            if ans.startswith("{"):
+                res = json.loads(ans)
+                status = res.get("status")
+                if status == "UNAUTHORIZED":
+                    global_signals.append_log.emit(
+                        f" [ 🔐 {n}] Unauthorized — check auth_token."
+                    )
+                    global_signals.node_updated.emit(
+                        str(row), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", ""
+                    )
+                    return
+                if status == "REJECTED_BUSY":
+                    global_signals.append_log.emit(
+                        f" [ ⚠️ {n}] Node busy: {res.get('task', 'unknown')}"
+                    )
+                    return
+                if status == "ERROR":
+                    global_signals.append_log.emit(
+                        f" [ ❌ {n}] {res.get('message') or 'Command failed.'}"
+                    )
+                    return
+                if status != "OK_STARTING":
+                    global_signals.append_log.emit(
+                        f" [ ❌ {n}] Rejected: {status}"
+                    )
+                    return
+
+            if command == "REBOOT_WINDOWS":
+                global_signals.append_log.emit(f" [ 🔁 {n}] Windows reboot scheduled.")
+                global_signals.node_updated.emit(str(row), "OFFLINE", "FETCHING...", "Rebooting", "")
+                return
+
+            global_signals.append_log.emit(f" [ ✅ {n}] {label} started. Waiting for Idle...")
+            deadline = time.time() + (600 if command == "OPERATOR_RESTART_DCS" else 300)
+            while time.time() < deadline:
+                chk = send_socket_command(ip, p, "PING_STATUS")
+                if chk and chk.startswith("{"):
+                    data = json.loads(chk)
+                    if data.get("status") == "UNAUTHORIZED":
+                        global_signals.node_updated.emit(
+                            str(row), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", ""
+                        )
+                        break
+                    task = data.get("active_task", "Idle")
+                    ver = data.get("installed_version", "Unknown")
+                    node_ver = data.get("node_version", "1.0")
+                    global_signals.node_updated.emit(str(row), "ONLINE", ver, task, node_ver)
+                    srs_installed, srs_latest = parse_srs_from_ping(chk)
+                    global_signals.srs_versions_updated.emit(str(row), srs_installed, srs_latest)
+                    if task == "Idle":
+                        global_signals.append_log.emit(f" [ 🎉 {n}] {label} finished.")
+                        break
+                time.sleep(DEPLOY_CHECK_INTERVAL)
+            else:
+                global_signals.append_log.emit(f" [ ⏳ {n}] {label} still running — check Live Status.")
+        except Exception as e:
+            global_signals.append_log.emit(f" [ ❌ {n}] {label} failed: {e}")
+        finally:
+            final_chk = send_socket_command(ip, p, "PING_STATUS")
+            if final_chk:
+                status, inst, _, task, node_ver = parse_socket_response(final_chk)
+                global_signals.node_updated.emit(str(row), status, inst, task, node_ver)
+                srs_installed, srs_latest = parse_srs_from_ping(final_chk)
+                global_signals.srs_versions_updated.emit(str(row), srs_installed, srs_latest)
+            is_deployment_running = False
+            global_signals.deployment_state_changed.emit(False)
 
     def save_auth_token(self):
         global cached_auth_token
@@ -921,6 +1085,8 @@ class MainWindow(QMainWindow):
             cw = QWidget(); cl = QHBoxLayout(cw); cb = QCheckBox(); cb.setChecked(True); cl.addWidget(cb)
             cl.setAlignment(Qt.AlignCenter); cl.setContentsMargins(0,0,0,0); cw.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
             self.table.setCellWidget(idx, 0, cw)
+            self._attach_row_context_menu(cw, idx)
+            self._attach_row_context_menu(cb, idx)
             self.table.setItem(idx, 1, QTableWidgetItem(s["name"]))
             self.table.setItem(idx, 2, QTableWidgetItem(s["ip"]))
             self.table.setItem(idx, 3, QTableWidgetItem(s["port"]))
@@ -938,6 +1104,7 @@ class MainWindow(QMainWindow):
                 l.setAlignment(Qt.AlignCenter)
                 w.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
                 self.table.setCellWidget(idx, col, w)
+                self._attach_row_context_menu(w, idx)
             sc = QWidget(); sl = QHBoxLayout(sc); sl.setContentsMargins(CELL_TEXT_PAD, 0, CELL_TEXT_PAD, 0); sl.setSpacing(8)
             lf = QFrame(); lf.setObjectName("status_lamp"); lf.setStyleSheet(f"background-color: {STYLE_STATUS_WARN}; border-radius: 8px;"); lf.setFixedSize(16,16)
             st = QLabel("CHECKING"); st.setObjectName("status_text"); st.setStyleSheet(f"color: {STYLE_STATUS_WARN}; font-weight: bold; background: transparent;")
@@ -945,6 +1112,7 @@ class MainWindow(QMainWindow):
             st.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
             sl.addWidget(lf); sl.addWidget(st); sl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter); sc.setStyleSheet("QWidget:selected { background-color: #3A3A3C; }")
             self.table.setCellWidget(idx, 8, sc)
+            self._attach_row_context_menu(sc, idx)
         for idx in range(self.table.rowCount()):
             self.table.setRowHeight(idx, TABLE_ROW_HEIGHT)
         self.fit_table_and_window()
