@@ -18,6 +18,7 @@ from dcs_ru_common import (
     get_discord_bot_token,
     github_api_headers,
     load_master_config,
+    resolve_master_config_path,
     save_master_config,
     wrap_command,
     fetch_latest_srs_release,
@@ -27,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.70"
+CURRENT_BOT_VERSION = "2.1.71"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -230,7 +231,7 @@ class DCSClusterBot(commands.Bot):
         intents.presences = True
         super().__init__(command_prefix="!", intents=intents)
 
-        self.config_path = "master_config.json"
+        self.config_path = resolve_master_config_path("master_config.json")
         self.deployment_queue = asyncio.Queue()
         self.is_processing_queue = False
         self.socket_timeout = 4.0
@@ -581,7 +582,14 @@ class DCSClusterBot(commands.Bot):
         self.github_self_update_loop.start()
         self.load_cluster_config()
         self.load_persisted_panel_selection()
-        logger.info("Discord Bot v%s running. Auto panel restore enabled.", CURRENT_BOT_VERSION)
+        token_set = bool(str(self.auth_token or "").strip())
+        logger.info(
+            "Discord Bot v%s running. Config: %s (auth_token %s, %s server(s)). Auto panel restore enabled.",
+            CURRENT_BOT_VERSION,
+            self.config_path,
+            "set" if token_set else "EMPTY",
+            len(self.load_cluster_nodes()),
+        )
 
     async def on_ready(self):
         logger.info("Logged in as %s", self.user)

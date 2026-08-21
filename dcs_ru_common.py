@@ -67,6 +67,7 @@ DEFAULT_MASTER_CONFIG: dict[str, Any] = {
     "discord": {
         "panel_channel_id": None,
         "panel_message_id": None,
+        "panel_selected_servers": [],
     },
 }
 
@@ -243,12 +244,18 @@ def migrate_master_dict(data: dict) -> dict:
         "discord": {
             "panel_channel_id": None,
             "panel_message_id": None,
+            "panel_selected_servers": [],
         },
     }
 
     discord = data.get("discord") if isinstance(data.get("discord"), dict) else {}
     result["discord"]["panel_channel_id"] = discord.get("panel_channel_id")
     result["discord"]["panel_message_id"] = discord.get("panel_message_id")
+    saved_selection = discord.get("panel_selected_servers")
+    if isinstance(saved_selection, list):
+        result["discord"]["panel_selected_servers"] = [
+            str(name).strip() for name in saved_selection if str(name).strip()
+        ]
 
     servers_raw = data.get("servers")
     if isinstance(servers_raw, list) and servers_raw:
@@ -261,7 +268,19 @@ def migrate_master_dict(data: dict) -> dict:
     return result
 
 
+def resolve_master_config_path(path: str = MASTER_CONFIG_FILE) -> str:
+    """
+    Resolve master_config.json next to the running app (exe/script), not CWD.
+    Prevents Bot/Control from reading/writing an empty config in the wrong folder.
+    """
+    raw = (path or MASTER_CONFIG_FILE).strip() or MASTER_CONFIG_FILE
+    if os.path.isabs(raw):
+        return raw
+    return os.path.join(get_app_base_dir(), raw)
+
+
 def load_master_config(path: str = MASTER_CONFIG_FILE) -> dict:
+    path = resolve_master_config_path(path)
     if not os.path.exists(path):
         return dict(DEFAULT_MASTER_CONFIG)
 
@@ -276,13 +295,63 @@ def load_master_config(path: str = MASTER_CONFIG_FILE) -> dict:
         return dict(DEFAULT_MASTER_CONFIG)
 
 
+def _merge_master_config_with_existing(payload: dict, existing: dict) -> dict:
+    """
+    Never let a save wipe a good on-disk config with empty defaults
+    (e.g. bot started from wrong folder then persist_panel_* ran).
+    """
+    merged = migrate_master_dict(payload)
+    existing_m = migrate_master_dict(existing)
+
+    if not str(merged.get("auth_token") or "").strip() and str(existing_m.get("auth_token") or "").strip():
+        merged["auth_token"] = existing_m["auth_token"]
+
+    if not merged.get("servers") and existing_m.get("servers"):
+        merged["servers"] = list(existing_m["servers"])
+
+    md = merged.setdefault("discord", {})
+    ed = existing_m.get("discord") or {}
+    if md.get("panel_channel_id") in (None, "", 0) and ed.get("panel_channel_id") not in (None, "", 0):
+        md["panel_channel_id"] = ed.get("panel_channel_id")
+    if md.get("panel_message_id") in (None, "", 0) and ed.get("panel_message_id") not in (None, "", 0):
+        md["panel_message_id"] = ed.get("panel_message_id")
+    # Keep prior selection unless the caller explicitly set a list (including empty clear).
+    if "panel_selected_servers" not in (payload.get("discord") or {}) and ed.get("panel_selected_servers"):
+        md["panel_selected_servers"] = list(ed.get("panel_selected_servers") or [])
+    return merged
+
+
 def save_master_config(config: dict, path: str = MASTER_CONFIG_FILE) -> None:
+    path = resolve_master_config_path(path)
     payload = migrate_master_dict(config if isinstance(config, dict) else {})
+
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                payload = _merge_master_config_with_existing(
+                    config if isinstance(config, dict) else {},
+                    existing,
+                )
+        except Exception as e:
+            logger.warning("Could not merge existing master config %s: %s", path, e)
+
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=4, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_path, path)
     except Exception as e:
         logger.error("Could not save master config %s: %s", path, e)
+        try:
+            if os.path.exists(f"{path}.tmp"):
+                os.remove(f"{path}.tmp")
+        except Exception:
+            pass
 
 
 def scrape_dcs_latest_version(timeout: float = 10.0) -> Optional[str]:

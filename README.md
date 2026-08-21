@@ -45,7 +45,9 @@ Unified schema (legacy `cluster_nodes` is migrated automatically):
 }
 ```
 
-This file is gitignored. Set the **same** `auth_token` on every node.
+This file is gitignored. Keep it **next to** the Control Panel exe / Discord bot script (not necessarily the shell working directory). Set the **same** `auth_token` on every node.
+
+Bot and Control resolve `master_config.json` from the app folder. Saves merge with the existing file so an empty in-memory config cannot wipe servers or `auth_token`.
 
 ### 2. Node (`%APPDATA%\DCS_Norway_Node\dcs_node_config.json`)
 
