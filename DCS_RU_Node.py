@@ -64,7 +64,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.55"
+CURRENT_NODE_VERSION = "2.1.56"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -1466,6 +1466,9 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                     inst_v, cloud_v = get_dcs_versions_local()
                     node_port = load_node_settings().get("network_port", "1015")
                     dcs_health = refresh_dcs_health_state(node_port)
+                    srs_configured = bool(
+                        str(load_node_settings().get("srs_install_folder") or "").strip()
+                    )
                     response = {
                         "status": "ACK",
                         "installed_version": inst_v,
@@ -1474,7 +1477,8 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         "node_version": CURRENT_NODE_VERSION,
                         "dcs_running": dcs_health == DCS_HEALTH_HEALTHY,
                         "dcs_health": dcs_health,
-                        "srs_configured": bool(str(load_node_settings().get("srs_install_folder") or "").strip()),
+                        "srs_configured": srs_configured,
+                        "srs_running": is_srs_process_running() if srs_configured else False,
                         "srs_installed_version": get_srs_installed_version(),
                         "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
                     }

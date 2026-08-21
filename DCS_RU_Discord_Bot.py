@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.55"
+CURRENT_BOT_VERSION = "2.1.56"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -38,21 +38,22 @@ PANEL_CHANNEL_GUIDE = """**DCS Norway — oppdateringspanel**
 
 Bruk `/dcs-panel-init` for å opprette eller gjenopprette live-panelet nederst i kanalen.
 
-**Status-ikon ved servernavn**
-🟢 **UP TO DATE** — Node svarer, DCS er OK (eller idle med vilje), DCS- og SRS-versjon matcher GitHub-release.
-⚠️ **UPDATE READY** — DCS er installert, men ED-versjonen henger etter siste release.
-⚠️ **SRS OUTDATED** — SRS-versjonen henger etter siste GitHub-release (gjelder også idle servere der DCS aldri er startet).
-⏸️ **NOT STARTED** — DCS har aldri vært startet på noden (bevisst idle). Hvis SRS er utdatert vises **SRS OUTDATED** i stedet.
+**Status-ikon ved servernavn (trafikklys)**
+🟢 **UP TO DATE** — Node svarer, DCS er OK (eller idle med vilje), SRS kjører (når konfigurert), versjoner matcher.
+⚠️ **UPDATE READY** — DCS-versjonen henger etter siste ED-release.
+⚠️ **SRS OUTDATED** — SRS-versjonen henger etter siste GitHub-release.
+⚠️ **SRS DOWN** — SRS er konfigurert på noden, men SR-Server-prosessen kjører ikke.
+⏸️ **NOT STARTED** — DCS har aldri vært startet på noden (bevisst idle). Gul status (oppdatering/SRS) overstyrer dette.
 ⏳ **STARTING** — DCS-prosess kjører, men port svarer ikke ennå.
-🛑 **DCS DOWN** — Node online, men DCS_server.exe har krasjet, stoppet eller svarer ikke.
+🛑 **DCS DOWN** — DCS har kjørt og deretter krasjet/stoppet (UNHEALTHY/DEAD). Rødt brukes bare for dette.
 🔐 **UNAUTHORIZED** — auth_token stemmer ikke mellom bot og node.
 🔴 **OFFLINE** — Ingen svar fra node (nede, feil IP/port eller brannmur).
 
 **I status-boksen under hver server**
-ℹ️ Status-tekst (f.eks. UP TO DATE, SRS OUTDATED, DCS DOWN)
+ℹ️ Status-tekst (f.eks. UP TO DATE, SRS DOWN, DCS DOWN)
 ⚙️ Installert DCS-versjon
 📻 Installert SRS-versjon (fra `scripts/DCS-SRS-AutoConnectGameGUI.lua` på noden)
-🖥️ Oppgave / maskinstatus (f.eks. Ready, Boot pending, Updating SRS)
+🖥️ Oppgave / maskinstatus (f.eks. Ready, Boot pending, SRS not running)
 
 **Footer under panelet**
 ED Release Version — siste DCS World-versjon fra ED
@@ -70,9 +71,10 @@ Dropdown — velg én eller flere servere som trenger oppdatering. Valget behold
 • Kun DCS utdatert → kun DCS-oppdatering.
 • Begge utdatert → DCS først, deretter SRS.
 • Idle server (DCS ikke startet) kan fortsatt få SRS-oppdatering.
+• SRS DOWN alene (uten versjonsmismatch) er ikke en deploy-kø — bare varsel.
 
 **DM-varsler (oppmerksomhets-runde)**
-Sendes ved **OFFLINE**, **DCS DOWN** og lignende driftsproblemer — ikke når en ny DCS- eller SRS-release blir tilgjengelig.
+Sendes ved **OFFLINE** og **DCS DOWN** (krasj) — ikke når SRS er nede eller en ny DCS-/SRS-release blir tilgjengelig.
 Flyt: 5 min grace → automatisk DCS-restart via node → 10 min venting → DM til kanalmedlemmer hvis server fortsatt ikke er online.
 
 **Andre symboler**
@@ -94,7 +96,8 @@ BOT_PID_FILE = "dcs_ru_discord_bot.pid"
 DISCORD_SELECT_MAX_OPTIONS = 25
 STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_SRS_OUTDATED = "SRS OUTDATED"
-STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED}
+STATUS_SRS_DOWN = "SRS DOWN"
+STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED, STATUS_SRS_DOWN}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
 STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
@@ -1439,6 +1442,7 @@ PANEL_STATUS_SHORT = {
     "DCS NOT STARTED": "NOT STARTED",
     "DCS STARTING": "STARTING",
     "SRS OUTDATED": "SRS OUTDATED",
+    "SRS DOWN": "SRS DOWN",
 }
 PANEL_TASK_SHORT = {
     "Awaiting server boot": "Boot pending",
@@ -1446,6 +1450,7 @@ PANEL_TASK_SHORT = {
     "Port not responding": "Port down",
     "Server stopped/crashed": "Crashed",
     "DCS_server stopped": "Stopped",
+    "SRS not running": "SRS stopped",
 }
 
 
@@ -1496,6 +1501,7 @@ def classify_node_answer(answer, srs_latest_release=None):
     icon = "🟢"
     dcs_health = ""
     dcs_running = None
+    srs_running = None
 
     if answer and answer.startswith("{"):
         try:
@@ -1511,6 +1517,7 @@ def classify_node_answer(answer, srs_latest_release=None):
                 active_task = res.get("active_task", "Idle")
                 srs_installed_raw = str(res.get("srs_installed_version") or "").strip()
                 srs_configured = bool(res.get("srs_configured", True))
+                srs_running = bool(res.get("srs_running", False)) if srs_configured else None
                 srs_info = srs_installed_raw or "—"
                 if not srs_configured and srs_info in ("", "Not set", "—"):
                     srs_info = "Not set"
@@ -1526,6 +1533,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                     srs_installed_raw, srs_latest
                 )
                 is_outdated = needs_dcs_update or needs_srs_update
+                srs_down = srs_configured and srs_running is False
+                dcs_crashed = dcs_health in HEALTH_CRASHED
                 ver_info = f"{installed_ver}"
 
                 if active_task == "Restarting DCS":
@@ -1536,23 +1545,29 @@ def classify_node_answer(answer, srs_latest_release=None):
                     task_info = "Awaiting server boot"
                 elif dcs_health == "STARTING":
                     task_info = "Awaiting DCS port"
+                elif srs_down:
+                    task_info = "SRS not running"
                 else:
                     task_info = "Ready"
 
-                # Pending updates take priority over DCS health in the panel status line.
+                # Yellow: updates or SRS not running. Red: DCS crash only.
                 if needs_dcs_update:
                     status_text = "UPDATE READY"
                     icon = "⚠️"
                 elif needs_srs_update:
                     status_text = STATUS_SRS_OUTDATED
                     icon = "⚠️"
+                elif srs_down:
+                    status_text = STATUS_SRS_DOWN
+                    icon = "⚠️"
+                    task_info = "SRS not running" if active_task == "Idle" else task_info
                 elif dcs_health == "STARTING":
                     status_text = "DCS STARTING"
                     icon = "⏳"
                 elif dcs_health == "NEVER_STARTED":
                     status_text = "DCS NOT STARTED"
                     icon = "⏸️"
-                elif dcs_running is False or dcs_health in HEALTH_CRASHED:
+                elif dcs_crashed:
                     status_text = "DCS DOWN"
                     icon = "🛑"
                     if active_task == "Restarting DCS":
@@ -1584,6 +1599,7 @@ def classify_node_answer(answer, srs_latest_release=None):
         "icon": icon,
         "dcs_health": dcs_health,
         "dcs_running": dcs_running,
+        "srs_running": srs_running,
     }
 
 
