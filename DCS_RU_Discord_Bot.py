@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.69"
+CURRENT_BOT_VERSION = "2.1.70"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -2068,7 +2068,7 @@ class LiveControlPanelView(discord.ui.View):
                 return defaults
         return []
 
-    def _set_selection(self, names, *, persist=True):
+    def _set_selection(self, names, *, persist=True, bump_rev=True):
         ordered = []
         seen = set()
         for name in names or []:
@@ -2077,7 +2077,8 @@ class LiveControlPanelView(discord.ui.View):
                 ordered.append(str(name))
         self.currently_selected_server_names = ordered
         self.bot.panel_selected_server_names = list(ordered)
-        self.bot._panel_selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0)) + 1
+        if bump_rev:
+            self.bot._panel_selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0)) + 1
         active = getattr(self.bot, "active_panel_view", None)
         if active is not None and active is not self:
             active.currently_selected_server_names = list(ordered)
@@ -2087,12 +2088,12 @@ class LiveControlPanelView(discord.ui.View):
             except Exception:
                 pass
 
-    def _apply_deploy_button_state(self, has_actionable, visible_selected_count=None):
-        if visible_selected_count is None:
+    def _apply_deploy_button_state(self, has_actionable, selected_count=None):
+        if selected_count is None:
             selected_count = len(self._selection_names())
         else:
-            selected_count = int(visible_selected_count)
-        if not has_actionable:
+            selected_count = int(selected_count)
+        if not has_actionable and not selected_count:
             self.btn_deploy_selected.disabled = True
             self.btn_deploy_selected.label = "✅ All clear"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
@@ -2106,29 +2107,112 @@ class LiveControlPanelView(discord.ui.View):
             self.btn_deploy_selected.label = "Select Server Actions"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
+    def _stash_option_rows(self, options):
+        rows = []
+        for opt in options or []:
+            rows.append(
+                {
+                    "label": opt.label,
+                    "value": opt.value,
+                    "description": opt.description or None,
+                    "emoji": opt.emoji,
+                }
+            )
+        self._panel_option_rows = rows
+        return rows
+
+    def _options_from_rows(self, rows, selected_set):
+        options = []
+        for row in rows or []:
+            kwargs = {
+                "label": row["label"],
+                "value": row["value"],
+                "description": row.get("description") or None,
+                "default": row["value"] in selected_set,
+            }
+            emoji = row.get("emoji")
+            if emoji is not None:
+                kwargs["emoji"] = emoji
+            options.append(discord.SelectOption(**kwargs))
+        return options
+
+    def _ensure_selected_servers_in_options(self, options, nodes, snapshots_by_name):
+        """Keep currently selected servers in the dropdown across status refreshes."""
+        known = {n["name"]: n for n in nodes}
+        selected = [n for n in self._selection_names() if n in known]
+        have = {opt.value for opt in options}
+        for name in selected:
+            if name in have:
+                continue
+            node = known[name]
+            snap = snapshots_by_name.get(name) or {}
+            icon = snap.get("icon")
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    description=(
+                        f"{snap.get('status_text', 'Selected')} | Port {node['port']}"
+                    )[:100],
+                    value=name,
+                    emoji=icon if icon in {"⚠️", "🛑"} else "📌",
+                    default=True,
+                )
+            )
+            have.add(name)
+
+        if len(options) <= DISCORD_SELECT_MAX_OPTIONS:
+            return options
+
+        # Prefer keeping selected entries when Discord's 25-option cap is hit.
+        selected_set = set(selected)
+        kept = [opt for opt in options if opt.value in selected_set]
+        for opt in options:
+            if opt.value in selected_set:
+                continue
+            if len(kept) >= DISCORD_SELECT_MAX_OPTIONS:
+                break
+            kept.append(opt)
+        return kept[:DISCORD_SELECT_MAX_OPTIONS]
+
+    def _resync_select_menu_from_selection(self):
+        """Re-apply defaults from bot selection onto the last option rows (under lock)."""
+        rows = getattr(self, "_panel_option_rows", None)
+        if not rows:
+            remembered = self._selection_names()
+            self._apply_deploy_button_state(
+                has_actionable=False,
+                selected_count=len(remembered),
+            )
+            return
+        selected_set = set(self._selection_names())
+        self._rebuild_select_menu(self._options_from_rows(rows, selected_set))
+
     def _rebuild_select_menu(self, options):
-        """Install dropdown. Options must already have default= set. Does not clear bot selection."""
+        """Install dropdown with defaults from current bot selection. Never clears selection."""
         if self.select_menu in self.children:
             self.remove_item(self.select_menu)
 
         remembered = self._selection_names()
+        self._stash_option_rows(options)
         if not options:
             self.select_menu = None
-            self._apply_deploy_button_state(has_actionable=False)
+            self._apply_deploy_button_state(
+                has_actionable=False,
+                selected_count=len(remembered),
+            )
             return
 
         options = options[:DISCORD_SELECT_MAX_OPTIONS]
         valid_values = {opt.value for opt in options}
-        selected_visible = [name for name in remembered if name in valid_values]
-        # Ensure defaults match remembered selection (constructor should already set these).
-        selected_set = set(selected_visible)
+        selected_in_menu = [name for name in remembered if name in valid_values]
+        selected_set = set(selected_in_menu)
         for opt in options:
             opt.default = opt.value in selected_set
 
         self.select_menu = discord.ui.Select(
             placeholder=(
-                f"Select server(s) — {len(selected_visible)} selected"
-                if selected_visible
+                f"Select server(s) — {len(remembered)} selected"
+                if remembered
                 else "Select server(s)"
             ),
             min_values=0,
@@ -2139,9 +2223,10 @@ class LiveControlPanelView(discord.ui.View):
         )
         self.select_menu.callback = self.select_menu_callback
         self.add_item(self.select_menu)
+        # Button reflects full remembered selection, not only "needs action" rows.
         self._apply_deploy_button_state(
             has_actionable=True,
-            visible_selected_count=len(selected_visible),
+            selected_count=len(remembered),
         )
 
     async def _edit_panel_view_only(self):
@@ -2160,10 +2245,6 @@ class LiveControlPanelView(discord.ui.View):
         nodes = self.bot.load_cluster_nodes()
         self.all_nodes_cached = nodes
         known_names = {n["name"] for n in nodes}
-
-        # Snapshot selection; prune only servers removed from the cluster.
-        remembered = [n for n in self._selection_names() if n in known_names]
-        selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0))
 
         dcs_latest_release = await self.bot.fetch_latest_dcs_release()
         srs_latest_release = await self.bot.fetch_latest_srs_release_cached()
@@ -2189,16 +2270,15 @@ class LiveControlPanelView(discord.ui.View):
 
         options = []
         snapshots = []
+        snapshots_by_name = {}
         tasks_list = [self.bot.send_socket_command(n["ip"], n["port"], "PING_STATUS") for n in nodes]
         responses = await asyncio.gather(*tasks_list)
 
-        # If the user changed selection during pings, keep their latest choice.
-        if int(getattr(self.bot, "_panel_selection_rev", 0)) != selection_rev:
-            remembered = [n for n in self._selection_names() if n in known_names]
-        else:
-            # Re-apply snapshot without rewriting config every refresh.
-            self._set_selection(remembered, persist=False)
-
+        # Prune selection only for servers removed from the cluster config.
+        # Never clear operator picks just because a refresh ran.
+        live_selection = [n for n in self._selection_names() if n in known_names]
+        if live_selection != list(self._selection_names()):
+            self._set_selection(live_selection, persist=True)
         selected_set = set(self._selection_names())
 
         for idx, (node, answer) in enumerate(zip(nodes, responses)):
@@ -2208,15 +2288,15 @@ class LiveControlPanelView(discord.ui.View):
             task_info = classified["task_info"]
             needs_action = classified.get("needs_action", classified["is_outdated"])
             icon = classified["icon"]
-            snapshots.append(
-                {
-                    "key": f"{node.get('ip')}:{node.get('port')}",
-                    "ip": node.get("ip"),
-                    "port": node.get("port"),
-                    "name": node["name"],
-                    **classified,
-                }
-            )
+            snap = {
+                "key": f"{node.get('ip')}:{node.get('port')}",
+                "ip": node.get("ip"),
+                "port": node.get("port"),
+                "name": node["name"],
+                **classified,
+            }
+            snapshots.append(snap)
+            snapshots_by_name[node["name"]] = snap
 
             if needs_action:
                 options.append(
@@ -2244,6 +2324,11 @@ class LiveControlPanelView(discord.ui.View):
                 for _ in range(3):
                     embed.add_field(name="\u2001", value="\u2001", inline=True)
 
+        # Re-read selection after awaits above may have interleaved with user clicks.
+        selected_set = set(self._selection_names())
+        for opt in options:
+            opt.default = opt.value in selected_set
+        options = self._ensure_selected_servers_in_options(options, nodes, snapshots_by_name)
         self._rebuild_select_menu(options)
 
         try:
@@ -2251,6 +2336,8 @@ class LiveControlPanelView(discord.ui.View):
         except Exception as e:
             logger.error("Failed to send status alert DMs: %s", e)
 
+        # Selection may have changed during notify DMs — rebuild defaults again before return.
+        self._resync_select_menu_from_selection()
         return embed
 
     @staticmethod
@@ -2295,7 +2382,10 @@ class LiveControlPanelView(discord.ui.View):
                     )
                 target._rebuild_select_menu(option_rows)
             else:
-                target._apply_deploy_button_state(has_actionable=False)
+                target._apply_deploy_button_state(
+                    has_actionable=False,
+                    selected_count=len(selected),
+                )
             await target._edit_panel_view_only()
 
         if not selected:
@@ -2319,6 +2409,8 @@ class LiveControlPanelView(discord.ui.View):
                 # Ping nodes outside the lock so dropdown selection can be saved mid-refresh.
                 new_embed = await self.generate_embed(guild=channel.guild)
                 async with self.bot._panel_update_lock:
+                    # User may have changed selection while generate_embed awaited; re-apply now.
+                    self._resync_select_menu_from_selection()
                     await message.edit(embed=new_embed, view=self)
                 return True
             except Exception as e:
