@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.66"
+CURRENT_BOT_VERSION = "2.1.67"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1918,6 +1918,10 @@ class PanelActionPickerView(discord.ui.View):
             content=f"Queued **{action_label}** for **{names}**.",
             view=None,
         )
+        try:
+            self.bot.dismiss_status_message_later(await interaction.original_response())
+        except Exception:
+            pass
         log_msg = await self.channel.send(
             f"🚨 **[ACTION LOG]** {action_label} for: **{names}**."
         )
@@ -1947,6 +1951,10 @@ class RebootConfirmView(discord.ui.View):
             content=f"Queued **{action_label}** for **{names}**.",
             view=None,
         )
+        try:
+            self.bot.dismiss_status_message_later(await interaction.original_response())
+        except Exception:
+            pass
         log_msg = await self.channel.send(
             f"🚨 **[ACTION LOG]** {action_label} for: **{names}**."
         )
@@ -1963,6 +1971,10 @@ class RebootConfirmView(discord.ui.View):
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def btn_cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="Reboot cancelled.", view=None)
+        try:
+            self.bot.dismiss_status_message_later(await interaction.original_response())
+        except Exception:
+            pass
         self.stop()
 
 
