@@ -28,65 +28,65 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.74"
+CURRENT_BOT_VERSION = "2.1.75"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
 BOT_GITHUB_CHECK_DELAY_SECONDS = 20
 BOT_GITHUB_CHECK_MINUTES = 5
 PANEL_CHANNEL_GUIDE_MARKER = "<!-- dcs-panel-guide -->"
-PANEL_CHANNEL_GUIDE = """**DCS Norway — oppdateringspanel**
+PANEL_CHANNEL_GUIDE = """**DCS Norway — update panel**
 
-Bruk `/dcs-panel-init` for å opprette eller gjenopprette live-panelet nederst i kanalen.
+Use `/dcs-panel-init` to create or restore the live panel at the bottom of this channel.
 
-**Status-ikon ved servernavn (trafikklys)**
-🟢 **UP TO DATE** — Node svarer, DCS er OK (eller idle med vilje), SRS kjører (når konfigurert), versjoner matcher.
-⚠️ **UPDATE READY** — DCS-versjonen henger etter siste ED-release.
-⚠️ **SRS OUTDATED** — SRS-versjonen henger etter siste GitHub-release.
-⚠️ **SRS DOWN** — SRS er konfigurert på noden, men SR-Server-prosessen kjører ikke (DCS er OK). Caution.
-⚠️ **SRS + DCS DOWN** — både SRS og DCS er nede, men DCS har aldri kjørt (NEVER_STARTED). Caution.
-🛑 **SRS + DCS DOWN** — både SRS og DCS er nede etter at DCS har kjørt (UNHEALTHY/DEAD). Rødt.
-⏸️ **NOT STARTED** — DCS har aldri vært startet på noden (bevisst idle). Gul status (oppdatering/SRS) overstyrer dette.
-⏳ **STARTING** — DCS-prosess kjører, men port svarer ikke ennå.
-🛑 **DCS DOWN** — DCS har kjørt og deretter krasjet/stoppet (UNHEALTHY/DEAD), mens SRS kjører.
-🔐 **UNAUTHORIZED** — auth_token stemmer ikke mellom bot og node.
-🔴 **OFFLINE** — Ingen svar fra node (nede, feil IP/port eller brannmur).
+**Status icon next to the server name (traffic light)**
+🟢 **UP TO DATE** — Node answers, DCS is OK (or idle on purpose), SRS is running (when configured), versions match.
+⚠️ **UPDATE READY** — DCS version is behind the latest ED release.
+⚠️ **SRS OUTDATED** — SRS version is behind the latest GitHub release.
+⚠️ **SRS DOWN** — SRS is configured on the node, but the SR-Server process is not running (DCS is OK). Caution.
+⚠️ **SRS + DCS DOWN** — both SRS and DCS are down, but DCS has never run (NEVER_STARTED). Caution.
+🛑 **SRS + DCS DOWN** — both SRS and DCS are down after DCS had been running (UNHEALTHY/DEAD). Red.
+⏸️ **NOT STARTED** — DCS has never been started on the node (intentional idle). Yellow status (update/SRS) overrides this.
+⏳ **STARTING** — DCS process is running, but the port is not answering yet.
+🛑 **DCS DOWN** — DCS had been running and then crashed/stopped (UNHEALTHY/DEAD), while SRS is running.
+🔐 **UNAUTHORIZED** — auth_token does not match between bot and node.
+🔴 **OFFLINE** — No reply from the node (down, wrong IP/port, or firewall).
 
-**I status-boksen under hver server**
-ℹ️ Status-tekst (f.eks. UP TO DATE, SRS DOWN, DCS DOWN)
-⚙️ Installert DCS-versjon
-📻 Installert SRS-versjon (fra `scripts/DCS-SRS-AutoConnectGameGUI.lua` på noden)
-🖥️ Oppgave / maskinstatus (f.eks. Ready, Action required, Port pending)
+**In the status box under each server**
+ℹ️ Status text (e.g. UP TO DATE, SRS DOWN, DCS DOWN)
+⚙️ Installed DCS version
+📻 Installed SRS version (from `scripts/DCS-SRS-AutoConnectGameGUI.lua` on the node)
+🖥️ Task / machine status (e.g. Ready, Action required, Port pending)
 
-**Footer under panelet**
-ED Release Version — siste DCS World-versjon fra ED
-SRS Release Version — siste SRS fra GitHub (ciribob/DCS-SimpleRadioStandalone)
-Bot version — versjon av denne Discord-boten
+**Footer under the panel**
+ED Release Version — latest DCS World version from ED
+SRS Release Version — latest SRS from GitHub (ciribob/DCS-SimpleRadioStandalone)
+Bot version — version of this Discord bot
 
-**Knapper og meny**
-🔄 **Refresh Server Status** — manuell oppdatering av panelet
-🚀 **Select Actions** — etter valg i dropdown: åpner handlingsmeny (start/restart, update, reboot)
-Dropdown **Select server(s)** — velg én eller flere gul/røde servere. Valget beholdes ved automatisk refresh (hvert 30 s).
-✅ **All clear** — ingen gul/rød servere akkurat nå
+**Buttons and menu**
+🔄 **Refresh Server Status** — manually refresh the panel
+🚀 **Select Actions** — after choosing from the dropdown: opens the action menu (start/restart, update, reboot)
+Dropdown **Select server(s)** — pick one or more yellow/red servers. Selection is kept across automatic refresh (every 30 s).
+✅ **All clear** — no yellow/red servers right now
 
-**Deploy-logikk**
-• Kun SRS utdatert → kun SRS-oppdatering (`TRIGGER_SRS_UPDATE`), DCS røres ikke.
-• Kun DCS utdatert → kun DCS-oppdatering.
-• Begge utdatert → DCS først, deretter SRS.
-• Idle server (DCS ikke startet) kan fortsatt få SRS-oppdatering.
-• SRS DOWN alene (uten versjonsmismatch) kan restartes via panelet (Restart SRS).
-• Gul/rød status aktiverer handlingsknappen: Update, Restart DCS, Restart SRS eller Reboot.
+**Deploy logic**
+• Only SRS outdated → SRS update only (`TRIGGER_SRS_UPDATE`), DCS is not touched.
+• Only DCS outdated → DCS update only.
+• Both outdated → DCS first, then SRS.
+• Idle server (DCS not started) can still receive an SRS update.
+• SRS DOWN alone (without a version mismatch) can be restarted from the panel (Restart SRS).
+• Yellow/red status enables the action button: Update, Restart DCS, Restart SRS, or Reboot.
 
-**DM-varsler (oppmerksomhets-runde)**
-Sendes ved **OFFLINE** og **DCS DOWN** (krasj) — ikke når SRS er nede eller en ny DCS-/SRS-release blir tilgjengelig.
-Flyt: 5 min grace → automatisk DCS-restart via node → 10 min venting → DM til kanalmedlemmer hvis server fortsatt ikke er online.
+**DM alerts (attention round)**
+Sent on **OFFLINE** and **DCS DOWN** (crash) — not when SRS is down or when a new DCS/SRS release becomes available.
+Flow: 5 min grace → automatic DCS restart via node → 10 min wait → DM channel members if the server is still not online.
 
-**Slash-kommandoer**
-`/dcs-panel-wiki` — midlertidig forklaring av statuslogikk (fjernes når du bytter kanal, lukker Discord, eller trykker Lukk).
+**Slash commands**
+`/dcs-panel-wiki` — temporary status-logic explanation (removed when you switch channel, close Discord, or press Close).
 `/dcs-panel-init` · `/dcs-panel-update`
 
-**Andre symboler**
-🛸 Panel-tittel · ⏳ / 🎉 / ❌ Meldinger under deploy-kø"""
+**Other symbols**
+🛸 Panel title · ⏳ / 🎉 / ❌ Messages during the deploy queue"""
 # Set to a Discord username to DM only that person while testing.
 # None = page panel-channel members one at a time (online first).
 STATUS_ALERT_TEST_USERNAME = None
@@ -1884,7 +1884,7 @@ class WikiDismissView(discord.ui.View):
         self.bot = bot_instance
         self.user_id = user_id
 
-    @discord.ui.button(label="Lukk", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.secondary)
     async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
             await interaction.response.send_message("This wiki belongs to another user.", ephemeral=True)
@@ -2497,7 +2497,7 @@ async def dcs_panel_wiki(interaction: discord.Interaction):
         title="DCS Norway — status wiki",
         description=(
             "Traffic-light logic for the live panel.\n"
-            "This message is removed when you switch channel, go offline, press **Lukk**, "
+            "This message is removed when you switch channel, go offline, press **Close**, "
             "or after 15 minutes."
         ),
         color=discord.Color.from_rgb(26, 132, 255),

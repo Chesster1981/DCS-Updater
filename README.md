@@ -88,7 +88,7 @@ $env:DISCORD_BOT_TOKEN = "..."
 python DCS_RU_Discord_Bot.py
 ```
 
-In Discord: `/dcs-panel-init` pins the live panel. On every bot restart the panel and pinned legend are refreshed automatically. `/dcs-panel-wiki` shows an ephemeral status-logic wiki that auto-dismisses when you switch channel, go offline, press Lukk, or after 15 minutes. `/dcs-panel-update` forces a GitHub bot self-update check. Yellow/red servers can be selected for Update, Restart DCS, Restart SRS, or Reboot. Channel/message IDs are stored in `master_config.json`.
+In Discord: `/dcs-panel-init` pins the live panel. On every bot restart the panel and pinned legend are refreshed automatically. `/dcs-panel-wiki` shows an ephemeral status-logic wiki that auto-dismisses when you switch channel, go offline, press Close, or after 15 minutes. `/dcs-panel-update` forces a GitHub bot self-update check. Yellow/red servers can be selected for Update, Restart DCS, Restart SRS, or Reboot. Channel/message IDs are stored in `master_config.json`.
 
 In the Control Panel: right-click a server row for **Start / Restart DCS**, **Start / Restart SRS**, **Check for Node Update**, or **Reboot Windows**. Live Status shows whether DCS and SRS are running (e.g. `DCS up · SRS down`).
 
