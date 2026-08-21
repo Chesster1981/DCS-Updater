@@ -64,7 +64,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.68"
+CURRENT_NODE_VERSION = "2.1.69"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -1616,6 +1616,19 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         response = {"status": "REJECTED_BUSY", "task": node_state["active_task"]}
                         conn.send((json.dumps(response) + "\n").encode("utf-8"))
                         conn.close()
+                elif command == "CHECK_NODE_UPDATE":
+                    if is_swapping:
+                        response = {"status": "REJECTED_BUSY", "task": "Updating node"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                    else:
+                        response = {"status": "OK_STARTING"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log(
+                            "[REMOTE] Control Panel requested an immediate GitHub Node update check."
+                        )
+                        force_github_update_check(silent=True)
                 elif command == "RESTART_DCS":
                     if is_swapping or node_state["active_task"] != "Idle":
                         response = {
@@ -1825,20 +1838,27 @@ def trigger_local_srs_update():
     if messagebox.askyesno("Confirm", "Update SRS Server on this machine now?"):
         threading.Thread(target=execute_srs_update_pipeline, daemon=True).start()
 
-def force_github_update_check():
-    """NEW: Forces an immediate GitHub update check from the settings panel."""
+def force_github_update_check(silent=False):
+    """Forces an immediate GitHub update check (UI button or remote Control command)."""
     global last_github_node_check_timestamp
     if is_swapping:
-        messagebox.showwarning("Busy", "A node update sequence is already active.")
-        return
-    
+        if not silent:
+            messagebox.showwarning("Busy", "A node update sequence is already active.")
+        return False
+
     append_activity_log("\n[SYSTEM] Manual GitHub update check requested by operator...")
     # Reset the loop timestamp so the background thread alignment stays correct
     last_github_node_check_timestamp = time.time()
-    
+
     # Run the check in a separate background thread to keep the UI perfectly fluid
     threading.Thread(target=check_for_github_node_updates_silent, daemon=True).start()
-    messagebox.showinfo("Update Check", "GitHub update check initiated in the background.\nCheck the activity log for details.")
+    if not silent:
+        messagebox.showinfo(
+            "Update Check",
+            "GitHub update check initiated in the background.\nCheck the activity log for details.",
+        )
+    return True
+
 
 def show_main_frame(): 
     frame_settings.pack_forget()

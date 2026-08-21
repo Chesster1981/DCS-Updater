@@ -58,7 +58,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.68"
+CONTROL_PANEL_VERSION = "2.1.69"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -109,7 +109,8 @@ STYLE_BTN_SRS_HOVER    = "#409CFF"
 # PART 2 OF 5: NETWORK INFRASTRUCTURE, ASYNCHRONOUS STATUS ENGINE & SIGNALS
 # ==============================================================================
 class ClusterSignals(QObject):
-    node_updated = Signal(str, str, str, str, str)
+    # row_id, status, installed_ver, active_task, node_ver, live_services (e.g. "DCS up · SRS down")
+    node_updated = Signal(str, str, str, str, str, str)
     srs_versions_updated = Signal(str, str, str)
     cloud_version_updated = Signal(str)
     srs_cloud_version_updated = Signal(str)
@@ -150,23 +151,68 @@ def save_config_to_file():
     )
 
 
+_LIVE_STATUS_REDUNDANT_TASKS = frozenset({
+    "Idle",
+    "DCS not started",
+    "DCS starting (waiting for port)",
+    "DCS not responding on port",
+    "DCS server stopped/crashed",
+    "DCS_server.exe not running",
+})
+
+
+def format_live_services(data):
+    """Compact DCS/SRS process line for the Live Status column."""
+    if not isinstance(data, dict) or data.get("status") == "UNAUTHORIZED":
+        return ""
+    dcs_health = str(data.get("dcs_health", "")).strip().upper()
+    if dcs_health == "HEALTHY":
+        dcs = "DCS up"
+    elif dcs_health == "STARTING":
+        dcs = "DCS starting"
+    elif dcs_health == "NEVER_STARTED":
+        dcs = "DCS off"
+    elif dcs_health == "UNHEALTHY":
+        dcs = "DCS no port"
+    elif dcs_health == "DEAD":
+        dcs = "DCS down"
+    elif data.get("dcs_running") is True:
+        dcs = "DCS up"
+    elif data.get("dcs_running") is False:
+        dcs = "DCS down"
+    else:
+        dcs = "DCS ?"
+
+    if "srs_configured" in data or "srs_running" in data:
+        if not data.get("srs_configured"):
+            srs = "SRS n/a"
+        elif data.get("srs_running"):
+            srs = "SRS up"
+        else:
+            srs = "SRS down"
+    else:
+        srs = "SRS ?"
+    return f"{dcs} · {srs}"
+
+
 def parse_socket_response(answer):
     """
     Parse a node TCP reply.
-    Returns: status, installed_ver, cloud_ver, active_task, node_ver
+    Returns: status, installed_ver, cloud_ver, active_task, node_ver, live_services
     status is ONLINE, DCS DOWN, UNAUTHORIZED, or OFFLINE.
     """
     if not answer:
-        return "OFFLINE", "UNKNOWN", "Unknown", "Idle", ""
+        return "OFFLINE", "UNKNOWN", "Unknown", "Idle", "", ""
 
     try:
         if answer.startswith("{"):
             data = json.loads(answer)
             if data.get("status") == "UNAUTHORIZED":
-                return "UNAUTHORIZED", "BAD TOKEN", "—", "Check auth_token", ""
+                return "UNAUTHORIZED", "BAD TOKEN", "—", "Check auth_token", "", ""
             dcs_health = str(data.get("dcs_health", "")).strip().upper()
             dcs_running = data.get("dcs_running", True)
             active_task = data.get("active_task", "Idle")
+            live_services = format_live_services(data)
 
             if dcs_health == "HEALTHY" or dcs_running is True:
                 status = "ONLINE"
@@ -194,6 +240,7 @@ def parse_socket_response(answer):
                 data.get("latest_cloud_version", "Unknown"),
                 active_task,
                 data.get("node_version", "1.0"),
+                live_services,
             )
         parts = answer.split(":")
         return (
@@ -202,10 +249,11 @@ def parse_socket_response(answer):
             parts[2].strip() if len(parts) > 2 else "Unknown",
             "Idle",
             "1.0",
+            "",
         )
     except Exception as err:
         logging.error("Error parsing network response: %s", err)
-        return "OFFLINE", "UNKNOWN", "Unknown", "Idle", ""
+        return "OFFLINE", "UNKNOWN", "Unknown", "Idle", "", ""
 
 
 def parse_srs_from_ping(answer):
@@ -242,7 +290,7 @@ def test_single_system_background(index, ip, port, window_ref=None):
     global is_deployment_running
     row_id_str = str(index)
     answer = send_socket_command(ip, port, "PING_STATUS")
-    status, local_ver, cloud_ver, active_task, node_ver = parse_socket_response(answer)
+    status, local_ver, cloud_ver, active_task, node_ver, live_services = parse_socket_response(answer)
     srs_installed, srs_latest = parse_srs_from_ping(answer)
     if status == "ONLINE" and cloud_ver not in ("Unknown", "Fetching..."):
         global_signals.cloud_version_updated.emit(cloud_ver)
@@ -251,7 +299,9 @@ def test_single_system_background(index, ip, port, window_ref=None):
         global_signals.cloud_version_updated.emit(cloud_ver)
     if srs_latest not in ("Unknown", "Fetching...", "—", ""):
         global_signals.srs_cloud_version_updated.emit(srs_latest)
-    global_signals.node_updated.emit(row_id_str, status, local_ver, active_task, node_ver)
+    global_signals.node_updated.emit(
+        row_id_str, status, local_ver, active_task, node_ver, live_services
+    )
     global_signals.srs_versions_updated.emit(row_id_str, srs_installed, srs_latest)
 
 def automatic_status_monitor(window_ref=None):
@@ -491,10 +541,12 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         act_dcs = menu.addAction("Start / Restart DCS")
         act_srs = menu.addAction("Start / Restart SRS")
+        act_node_upd = menu.addAction("Check for Node Update")
         act_reboot = menu.addAction("Reboot Windows")
         if is_deployment_running:
             act_dcs.setEnabled(False)
             act_srs.setEnabled(False)
+            act_node_upd.setEnabled(False)
             act_reboot.setEnabled(False)
 
         chosen = menu.exec(global_pos)
@@ -502,6 +554,16 @@ class MainWindow(QMainWindow):
             self._confirm_and_run_operator_action(row, "OPERATOR_RESTART_DCS", "Start / Restart DCS")
         elif chosen is act_srs:
             self._confirm_and_run_operator_action(row, "RESTART_SRS", "Start / Restart SRS")
+        elif chosen is act_node_upd:
+            self._confirm_and_run_operator_action(
+                row,
+                "CHECK_NODE_UPDATE",
+                "Check for Node Update",
+                confirm_text=(
+                    f"Force a GitHub Node update check on '{name}' now?\n\n"
+                    "The node will download and install if a newer release is available."
+                ),
+            )
         elif chosen is act_reboot:
             self._confirm_and_run_operator_action(
                 row,
@@ -539,7 +601,7 @@ class MainWindow(QMainWindow):
         sd = global_servers[row]
         n, ip, p = sd["name"], sd["ip"], sd["port"]
         global_signals.append_log.emit(f" [ACTION] {label} ▶️ {n} ({ip}:{p})...")
-        global_signals.node_updated.emit(str(row), "ONLINE", "FETCHING...", label, "")
+        global_signals.node_updated.emit(str(row), "ONLINE", "FETCHING...", label, "", "")
         try:
             ans = send_socket_command(ip, p, command)
             if not ans:
@@ -558,7 +620,7 @@ class MainWindow(QMainWindow):
                         f" [ 🔐 {n}] Unauthorized — check auth_token."
                     )
                     global_signals.node_updated.emit(
-                        str(row), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", ""
+                        str(row), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "", ""
                     )
                     return
                 if status == "REJECTED_BUSY":
@@ -579,7 +641,13 @@ class MainWindow(QMainWindow):
 
             if command == "REBOOT_WINDOWS":
                 global_signals.append_log.emit(f" [ 🔁 {n}] Windows reboot scheduled.")
-                global_signals.node_updated.emit(str(row), "OFFLINE", "FETCHING...", "Rebooting", "")
+                global_signals.node_updated.emit(str(row), "OFFLINE", "FETCHING...", "Rebooting", "", "")
+                return
+
+            if command == "CHECK_NODE_UPDATE":
+                global_signals.append_log.emit(
+                    f" [ ✅ {n}] Node update check started (see node activity log)."
+                )
                 return
 
             global_signals.append_log.emit(f" [ ✅ {n}] {label} started. Waiting for Idle...")
@@ -590,13 +658,14 @@ class MainWindow(QMainWindow):
                     data = json.loads(chk)
                     if data.get("status") == "UNAUTHORIZED":
                         global_signals.node_updated.emit(
-                            str(row), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", ""
+                            str(row), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "", ""
                         )
                         break
                     task = data.get("active_task", "Idle")
                     ver = data.get("installed_version", "Unknown")
                     node_ver = data.get("node_version", "1.0")
-                    global_signals.node_updated.emit(str(row), "ONLINE", ver, task, node_ver)
+                    live = format_live_services(data)
+                    global_signals.node_updated.emit(str(row), "ONLINE", ver, task, node_ver, live)
                     srs_installed, srs_latest = parse_srs_from_ping(chk)
                     global_signals.srs_versions_updated.emit(str(row), srs_installed, srs_latest)
                     if task == "Idle":
@@ -610,8 +679,8 @@ class MainWindow(QMainWindow):
         finally:
             final_chk = send_socket_command(ip, p, "PING_STATUS")
             if final_chk:
-                status, inst, _, task, node_ver = parse_socket_response(final_chk)
-                global_signals.node_updated.emit(str(row), status, inst, task, node_ver)
+                status, inst, _, task, node_ver, live = parse_socket_response(final_chk)
+                global_signals.node_updated.emit(str(row), status, inst, task, node_ver, live)
                 srs_installed, srs_latest = parse_srs_from_ping(final_chk)
                 global_signals.srs_versions_updated.emit(str(row), srs_installed, srs_latest)
             is_deployment_running = False
@@ -1267,8 +1336,8 @@ class MainWindow(QMainWindow):
 # ==============================================================================
 # PART 5 OF 5: THREAD-SAFE SLOTS, EXPLICIT STRING IDENTITY MATCHERS & MAIN LOOPS
 # ==============================================================================
-    @Slot(str, str, str, str, str)
-    def slot_node_updated(self, row_id_str, status, installed_ver, active_task, node_ver):
+    @Slot(str, str, str, str, str, str)
+    def slot_node_updated(self, row_id_str, status, installed_ver, active_task, node_ver, live_services=""):
         idx = int(row_id_str)
         if idx >= self.table.rowCount(): return
         
@@ -1285,24 +1354,40 @@ class MainWindow(QMainWindow):
             if lf and st:
                 if status == "ONLINE":
                     c = STYLE_STATUS_GREEN
-                    label = status if active_task == "Idle" else f"{status} ({active_task})"
                 elif status == "STARTING":
                     c = STYLE_STATUS_WARN
-                    label = "STARTING"
                 elif status == "DCS DOWN":
                     c = STYLE_STATUS_WARN
-                    # Keep column compact; details go in tooltip
-                    label = "DCS DOWN"
                 elif status == "UNAUTHORIZED":
                     c = STYLE_STATUS_WARN
-                    label = "UNAUTHORIZED"
                 else:
                     c = STYLE_STATUS_RED
+
+                live = (live_services or "").strip()
+                if live and status not in ("OFFLINE", "UNAUTHORIZED"):
+                    if "SRS down" in live or "DCS down" in live or "DCS no port" in live:
+                        c = STYLE_STATUS_WARN
+                    elif "DCS starting" in live or "DCS off" in live:
+                        c = STYLE_STATUS_WARN
+                    label = live
+                    if active_task and active_task not in _LIVE_STATUS_REDUNDANT_TASKS:
+                        label = f"{live} ({active_task})"
+                elif status == "ONLINE":
                     label = status if active_task == "Idle" else f"{status} ({active_task})"
+                elif status == "STARTING":
+                    label = "STARTING"
+                elif status == "DCS DOWN":
+                    label = "DCS DOWN"
+                elif status == "UNAUTHORIZED":
+                    label = "UNAUTHORIZED"
+                else:
+                    label = status if active_task == "Idle" else f"{status} ({active_task})"
+
                 lf.setStyleSheet(f"background-color: {c}; border-radius: 8px;")
                 st.setText(label)
                 st.setMinimumWidth(st.fontMetrics().boundingRect(label).width() + 4)
-                tip = active_task if active_task not in ("Idle",) else status
+                tip_parts = [p for p in (live, active_task if active_task not in ("Idle",) else "", status) if p]
+                tip = " | ".join(dict.fromkeys(tip_parts))  # unique, preserve order
                 st.setToolTip(tip)
                 sc.setToolTip(tip)
                 st.setStyleSheet(f"color: {c}; font-weight: bold; background: transparent;")
@@ -1442,7 +1527,7 @@ class MainWindow(QMainWindow):
                 
             sd = global_servers[idx]; n, ip, p = sd["name"], sd["ip"], sd["port"]
             global_signals.append_log.emit(f" [QUEUE] Processing ▶️ {n} ({ip}:{p})...")
-            global_signals.node_updated.emit(str(idx), "ONLINE", "FETCHING...", "Updating", "")
+            global_signals.node_updated.emit(str(idx), "ONLINE", "FETCHING...", "Updating", "", "")
             
             try:
                 ans = send_socket_command(ip, p, "TRIGGER_DCS_UPDATE")
@@ -1452,7 +1537,7 @@ class MainWindow(QMainWindow):
                         global_signals.append_log.emit(
                             f" [ 🔐 {n}] Unauthorized — set the same auth_token in Control Panel and on this Node."
                         )
-                        global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                        global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "", "")
                         continue
                     if res_json.get("status") == "REJECTED_BUSY":
                         global_signals.append_log.emit(f" [ ⚠️ {n}] Node busy: {res_json.get('task', 'unknown')}")
@@ -1471,13 +1556,16 @@ class MainWindow(QMainWindow):
                                 response_json = json.loads(chk)
                                 if response_json.get("status") == "UNAUTHORIZED":
                                     global_signals.append_log.emit(f" [ 🔐 {n}] Unauthorized during monitor.")
-                                    global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                                    global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "", "")
                                     break
                                 local_task = response_json.get("active_task", "Idle")
                                 local_ver = response_json.get("installed_version", "Unknown")
                                 node_ver = response_json.get("node_version", "1.0")
                                 
-                                global_signals.node_updated.emit(str(idx), "ONLINE", local_ver, local_task, node_ver)
+                                global_signals.node_updated.emit(
+                                    str(idx), "ONLINE", local_ver, local_task, node_ver,
+                                    format_live_services(response_json),
+                                )
                                 
                                 if local_task in ["Rebooting", "Idle"]:
                                     global_signals.append_log.emit(f" [ 🎉 {n}] Download complete! Bandwidth released for next server.")
@@ -1509,12 +1597,12 @@ class MainWindow(QMainWindow):
             finally:
                 final_chk = send_socket_command(ip, p, "PING_STATUS")
                 if final_chk:
-                    status, inst, _, task, node_ver = parse_socket_response(final_chk)
-                    global_signals.node_updated.emit(str(idx), status, inst, task, node_ver)
+                    status, inst, _, task, node_ver, live = parse_socket_response(final_chk)
+                    global_signals.node_updated.emit(str(idx), status, inst, task, node_ver, live)
                     srs_installed, srs_latest = parse_srs_from_ping(final_chk)
                     global_signals.srs_versions_updated.emit(str(idx), srs_installed, srs_latest)
                 else:
-                    global_signals.node_updated.emit(str(idx), "OFFLINE", "FETCHING...", "Rebooting", "")
+                    global_signals.node_updated.emit(str(idx), "OFFLINE", "FETCHING...", "Rebooting", "", "")
                     
         global_signals.append_log.emit("\n=== ALL SEQUENTIAL DEPLOYMENTS COMPLETED ===")
         is_deployment_running = False
@@ -1534,7 +1622,7 @@ class MainWindow(QMainWindow):
             sd = global_servers[idx]
             n, ip, p = sd["name"], sd["ip"], sd["port"]
             global_signals.append_log.emit(f" [QUEUE] SRS update ▶️ {n} ({ip}:{p})...")
-            global_signals.node_updated.emit(str(idx), "ONLINE", "FETCHING...", "Updating SRS", "")
+            global_signals.node_updated.emit(str(idx), "ONLINE", "FETCHING...", "Updating SRS", "", "")
 
             try:
                 ans = send_socket_command(ip, p, "TRIGGER_SRS_UPDATE")
@@ -1550,7 +1638,7 @@ class MainWindow(QMainWindow):
                         global_signals.append_log.emit(
                             f" [ 🔐 {n}] Unauthorized — set the same auth_token in Control Panel and on this Node."
                         )
-                        global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                        global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "", "")
                         continue
                     if res_json.get("status") == "REJECTED_BUSY":
                         global_signals.append_log.emit(f" [ ⚠️ {n}] Node busy: {res_json.get('task', 'unknown')}")
@@ -1577,13 +1665,16 @@ class MainWindow(QMainWindow):
                             response_json = json.loads(chk)
                             if response_json.get("status") == "UNAUTHORIZED":
                                 global_signals.append_log.emit(f" [ 🔐 {n}] Unauthorized during monitor.")
-                                global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "")
+                                global_signals.node_updated.emit(str(idx), "UNAUTHORIZED", "BAD TOKEN", "Check auth_token", "", "")
                                 finished = True
                                 break
                             local_task = response_json.get("active_task", "Idle")
                             local_ver = response_json.get("installed_version", "Unknown")
                             node_ver = response_json.get("node_version", "1.0")
-                            global_signals.node_updated.emit(str(idx), "ONLINE", local_ver, local_task, node_ver)
+                            global_signals.node_updated.emit(
+                                    str(idx), "ONLINE", local_ver, local_task, node_ver,
+                                    format_live_services(response_json),
+                                )
                             srs_installed, srs_latest = parse_srs_from_ping(chk)
                             global_signals.srs_versions_updated.emit(str(idx), srs_installed, srs_latest)
                             if local_task == "Idle":
@@ -1606,13 +1697,13 @@ class MainWindow(QMainWindow):
             finally:
                 final_chk = send_socket_command(ip, p, "PING_STATUS")
                 if final_chk:
-                    status, inst, _, task, node_ver = parse_socket_response(final_chk)
-                    global_signals.node_updated.emit(str(idx), status, inst, task, node_ver)
+                    status, inst, _, task, node_ver, live = parse_socket_response(final_chk)
+                    global_signals.node_updated.emit(str(idx), status, inst, task, node_ver, live)
                     srs_installed, srs_latest = parse_srs_from_ping(final_chk)
                     global_signals.srs_versions_updated.emit(str(idx), srs_installed, srs_latest)
                 else:
                     global_signals.append_log.emit(f" [ ❌ {n}] Node went offline during SRS update.")
-                    global_signals.node_updated.emit(str(idx), "OFFLINE", "FETCHING...", "Idle", "")
+                    global_signals.node_updated.emit(str(idx), "OFFLINE", "FETCHING...", "Idle", "", "")
 
         global_signals.append_log.emit("\n=== ALL SEQUENTIAL SRS UPDATES COMPLETED ===")
         is_deployment_running = False
