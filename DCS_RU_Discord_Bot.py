@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.60"
+CURRENT_BOT_VERSION = "2.1.61"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -64,8 +64,8 @@ Bot version — versjon av denne Discord-boten
 
 **Knapper og meny**
 🔄 **Refresh Server Status** — manuell oppdatering av panelet
-🚀 **Choose Update / Restart / Reboot** — åpner valgmeny for valgte servere (update, restart DCS/SRS eller reboot)
-Dropdown — velg én eller flere servere med gul/rød status. Valget beholdes ved automatisk refresh (hvert 30 s).
+🚀 **Select Servers** — etter valg i dropdown: åpner handlingsmeny (start/restart, update, reboot)
+Dropdown **Select Server Actions** — velg én eller flere gul/røde servere. Valget beholdes ved automatisk refresh (hvert 30 s).
 ✅ **All clear** — ingen gul/rød servere akkurat nå
 
 **Deploy-logikk**
@@ -1380,30 +1380,48 @@ class DCSClusterBot(commands.Bot):
         )
         status_messages = [status_msg]
         try:
-            if action == "update":
+            if action in ("update", "update_dcs", "update_srs"):
                 ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
                 classified = classify_node_answer(ping, srs_latest_release=srs_latest)
                 needs_dcs = classified.get("needs_dcs_update", False)
                 needs_srs = classified.get("needs_srs_update", False)
 
-                if not needs_dcs and not needs_srs:
-                    await status_msg.edit(
-                        content=f"✅ **[{name}]** Already up to date — nothing to deploy."
-                    )
-                    return
-
-                if needs_dcs:
+                if action == "update_dcs":
+                    if not needs_dcs:
+                        await status_msg.edit(
+                            content=f"✅ **[{name}]** DCS already up to date — nothing to deploy."
+                        )
+                        return
                     await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
                     await self._run_dcs_update(node, channel, status_msg, name)
+                elif action == "update_srs":
+                    if not needs_srs:
+                        await status_msg.edit(
+                            content=f"✅ **[{name}]** SRS already up to date — nothing to deploy."
+                        )
+                        return
+                    await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                    await self._run_srs_update(node, channel, status_msg, name)
+                else:
+                    # Legacy combined update
+                    if not needs_dcs and not needs_srs:
+                        await status_msg.edit(
+                            content=f"✅ **[{name}]** Already up to date — nothing to deploy."
+                        )
+                        return
 
-                if needs_srs:
                     if needs_dcs:
-                        srs_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
-                        status_messages.append(srs_msg)
-                        await self._run_srs_update(node, channel, srs_msg, name)
-                    else:
-                        await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
-                        await self._run_srs_update(node, channel, status_msg, name)
+                        await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
+                        await self._run_dcs_update(node, channel, status_msg, name)
+
+                    if needs_srs:
+                        if needs_dcs:
+                            srs_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                            status_messages.append(srs_msg)
+                            await self._run_srs_update(node, channel, srs_msg, name)
+                        else:
+                            await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                            await self._run_srs_update(node, channel, status_msg, name)
 
             elif action == "restart_dcs":
                 await self._run_operator_command(
@@ -1819,25 +1837,31 @@ class PanelActionPickerView(discord.ui.View):
         placeholder="Choose action…",
         options=[
             discord.SelectOption(
-                label="Update (DCS and/or SRS)",
-                value="update",
-                description="Install available DCS/SRS updates only",
-                emoji="🚀",
-            ),
-            discord.SelectOption(
-                label="Restart DCS",
+                label="Start/Restart DCS",
                 value="restart_dcs",
-                description="Restart DCS_server.exe on selected nodes",
+                description="Start or restart DCS_server.exe",
                 emoji="🔄",
             ),
             discord.SelectOption(
-                label="Restart SRS",
+                label="Start/Restart SRS",
                 value="restart_srs",
-                description="Restart SR-Server.exe on selected nodes",
+                description="Start or restart SR-Server.exe",
                 emoji="📻",
             ),
             discord.SelectOption(
-                label="Reboot Windows",
+                label="Update DCS",
+                value="update_dcs",
+                description="Install available DCS update only",
+                emoji="🚀",
+            ),
+            discord.SelectOption(
+                label="Update SRS",
+                value="update_srs",
+                description="Install available SRS update only",
+                emoji="📡",
+            ),
+            discord.SelectOption(
+                label="Reboot Server",
                 value="reboot",
                 description="Reboot the Windows host (10s delay)",
                 emoji="🔁",
@@ -1852,7 +1876,7 @@ class PanelActionPickerView(discord.ui.View):
             confirm = RebootConfirmView(self.bot, self.nodes, self.channel)
             await interaction.response.edit_message(
                 content=(
-                    f"⚠️ Confirm **Windows reboot** for **{names}**?\n"
+                    f"⚠️ Confirm **Reboot Server** for **{names}**?\n"
                     "This will reboot the host OS in ~10 seconds."
                 ),
                 view=confirm,
@@ -1945,14 +1969,11 @@ class LiveControlPanelView(discord.ui.View):
             return
         if selected_count:
             self.btn_deploy_selected.disabled = False
-            noun = "server" if selected_count == 1 else "servers"
-            self.btn_deploy_selected.label = (
-                f"🎯 Choose Update / Restart / Reboot ({selected_count} {noun})"
-            )
+            self.btn_deploy_selected.label = "Select Servers"
             self.btn_deploy_selected.style = discord.ButtonStyle.primary
         else:
             self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "Select server(s) below first"
+            self.btn_deploy_selected.label = "Select Servers"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
     def _rebuild_select_menu(self, options):
@@ -1974,7 +1995,7 @@ class LiveControlPanelView(discord.ui.View):
             opt.default = opt.value in selected_set
 
         self.select_menu = discord.ui.Select(
-            placeholder="Select yellow/red servers for update, restart or reboot...",
+            placeholder="Select Server Actions",
             min_values=0,
             max_values=len(options),
             options=options,
@@ -2129,7 +2150,7 @@ class LiveControlPanelView(discord.ui.View):
             await self.bot.restore_or_recreate_panel()
 
     @discord.ui.button(
-        label="Select server(s) below first",
+        label="Select Servers",
         style=discord.ButtonStyle.secondary,
         row=0,
         disabled=True,
@@ -2232,10 +2253,10 @@ async def dcs_update_wiki(interaction: discord.Interaction):
     embed.add_field(
         name="Panel actions (yellow/red)",
         value=(
-            "Select affected servers, then **Choose Update / Restart / Reboot**:\n"
-            "• **Update** — DCS and/or SRS install\n"
-            "• **Restart DCS** / **Restart SRS**\n"
-            "• **Reboot Windows** (confirmation required)"
+            "Use **Select Server Actions**, then **Select Servers**:\n"
+            "• **Start/Restart DCS** / **Start/Restart SRS**\n"
+            "• **Update DCS** / **Update SRS**\n"
+            "• **Reboot Server** (confirmation required)"
         ),
         inline=False,
     )
