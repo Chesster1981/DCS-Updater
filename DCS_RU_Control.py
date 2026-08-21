@@ -60,7 +60,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.72"
+CONTROL_PANEL_VERSION = "2.1.73"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10

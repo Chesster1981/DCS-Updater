@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.72"
+CURRENT_BOT_VERSION = "2.1.73"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -65,7 +65,7 @@ Bot version — versjon av denne Discord-boten
 
 **Knapper og meny**
 🔄 **Refresh Server Status** — manuell oppdatering av panelet
-🚀 **Select Server Actions** — etter valg i dropdown: åpner handlingsmeny (start/restart, update, reboot)
+🚀 **Select Actions** — etter valg i dropdown: åpner handlingsmeny (start/restart, update, reboot)
 Dropdown **Select server(s)** — velg én eller flere gul/røde servere. Valget beholdes ved automatisk refresh (hvert 30 s).
 ✅ **All clear** — ingen gul/rød servere akkurat nå
 
@@ -2108,11 +2108,11 @@ class LiveControlPanelView(discord.ui.View):
             return
         if selected_count:
             self.btn_deploy_selected.disabled = False
-            self.btn_deploy_selected.label = f"Select Server Actions ({selected_count})"
+            self.btn_deploy_selected.label = f"Select Actions ({selected_count})"
             self.btn_deploy_selected.style = discord.ButtonStyle.primary
         else:
             self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "Select Server Actions"
+            self.btn_deploy_selected.label = "Select Actions"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
     def _stash_option_rows(self, options):
@@ -2439,7 +2439,7 @@ class LiveControlPanelView(discord.ui.View):
             await self.bot.restore_or_recreate_panel()
 
     @discord.ui.button(
-        label="Select Server Actions",
+        label="Select Actions",
         style=discord.ButtonStyle.secondary,
         row=0,
         disabled=True,
@@ -2545,7 +2545,7 @@ async def dcs_update_wiki(interaction: discord.Interaction):
     embed.add_field(
         name="Panel actions (yellow/red)",
         value=(
-            "Use **Select server(s)**, then **Select Server Actions**:\n"
+            "Use **Select server(s)**, then **Select Actions**:\n"
             "• **Start/Restart DCS** / **Start/Restart SRS**\n"
             "• **Update DCS** / **Update SRS**\n"
             "• **Reboot Server** (confirmation required)"
