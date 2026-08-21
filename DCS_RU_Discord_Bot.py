@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.67"
+CURRENT_BOT_VERSION = "2.1.68"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -295,22 +295,51 @@ class DCSClusterBot(commands.Bot):
             self.panel_message_id = message_id
         return data
 
+    def load_persisted_panel_selection(self):
+        """Load dropdown selection from disk once (not on every status refresh)."""
+        try:
+            data = load_master_config(self.config_path)
+            saved = (data.get("discord") or {}).get("panel_selected_servers")
+            if isinstance(saved, list):
+                self.panel_selected_server_names = [
+                    str(name).strip() for name in saved if str(name).strip()
+                ]
+        except Exception as e:
+            logger.warning("Could not load persisted panel selection: %s", e)
+
     def load_cluster_nodes(self):
         data = self.load_cluster_config()
         return data.get("servers", [])
 
     def persist_panel_ids(self):
         data = load_master_config(self.config_path)
-        data["discord"] = {
-            "panel_channel_id": self.panel_channel_id,
-            "panel_message_id": self.panel_message_id,
-        }
+        discord_meta = dict(data.get("discord") or {})
+        discord_meta["panel_channel_id"] = self.panel_channel_id
+        discord_meta["panel_message_id"] = self.panel_message_id
+        discord_meta["panel_selected_servers"] = list(self.panel_selected_server_names or [])
+        data["discord"] = discord_meta
         save_master_config(data, self.config_path)
         logger.info(
-            "Persisted Discord panel IDs (channel=%s message=%s)",
+            "Persisted Discord panel IDs (channel=%s message=%s selection=%s)",
             self.panel_channel_id,
             self.panel_message_id,
+            self.panel_selected_server_names,
         )
+
+    def persist_panel_selection(self):
+        """Write current dropdown selection to master_config without touching other fields."""
+        try:
+            data = load_master_config(self.config_path)
+            discord_meta = dict(data.get("discord") or {})
+            discord_meta["panel_selected_servers"] = list(self.panel_selected_server_names or [])
+            if self.panel_channel_id is not None:
+                discord_meta["panel_channel_id"] = self.panel_channel_id
+            if self.panel_message_id is not None:
+                discord_meta["panel_message_id"] = self.panel_message_id
+            data["discord"] = discord_meta
+            save_master_config(data, self.config_path)
+        except Exception as e:
+            logger.warning("Could not persist panel selection: %s", e)
 
     async def fetch_latest_dcs_release(self):
         """Async scrape with the same URL/pattern set as Control/Node."""
@@ -551,6 +580,7 @@ class DCSClusterBot(commands.Bot):
         self.persistent_panel_refresh_loop.start()
         self.github_self_update_loop.start()
         self.load_cluster_config()
+        self.load_persisted_panel_selection()
         logger.info("Discord Bot v%s running. Auto panel restore enabled.", CURRENT_BOT_VERSION)
 
     async def on_ready(self):
@@ -1990,14 +2020,14 @@ class LiveControlPanelView(discord.ui.View):
 
     def _selection_names(self):
         names = getattr(self.bot, "panel_selected_server_names", None)
-        if names:
-            return list(names)
+        if names is not None:
+            return [str(n) for n in names if n]
         active = getattr(self.bot, "active_panel_view", None)
         if active is not None and active is not self:
             active_names = getattr(active, "currently_selected_server_names", None)
             if active_names:
-                return list(active_names)
-        return list(self.currently_selected_server_names or [])
+                return [str(n) for n in active_names if n]
+        return [str(n) for n in (self.currently_selected_server_names or []) if n]
 
     @staticmethod
     def _selection_from_message(message):
@@ -2010,7 +2040,6 @@ class LiveControlPanelView(discord.ui.View):
                 values = getattr(child, "values", None)
                 if values:
                     selected.extend(str(v) for v in values if v)
-        # Preserve order, drop duplicates
         ordered = []
         seen = set()
         for name in selected:
@@ -2039,19 +2068,24 @@ class LiveControlPanelView(discord.ui.View):
                 return defaults
         return []
 
-    def _set_selection(self, names):
+    def _set_selection(self, names, *, persist=True):
         ordered = []
         seen = set()
         for name in names or []:
             if name and name not in seen:
                 seen.add(name)
-                ordered.append(name)
+                ordered.append(str(name))
         self.currently_selected_server_names = ordered
         self.bot.panel_selected_server_names = list(ordered)
         self.bot._panel_selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0)) + 1
         active = getattr(self.bot, "active_panel_view", None)
         if active is not None and active is not self:
             active.currently_selected_server_names = list(ordered)
+        if persist:
+            try:
+                self.bot.persist_panel_selection()
+            except Exception:
+                pass
 
     def _apply_deploy_button_state(self, has_actionable, visible_selected_count=None):
         if visible_selected_count is None:
@@ -2072,32 +2106,21 @@ class LiveControlPanelView(discord.ui.View):
             self.btn_deploy_selected.label = "Select Server Actions"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
-    def _rebuild_select_menu(self, options, known_server_names=None):
-        """Rebuild dropdown while remembering selection across refreshes.
-
-        Selection is only pruned when a server disappears from the cluster, not when
-        it temporarily leaves the actionable (yellow/red) list.
-        """
-        remembered = self._selection_names()
-        if known_server_names is not None:
-            known = set(known_server_names)
-            remembered = [name for name in remembered if name in known]
-            self._set_selection(remembered)
-        else:
-            remembered = self._selection_names()
-
+    def _rebuild_select_menu(self, options):
+        """Install dropdown. Options must already have default= set. Does not clear bot selection."""
         if self.select_menu in self.children:
             self.remove_item(self.select_menu)
 
+        remembered = self._selection_names()
         if not options:
             self.select_menu = None
-            # Keep remembered selection for when servers become actionable again.
             self._apply_deploy_button_state(has_actionable=False)
             return
 
         options = options[:DISCORD_SELECT_MAX_OPTIONS]
         valid_values = {opt.value for opt in options}
         selected_visible = [name for name in remembered if name in valid_values]
+        # Ensure defaults match remembered selection (constructor should already set these).
         selected_set = set(selected_visible)
         for opt in options:
             opt.default = opt.value in selected_set
@@ -2134,11 +2157,13 @@ class LiveControlPanelView(discord.ui.View):
             logger.error("Failed to update panel selection view: %s", e)
 
     async def generate_embed(self, guild=None):
-        # Snapshot before awaits; only restore if nothing changed the selection mid-flight.
-        selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0))
-        remembered = list(self._selection_names())
         nodes = self.bot.load_cluster_nodes()
         self.all_nodes_cached = nodes
+        known_names = {n["name"] for n in nodes}
+
+        # Snapshot selection; prune only servers removed from the cluster.
+        remembered = [n for n in self._selection_names() if n in known_names]
+        selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0))
 
         dcs_latest_release = await self.bot.fetch_latest_dcs_release()
         srs_latest_release = await self.bot.fetch_latest_srs_release_cached()
@@ -2167,8 +2192,14 @@ class LiveControlPanelView(discord.ui.View):
         tasks_list = [self.bot.send_socket_command(n["ip"], n["port"], "PING_STATUS") for n in nodes]
         responses = await asyncio.gather(*tasks_list)
 
-        if int(getattr(self.bot, "_panel_selection_rev", 0)) == selection_rev:
-            self._set_selection(remembered)
+        # If the user changed selection during pings, keep their latest choice.
+        if int(getattr(self.bot, "_panel_selection_rev", 0)) != selection_rev:
+            remembered = [n for n in self._selection_names() if n in known_names]
+        else:
+            # Re-apply snapshot without rewriting config every refresh.
+            self._set_selection(remembered, persist=False)
+
+        selected_set = set(self._selection_names())
 
         for idx, (node, answer) in enumerate(zip(nodes, responses)):
             classified = classify_node_answer(answer, srs_latest_release=srs_latest_release)
@@ -2194,6 +2225,7 @@ class LiveControlPanelView(discord.ui.View):
                         description=f"{status_text} | Port {node['port']}",
                         value=node["name"],
                         emoji=icon if icon in {"⚠️", "🛑"} else "⚠️",
+                        default=node["name"] in selected_set,
                     )
                 )
 
@@ -2212,10 +2244,7 @@ class LiveControlPanelView(discord.ui.View):
                 for _ in range(3):
                     embed.add_field(name="\u2001", value="\u2001", inline=True)
 
-        self._rebuild_select_menu(
-            options,
-            known_server_names={n["name"] for n in nodes},
-        )
+        self._rebuild_select_menu(options)
 
         try:
             await self.bot.notify_status_changes(snapshots, guild)
@@ -2224,31 +2253,50 @@ class LiveControlPanelView(discord.ui.View):
 
         return embed
 
+    @staticmethod
+    def _interaction_select_values(interaction: discord.Interaction):
+        data = getattr(interaction, "data", None)
+        if data is None:
+            return []
+        if isinstance(data, dict):
+            return [str(v) for v in (data.get("values") or []) if v]
+        values = getattr(data, "get", lambda _k, _d=None: None)("values")
+        if values:
+            return [str(v) for v in values if v]
+        try:
+            return [str(v) for v in data["values"] if v]
+        except Exception:
+            return []
+
     async def select_menu_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        values = []
-        data = getattr(interaction, "data", None) or {}
-        if isinstance(data, dict):
-            values = list(data.get("values") or [])
+        values = self._interaction_select_values(interaction)
         if not values and self.select_menu is not None:
-            values = list(getattr(self.select_menu, "values", None) or [])
+            values = [str(v) for v in (getattr(self.select_menu, "values", None) or []) if v]
+
+        # Prefer writing onto the live panel view so refresh and button share state.
+        target = self.bot.active_panel_view or self
         async with self.bot._panel_update_lock:
-            self._set_selection(values)
-            selected = self._selection_names()
-            if self.select_menu is not None:
-                selected_set = set(selected)
-                for opt in self.select_menu.options:
-                    opt.default = opt.value in selected_set
-                self.select_menu.placeholder = (
-                    f"Select server(s) — {len(selected)} selected"
-                    if selected
-                    else "Select server(s)"
-                )
-            self._apply_deploy_button_state(
-                has_actionable=self.select_menu is not None,
-                visible_selected_count=len(selected),
-            )
-            await self._edit_panel_view_only()
+            target._set_selection(values, persist=True)
+            selected = target._selection_names()
+            selected_set = set(selected)
+            # Rebuild option defaults on the active view's current option list.
+            option_rows = []
+            if target.select_menu is not None:
+                for opt in target.select_menu.options:
+                    option_rows.append(
+                        discord.SelectOption(
+                            label=opt.label,
+                            value=opt.value,
+                            description=opt.description or None,
+                            emoji=opt.emoji if opt.emoji is not None else None,
+                            default=opt.value in selected_set,
+                        )
+                    )
+                target._rebuild_select_menu(option_rows)
+            else:
+                target._apply_deploy_button_state(has_actionable=False)
+            await target._edit_panel_view_only()
 
         if not selected:
             confirm = await interaction.followup.send(
@@ -2264,12 +2312,13 @@ class LiveControlPanelView(discord.ui.View):
     async def refresh_panel(self):
         if self.bot.panel_channel_id and self.bot.panel_message_id:
             try:
+                channel = self.bot.get_channel(int(self.bot.panel_channel_id))
+                if channel is None:
+                    channel = await self.bot.fetch_channel(int(self.bot.panel_channel_id))
+                message = await channel.fetch_message(int(self.bot.panel_message_id))
+                # Ping nodes outside the lock so dropdown selection can be saved mid-refresh.
+                new_embed = await self.generate_embed(guild=channel.guild)
                 async with self.bot._panel_update_lock:
-                    channel = self.bot.get_channel(int(self.bot.panel_channel_id))
-                    if channel is None:
-                        channel = await self.bot.fetch_channel(int(self.bot.panel_channel_id))
-                    message = await channel.fetch_message(int(self.bot.panel_message_id))
-                    new_embed = await self.generate_embed(guild=channel.guild)
                     await message.edit(embed=new_embed, view=self)
                 return True
             except Exception as e:
