@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.63"
+CURRENT_BOT_VERSION = "2.1.64"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -55,7 +55,7 @@ Bruk `/dcs-panel-init` for å opprette eller gjenopprette live-panelet nederst i
 ℹ️ Status-tekst (f.eks. UP TO DATE, SRS DOWN, DCS DOWN)
 ⚙️ Installert DCS-versjon
 📻 Installert SRS-versjon (fra `scripts/DCS-SRS-AutoConnectGameGUI.lua` på noden)
-🖥️ Oppgave / maskinstatus (f.eks. Ready, Need action, Boot pending)
+🖥️ Oppgave / maskinstatus (f.eks. Ready, Action required, Port pending)
 
 **Footer under panelet**
 ED Release Version — siste DCS World-versjon fra ED
@@ -110,7 +110,16 @@ STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED, STATUS_SRS_
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
 STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
-TASK_AWAITING_OPERATOR = "Awaiting operator action"
+TASK_AWAITING_OPERATOR = "Action required"
+
+PANEL_ACTION_LABELS = {
+    "restart_dcs": "Start/Restart DCS",
+    "restart_srs": "Start/Restart SRS",
+    "update_dcs": "Update DCS",
+    "update_srs": "Update SRS",
+    "update": "Update",
+    "reboot": "Reboot Server",
+}
 STILL_ACTIVE = 259
 
 
@@ -1642,7 +1651,8 @@ PANEL_TASK_SHORT = {
     "Port not responding": "Port down",
     "Server stopped/crashed": "Crashed",
     "DCS_server stopped": "Stopped",
-    "Awaiting operator action": "Need action",
+    "Awaiting operator action": "Action needed",
+    "Action required": "Action needed",
 }
 
 
@@ -1730,7 +1740,9 @@ def classify_node_answer(answer, srs_latest_release=None):
                 srs_down = srs_configured and srs_running is False
                 dcs_crashed = dcs_health in HEALTH_CRASHED
                 dcs_not_running = dcs_crashed or dcs_health == "NEVER_STARTED"
-                needs_action = is_outdated or srs_down or dcs_crashed
+                needs_action = (
+                    is_outdated or srs_down or dcs_crashed or dcs_health == "NEVER_STARTED"
+                )
                 ver_info = f"{installed_ver}"
 
                 if active_task == "Restarting DCS":
@@ -1739,10 +1751,12 @@ def classify_node_answer(answer, srs_latest_release=None):
                     task_info = "Restarting SRS"
                 elif active_task != "Idle":
                     task_info = active_task
-                elif dcs_health == "NEVER_STARTED":
-                    task_info = "Awaiting server boot"
                 elif dcs_health == "STARTING":
+                    # Real wait: process is up, port not ready yet.
                     task_info = "Awaiting DCS port"
+                elif dcs_health == "NEVER_STARTED" or srs_down or dcs_crashed:
+                    # No automatic boot is queued — operator must act.
+                    task_info = TASK_AWAITING_OPERATOR
                 else:
                     task_info = "Ready"
 
@@ -1770,6 +1784,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif dcs_health == "NEVER_STARTED":
                     status_text = "DCS NOT STARTED"
                     icon = "⏸️"
+                    if active_task == "Idle":
+                        task_info = TASK_AWAITING_OPERATOR
                 elif dcs_crashed:
                     status_text = "DCS DOWN"
                     icon = "🛑"
@@ -1871,6 +1887,7 @@ class PanelActionPickerView(discord.ui.View):
     )
     async def action_select(self, interaction: discord.Interaction, select: discord.ui.Select):
         action = select.values[0]
+        action_label = PANEL_ACTION_LABELS.get(action, action)
         names = ", ".join(n["name"] for n in self.nodes)
 
         if action == "reboot":
@@ -1885,11 +1902,11 @@ class PanelActionPickerView(discord.ui.View):
             return
 
         await interaction.response.edit_message(
-            content=f"Queued **{action}** for **{names}**.",
+            content=f"Queued **{action_label}** for **{names}**.",
             view=None,
         )
         log_msg = await self.channel.send(
-            f"🚨 **[ACTION LOG]** `{action}` for: **{names}**."
+            f"🚨 **[ACTION LOG]** {action_label} for: **{names}**."
         )
         self.bot.dismiss_status_message_later(log_msg)
         for node in self.nodes:
@@ -1912,12 +1929,13 @@ class RebootConfirmView(discord.ui.View):
     @discord.ui.button(label="Confirm reboot", style=discord.ButtonStyle.danger)
     async def btn_confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         names = ", ".join(n["name"] for n in self.nodes)
+        action_label = PANEL_ACTION_LABELS["reboot"]
         await interaction.response.edit_message(
-            content=f"Queued **reboot** for **{names}**.",
+            content=f"Queued **{action_label}** for **{names}**.",
             view=None,
         )
         log_msg = await self.channel.send(
-            f"🚨 **[ACTION LOG]** `reboot` for: **{names}**."
+            f"🚨 **[ACTION LOG]** {action_label} for: **{names}**."
         )
         self.bot.dismiss_status_message_later(log_msg)
         for node in self.nodes:
@@ -2295,8 +2313,8 @@ async def dcs_update_wiki(interaction: discord.Interaction):
     embed.add_field(
         name="Other icons",
         value=(
-            "⏸️ **NOT STARTED** — DCS never started (idle)\n"
-            "⏳ **STARTING** — process up, port not ready yet\n"
+            "⏸️ **NOT STARTED** — DCS never started (idle; Action required — no auto-boot)\n"
+            "⏳ **STARTING** — process up, port not ready yet (Port pending)\n"
             "🔐 **UNAUTHORIZED** — auth token mismatch\n"
             "🔴 **OFFLINE** — node did not answer"
         ),
