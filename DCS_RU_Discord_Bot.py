@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.64"
+CURRENT_BOT_VERSION = "2.1.65"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -239,6 +239,7 @@ class DCSClusterBot(commands.Bot):
         self.panel_channel_id = None
         self.panel_message_id = None
         self.panel_selected_server_names = []
+        self._panel_selection_rev = 0
         self._panel_update_lock = asyncio.Lock()
         self.cached_dcs_version = "Unknown"
         self.last_cache_time = 0
@@ -2023,12 +2024,16 @@ class LiveControlPanelView(discord.ui.View):
                 ordered.append(name)
         self.currently_selected_server_names = ordered
         self.bot.panel_selected_server_names = list(ordered)
+        self.bot._panel_selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0)) + 1
         active = getattr(self.bot, "active_panel_view", None)
         if active is not None and active is not self:
             active.currently_selected_server_names = list(ordered)
 
-    def _apply_deploy_button_state(self, has_actionable):
-        selected_count = len(self._selection_names())
+    def _apply_deploy_button_state(self, has_actionable, visible_selected_count=None):
+        if visible_selected_count is None:
+            selected_count = len(self._selection_names())
+        else:
+            selected_count = int(visible_selected_count)
         if not has_actionable:
             self.btn_deploy_selected.disabled = True
             self.btn_deploy_selected.label = "✅ All clear"
@@ -2036,33 +2041,49 @@ class LiveControlPanelView(discord.ui.View):
             return
         if selected_count:
             self.btn_deploy_selected.disabled = False
-            self.btn_deploy_selected.label = "Select Server Actions"
+            self.btn_deploy_selected.label = f"Select Server Actions ({selected_count})"
             self.btn_deploy_selected.style = discord.ButtonStyle.primary
         else:
             self.btn_deploy_selected.disabled = True
             self.btn_deploy_selected.label = "Select Server Actions"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
-    def _rebuild_select_menu(self, options):
+    def _rebuild_select_menu(self, options, known_server_names=None):
+        """Rebuild dropdown while remembering selection across refreshes.
+
+        Selection is only pruned when a server disappears from the cluster, not when
+        it temporarily leaves the actionable (yellow/red) list.
+        """
+        remembered = self._selection_names()
+        if known_server_names is not None:
+            known = set(known_server_names)
+            remembered = [name for name in remembered if name in known]
+            self._set_selection(remembered)
+        else:
+            remembered = self._selection_names()
+
         if self.select_menu in self.children:
             self.remove_item(self.select_menu)
 
         if not options:
             self.select_menu = None
-            self._set_selection([])
+            # Keep remembered selection for when servers become actionable again.
             self._apply_deploy_button_state(has_actionable=False)
             return
 
         options = options[:DISCORD_SELECT_MAX_OPTIONS]
         valid_values = {opt.value for opt in options}
-        still_selected = [name for name in self._selection_names() if name in valid_values]
-        self._set_selection(still_selected)
-        selected_set = set(still_selected)
+        selected_visible = [name for name in remembered if name in valid_values]
+        selected_set = set(selected_visible)
         for opt in options:
             opt.default = opt.value in selected_set
 
         self.select_menu = discord.ui.Select(
-            placeholder="Select server(s)",
+            placeholder=(
+                f"Select server(s) — {len(selected_visible)} selected"
+                if selected_visible
+                else "Select server(s)"
+            ),
             min_values=0,
             max_values=len(options),
             options=options,
@@ -2071,7 +2092,10 @@ class LiveControlPanelView(discord.ui.View):
         )
         self.select_menu.callback = self.select_menu_callback
         self.add_item(self.select_menu)
-        self._apply_deploy_button_state(has_actionable=True)
+        self._apply_deploy_button_state(
+            has_actionable=True,
+            visible_selected_count=len(selected_visible),
+        )
 
     async def _edit_panel_view_only(self):
         if not (self.bot.panel_channel_id and self.bot.panel_message_id):
@@ -2086,6 +2110,9 @@ class LiveControlPanelView(discord.ui.View):
             logger.error("Failed to update panel selection view: %s", e)
 
     async def generate_embed(self, guild=None):
+        # Snapshot before awaits; only restore if nothing changed the selection mid-flight.
+        selection_rev = int(getattr(self.bot, "_panel_selection_rev", 0))
+        remembered = list(self._selection_names())
         nodes = self.bot.load_cluster_nodes()
         self.all_nodes_cached = nodes
 
@@ -2115,6 +2142,9 @@ class LiveControlPanelView(discord.ui.View):
         snapshots = []
         tasks_list = [self.bot.send_socket_command(n["ip"], n["port"], "PING_STATUS") for n in nodes]
         responses = await asyncio.gather(*tasks_list)
+
+        if int(getattr(self.bot, "_panel_selection_rev", 0)) == selection_rev:
+            self._set_selection(remembered)
 
         for idx, (node, answer) in enumerate(zip(nodes, responses)):
             classified = classify_node_answer(answer, srs_latest_release=srs_latest_release)
@@ -2158,7 +2188,10 @@ class LiveControlPanelView(discord.ui.View):
                 for _ in range(3):
                     embed.add_field(name="\u2001", value="\u2001", inline=True)
 
-        self._rebuild_select_menu(options)
+        self._rebuild_select_menu(
+            options,
+            known_server_names={n["name"] for n in nodes},
+        )
 
         try:
             await self.bot.notify_status_changes(snapshots, guild)
@@ -2182,7 +2215,15 @@ class LiveControlPanelView(discord.ui.View):
                 selected_set = set(selected)
                 for opt in self.select_menu.options:
                     opt.default = opt.value in selected_set
-            self._apply_deploy_button_state(has_actionable=self.select_menu is not None)
+                self.select_menu.placeholder = (
+                    f"Select server(s) — {len(selected)} selected"
+                    if selected
+                    else "Select server(s)"
+                )
+            self._apply_deploy_button_state(
+                has_actionable=self.select_menu is not None,
+                visible_selected_count=len(selected),
+            )
             await self._edit_panel_view_only()
 
         if not selected:
