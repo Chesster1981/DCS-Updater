@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.61"
+CURRENT_BOT_VERSION = "2.1.62"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -64,8 +64,8 @@ Bot version — versjon av denne Discord-boten
 
 **Knapper og meny**
 🔄 **Refresh Server Status** — manuell oppdatering av panelet
-🚀 **Select Servers** — etter valg i dropdown: åpner handlingsmeny (start/restart, update, reboot)
-Dropdown **Select Server Actions** — velg én eller flere gul/røde servere. Valget beholdes ved automatisk refresh (hvert 30 s).
+🚀 **Select Server Actions** — etter valg i dropdown: åpner handlingsmeny (start/restart, update, reboot)
+Dropdown **Select server(s)** — velg én eller flere gul/røde servere. Valget beholdes ved automatisk refresh (hvert 30 s).
 ✅ **All clear** — ingen gul/rød servere akkurat nå
 
 **Deploy-logikk**
@@ -1969,11 +1969,11 @@ class LiveControlPanelView(discord.ui.View):
             return
         if selected_count:
             self.btn_deploy_selected.disabled = False
-            self.btn_deploy_selected.label = "Select Servers"
+            self.btn_deploy_selected.label = "Select Server Actions"
             self.btn_deploy_selected.style = discord.ButtonStyle.primary
         else:
             self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "Select Servers"
+            self.btn_deploy_selected.label = "Select Server Actions"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
     def _rebuild_select_menu(self, options):
@@ -1995,7 +1995,7 @@ class LiveControlPanelView(discord.ui.View):
             opt.default = opt.value in selected_set
 
         self.select_menu = discord.ui.Select(
-            placeholder="Select Server Actions",
+            placeholder="Select server(s)",
             min_values=0,
             max_values=len(options),
             options=options,
@@ -2150,7 +2150,7 @@ class LiveControlPanelView(discord.ui.View):
             await self.bot.restore_or_recreate_panel()
 
     @discord.ui.button(
-        label="Select Servers",
+        label="Select Server Actions",
         style=discord.ButtonStyle.secondary,
         row=0,
         disabled=True,
@@ -2253,7 +2253,7 @@ async def dcs_update_wiki(interaction: discord.Interaction):
     embed.add_field(
         name="Panel actions (yellow/red)",
         value=(
-            "Use **Select Server Actions**, then **Select Servers**:\n"
+            "Use **Select server(s)**, then **Select Server Actions**:\n"
             "• **Start/Restart DCS** / **Start/Restart SRS**\n"
             "• **Update DCS** / **Update SRS**\n"
             "• **Reboot Server** (confirmation required)"
