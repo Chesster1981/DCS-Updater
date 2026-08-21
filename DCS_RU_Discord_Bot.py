@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.73"
+CURRENT_BOT_VERSION = "2.1.74"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -82,8 +82,8 @@ Sendes ved **OFFLINE** og **DCS DOWN** (krasj) — ikke når SRS er nede eller e
 Flyt: 5 min grace → automatisk DCS-restart via node → 10 min venting → DM til kanalmedlemmer hvis server fortsatt ikke er online.
 
 **Slash-kommandoer**
-`/dcs-update-wiki` — midlertidig forklaring av statuslogikk (fjernes når du bytter kanal, lukker Discord, eller trykker Lukk).
-`/dcs-panel-init` · `/dcs-panel-guide` · `/check-bot-update`
+`/dcs-panel-wiki` — midlertidig forklaring av statuslogikk (fjernes når du bytter kanal, lukker Discord, eller trykker Lukk).
+`/dcs-panel-init` · `/dcs-panel-update`
 
 **Andre symboler**
 🛸 Panel-tittel · ⏳ / 🎉 / ❌ Meldinger under deploy-kø"""
@@ -1639,7 +1639,7 @@ class DCSClusterBot(commands.Bot):
         if not session:
             return
         command_name = getattr(getattr(interaction, "command", None), "name", None)
-        if command_name == "dcs-update-wiki":
+        if command_name == "dcs-panel-wiki":
             return
         if interaction.channel.id != session.get("channel_id"):
             await self.dismiss_wiki_for_user(interaction.user.id, "other_channel")
@@ -2485,11 +2485,11 @@ class LiveControlPanelView(discord.ui.View):
 
 
 @bot.tree.command(
-    name="dcs-update-wiki",
+    name="dcs-panel-wiki",
     description="Show status icon explanations and traffic-light logic (auto-dismisses).",
 )
 @has_dcs_management_permission()
-async def dcs_update_wiki(interaction: discord.Interaction):
+async def dcs_panel_wiki(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await bot.dismiss_wiki_for_user(interaction.user.id, "replaced")
 
@@ -2564,26 +2564,6 @@ async def dcs_update_wiki(interaction: discord.Interaction):
     bot.track_wiki_session(interaction.user.id, interaction.channel_id, message)
 
 
-@bot.tree.command(
-    name="dcs-panel-guide",
-    description="Oppdater festet hjelpetekst for oppdateringspanelet.",
-)
-@has_dcs_management_permission()
-async def dcs_panel_guide(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    message = await bot.ensure_panel_channel_guide(interaction.channel)
-    if message:
-        await interaction.followup.send(
-            "✅ Hjelpetekst oppdatert og festet i kanalen.",
-            ephemeral=True,
-        )
-    else:
-        await interaction.followup.send(
-            "❌ Kunne ikke oppdatere hjelpeteksten. Sjekk bot-loggen.",
-            ephemeral=True,
-        )
-
-
 @bot.tree.command(name="dcs-panel-init", description="Pins the permanent live dashboard into this channel.")
 @has_dcs_management_permission()
 async def dcs_panel_init(interaction: discord.Interaction):
@@ -2606,11 +2586,11 @@ async def dcs_panel_init(interaction: discord.Interaction):
 
 
 @bot.tree.command(
-    name="check-bot-update",
+    name="dcs-panel-update",
     description="Force an immediate GitHub check and install a newer Discord Bot if available.",
 )
 @has_dcs_management_permission()
-async def check_bot_update(interaction: discord.Interaction):
+async def dcs_panel_update(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     result = await bot.check_github_self_update(apply=False) or {
         "ok": False,
