@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.56"
+CURRENT_BOT_VERSION = "2.1.57"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -71,11 +71,16 @@ Dropdown — velg én eller flere servere som trenger oppdatering. Valget behold
 • Kun DCS utdatert → kun DCS-oppdatering.
 • Begge utdatert → DCS først, deretter SRS.
 • Idle server (DCS ikke startet) kan fortsatt få SRS-oppdatering.
-• SRS DOWN alene (uten versjonsmismatch) er ikke en deploy-kø — bare varsel.
+• SRS DOWN alene (uten versjonsmismatch) kan restartes via panelet (Restart SRS).
+• Gul/rød status aktiverer handlingsknappen: Update, Restart DCS, Restart SRS eller Reboot.
 
 **DM-varsler (oppmerksomhets-runde)**
 Sendes ved **OFFLINE** og **DCS DOWN** (krasj) — ikke når SRS er nede eller en ny DCS-/SRS-release blir tilgjengelig.
 Flyt: 5 min grace → automatisk DCS-restart via node → 10 min venting → DM til kanalmedlemmer hvis server fortsatt ikke er online.
+
+**Slash-kommandoer**
+`/dcs-update-wiki` — midlertidig forklaring av statuslogikk (fjernes når du bytter kanal, lukker Discord, eller trykker Lukk).
+`/dcs-panel-init` · `/dcs-panel-guide` · `/check-bot-update`
 
 **Andre symboler**
 🛸 Panel-tittel · ⏳ / 🎉 / ❌ Meldinger under deploy-kø"""
@@ -92,6 +97,7 @@ ATTENTION_QUESTION = "Are you available to attend the issue ? Please reply (Yes/
 ATTENTION_YES_REPLIES = {"ja", "yes"}
 ATTENTION_NO_REPLIES = {"no", "nei"}
 STATUS_MESSAGE_DISMISS_SECONDS = 10
+WIKI_AUTO_DISMISS_SECONDS = 900
 BOT_PID_FILE = "dcs_ru_discord_bot.pid"
 DISCORD_SELECT_MAX_OPTIONS = 25
 STATUS_UP_TO_DATE = "UP TO DATE"
@@ -237,6 +243,7 @@ class DCSClusterBot(commands.Bot):
         self._attention_stop = asyncio.Event()
         self._attention_contacted = []
         self._attention_server_names = []
+        self._wiki_sessions = {}
 
     def dismiss_status_message_later(self, message):
         """Delete a transient Discord status message after a short delay."""
@@ -1071,6 +1078,10 @@ class DCSClusterBot(commands.Bot):
         await self.process_commands(message)
         if message.author.bot:
             return
+        session = self._wiki_sessions.get(message.author.id)
+        if session and message.guild is not None:
+            if message.channel.id != session.get("channel_id"):
+                await self.dismiss_wiki_for_user(message.author.id, "other_channel")
         if message.guild is not None:
             return
         wait = self._attention_wait
@@ -1357,32 +1368,82 @@ class DCSClusterBot(commands.Bot):
         node = task_data["node"]
         channel = task_data["channel"]
         name = node["name"]
+        action = str(task_data.get("action") or "update").strip().lower()
         srs_latest = await self.fetch_latest_srs_release_cached()
 
-        status_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` to check update requirements...")
+        status_msg = await channel.send(
+            f"⏳ **[QUEUE]** Connecting to `{name}` for **{action}**..."
+        )
         status_messages = [status_msg]
         try:
-            ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
-            classified = classify_node_answer(ping, srs_latest_release=srs_latest)
-            needs_dcs = classified.get("needs_dcs_update", False)
-            needs_srs = classified.get("needs_srs_update", False)
+            if action == "update":
+                ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
+                classified = classify_node_answer(ping, srs_latest_release=srs_latest)
+                needs_dcs = classified.get("needs_dcs_update", False)
+                needs_srs = classified.get("needs_srs_update", False)
 
-            if not needs_dcs and not needs_srs:
-                await status_msg.edit(content=f"✅ **[{name}]** Already up to date — nothing to deploy.")
-                return
+                if not needs_dcs and not needs_srs:
+                    await status_msg.edit(
+                        content=f"✅ **[{name}]** Already up to date — nothing to deploy."
+                    )
+                    return
 
-            if needs_dcs:
-                await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
-                await self._run_dcs_update(node, channel, status_msg, name)
-
-            if needs_srs:
                 if needs_dcs:
-                    srs_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
-                    status_messages.append(srs_msg)
-                    await self._run_srs_update(node, channel, srs_msg, name)
+                    await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
+                    await self._run_dcs_update(node, channel, status_msg, name)
+
+                if needs_srs:
+                    if needs_dcs:
+                        srs_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                        status_messages.append(srs_msg)
+                        await self._run_srs_update(node, channel, srs_msg, name)
+                    else:
+                        await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                        await self._run_srs_update(node, channel, status_msg, name)
+
+            elif action == "restart_dcs":
+                await self._run_operator_command(
+                    node,
+                    status_msg,
+                    name,
+                    "OPERATOR_RESTART_DCS",
+                    success_text=f"🎉 **[{name}]** DCS restart completed.",
+                    timeout_seconds=600,
+                    done_tasks=("Idle",),
+                )
+
+            elif action == "restart_srs":
+                await self._run_operator_command(
+                    node,
+                    status_msg,
+                    name,
+                    "RESTART_SRS",
+                    success_text=f"🎉 **[{name}]** SRS restart completed.",
+                    timeout_seconds=300,
+                    done_tasks=("Idle",),
+                )
+
+            elif action == "reboot":
+                ans = await self.send_socket_command(node["ip"], node["port"], "REBOOT_WINDOWS")
+                if not ans:
+                    await status_msg.edit(content=f"❌ **[{name}]** Connection timeout.")
+                elif "UNKNOWN_COMMAND" in str(ans):
+                    await status_msg.edit(content=f"❌ **[{name}]** Node is too old for REBOOT_WINDOWS.")
                 else:
-                    await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
-                    await self._run_srs_update(node, channel, status_msg, name)
+                    try:
+                        res = json.loads(ans)
+                        if res.get("status") == "OK_STARTING":
+                            await status_msg.edit(
+                                content=f"🔁 **[{name}]** Windows reboot scheduled."
+                            )
+                        else:
+                            await status_msg.edit(
+                                content=f"❌ **[{name}]** Reboot rejected: `{res.get('status')}`."
+                            )
+                    except Exception:
+                        await status_msg.edit(content=f"❌ **[{name}]** Unexpected reboot reply.")
+            else:
+                await status_msg.edit(content=f"❌ **[{name}]** Unknown action `{action}`.")
 
             if self.active_panel_view:
                 try:
@@ -1392,6 +1453,113 @@ class DCSClusterBot(commands.Bot):
         finally:
             for msg in status_messages:
                 self.dismiss_status_message_later(msg)
+
+    async def _run_operator_command(
+        self,
+        node,
+        status_msg,
+        name,
+        command,
+        *,
+        success_text,
+        timeout_seconds,
+        done_tasks,
+    ):
+        ans = await self.send_socket_command(node["ip"], node["port"], command)
+        if not ans:
+            await status_msg.edit(content=f"❌ **[{name}]** Connection timeout.")
+            return False
+        if "UNKNOWN_COMMAND" in str(ans):
+            await status_msg.edit(content=f"❌ **[{name}]** Node is too old for `{command}`.")
+            return False
+        try:
+            res = json.loads(ans)
+            if res.get("status") == "UNAUTHORIZED":
+                await status_msg.edit(content=f"🔐 **[{name}]** Unauthorized.")
+                return False
+            if res.get("status") == "REJECTED_BUSY":
+                await status_msg.edit(
+                    content=f"⚠️ **[{name}]** Busy: `{res.get('task')}`."
+                )
+                return False
+            if res.get("status") == "ERROR":
+                await status_msg.edit(
+                    content=f"❌ **[{name}]** {res.get('message') or 'Command failed.'}"
+                )
+                return False
+            if res.get("status") != "OK_STARTING":
+                await status_msg.edit(
+                    content=f"❌ **[{name}]** Rejected: `{res.get('status')}`."
+                )
+                return False
+        except Exception:
+            await status_msg.edit(content=f"❌ **[{name}]** Could not parse reply.")
+            return False
+
+        await status_msg.edit(content=f"⏳ **[{name}]** `{command}` started...")
+        return await self._monitor_node_task_until_idle(
+            node,
+            status_msg,
+            name,
+            success_text=success_text,
+            timeout_seconds=timeout_seconds,
+            done_tasks=done_tasks,
+        )
+
+    async def dismiss_wiki_for_user(self, user_id, reason=""):
+        session = self._wiki_sessions.pop(user_id, None)
+        if not session:
+            return
+        message = session.get("message")
+        if message is None:
+            return
+        try:
+            await message.delete()
+            if reason:
+                logger.info("Dismissed wiki for user %s (%s)", user_id, reason)
+        except Exception:
+            pass
+
+    def track_wiki_session(self, user_id, channel_id, message):
+        previous = self._wiki_sessions.get(user_id)
+        self._wiki_sessions[user_id] = {
+            "channel_id": channel_id,
+            "message": message,
+            "created_at": time.monotonic(),
+        }
+        if previous and previous.get("message") is not None:
+            async def _delete_old():
+                try:
+                    await previous["message"].delete()
+                except Exception:
+                    pass
+            asyncio.create_task(_delete_old())
+
+        async def _timeout():
+            await asyncio.sleep(WIKI_AUTO_DISMISS_SECONDS)
+            session = self._wiki_sessions.get(user_id)
+            if session and session.get("message") is message:
+                await self.dismiss_wiki_for_user(user_id, "timeout")
+
+        asyncio.create_task(_timeout())
+
+    async def on_presence_update(self, before, after):
+        if after.bot:
+            return
+        if after.status in (discord.Status.offline, discord.Status.invisible):
+            await self.dismiss_wiki_for_user(after.id, "discord_closed_or_offline")
+
+    async def on_interaction(self, interaction: discord.Interaction):
+        if interaction.user is None or interaction.channel is None:
+            return
+        session = self._wiki_sessions.get(interaction.user.id)
+        if not session:
+            return
+        command_name = getattr(getattr(interaction, "command", None), "name", None)
+        if command_name == "dcs-update-wiki":
+            return
+        if interaction.channel.id != session.get("channel_id"):
+            await self.dismiss_wiki_for_user(interaction.user.id, "other_channel")
 
     @tasks.loop(seconds=30)
     async def persistent_panel_refresh_loop(self):
@@ -1450,7 +1618,6 @@ PANEL_TASK_SHORT = {
     "Port not responding": "Port down",
     "Server stopped/crashed": "Crashed",
     "DCS_server stopped": "Stopped",
-    "SRS not running": "SRS stopped",
 }
 
 
@@ -1496,8 +1663,10 @@ def classify_node_answer(answer, srs_latest_release=None):
     srs_info = "—"
     task_info = "Ready"
     is_outdated = False
+    needs_action = False
     needs_dcs_update = False
     needs_srs_update = False
+    srs_down = False
     icon = "🟢"
     dcs_health = ""
     dcs_running = None
@@ -1535,18 +1704,19 @@ def classify_node_answer(answer, srs_latest_release=None):
                 is_outdated = needs_dcs_update or needs_srs_update
                 srs_down = srs_configured and srs_running is False
                 dcs_crashed = dcs_health in HEALTH_CRASHED
+                needs_action = is_outdated or srs_down or dcs_crashed
                 ver_info = f"{installed_ver}"
 
                 if active_task == "Restarting DCS":
                     task_info = "Restarting..."
+                elif active_task == "Restarting SRS":
+                    task_info = "Restarting SRS"
                 elif active_task != "Idle":
                     task_info = active_task
                 elif dcs_health == "NEVER_STARTED":
                     task_info = "Awaiting server boot"
                 elif dcs_health == "STARTING":
                     task_info = "Awaiting DCS port"
-                elif srs_down:
-                    task_info = "SRS not running"
                 else:
                     task_info = "Ready"
 
@@ -1560,7 +1730,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif srs_down:
                     status_text = STATUS_SRS_DOWN
                     icon = "⚠️"
-                    task_info = "SRS not running" if active_task == "Idle" else task_info
+                    if active_task == "Idle":
+                        task_info = "Ready"
                 elif dcs_health == "STARTING":
                     status_text = "DCS STARTING"
                     icon = "⏳"
@@ -1594,8 +1765,10 @@ def classify_node_answer(answer, srs_latest_release=None):
         "srs_info": srs_info,
         "task_info": task_info,
         "is_outdated": is_outdated,
+        "needs_action": needs_action,
         "needs_dcs_update": needs_dcs_update,
         "needs_srs_update": needs_srs_update,
+        "srs_down": srs_down,
         "icon": icon,
         "dcs_health": dcs_health,
         "dcs_running": dcs_running,
@@ -1604,6 +1777,124 @@ def classify_node_answer(answer, srs_latest_release=None):
 
 
 # ==================== INTERACTIVE MULTI-SELECT PANEL ENGINE ====================
+
+
+class WikiDismissView(discord.ui.View):
+    def __init__(self, bot_instance, user_id):
+        super().__init__(timeout=WIKI_AUTO_DISMISS_SECONDS)
+        self.bot = bot_instance
+        self.user_id = user_id
+
+    @discord.ui.button(label="Lukk", style=discord.ButtonStyle.secondary)
+    async def btn_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This wiki belongs to another user.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self.bot.dismiss_wiki_for_user(self.user_id, "closed")
+        self.stop()
+
+
+class PanelActionPickerView(discord.ui.View):
+    def __init__(self, bot_instance, nodes, channel):
+        super().__init__(timeout=120)
+        self.bot = bot_instance
+        self.nodes = nodes
+        self.channel = channel
+
+    @discord.ui.select(
+        placeholder="Choose action…",
+        options=[
+            discord.SelectOption(
+                label="Update (DCS and/or SRS)",
+                value="update",
+                description="Install available DCS/SRS updates only",
+                emoji="🚀",
+            ),
+            discord.SelectOption(
+                label="Restart DCS",
+                value="restart_dcs",
+                description="Restart DCS_server.exe on selected nodes",
+                emoji="🔄",
+            ),
+            discord.SelectOption(
+                label="Restart SRS",
+                value="restart_srs",
+                description="Restart SR-Server.exe on selected nodes",
+                emoji="📻",
+            ),
+            discord.SelectOption(
+                label="Reboot Windows",
+                value="reboot",
+                description="Reboot the Windows host (10s delay)",
+                emoji="🔁",
+            ),
+        ],
+    )
+    async def action_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        action = select.values[0]
+        names = ", ".join(n["name"] for n in self.nodes)
+
+        if action == "reboot":
+            confirm = RebootConfirmView(self.bot, self.nodes, self.channel)
+            await interaction.response.edit_message(
+                content=(
+                    f"⚠️ Confirm **Windows reboot** for **{names}**?\n"
+                    "This will reboot the host OS in ~10 seconds."
+                ),
+                view=confirm,
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=f"Queued **{action}** for **{names}**.",
+            view=None,
+        )
+        log_msg = await self.channel.send(
+            f"🚨 **[ACTION LOG]** `{action}` for: **{names}**."
+        )
+        self.bot.dismiss_status_message_later(log_msg)
+        for node in self.nodes:
+            await self.bot.deployment_queue.put(
+                {"node": node, "channel": self.channel, "action": action}
+            )
+        if self.bot.active_panel_view:
+            self.bot.active_panel_view._set_selection([])
+            await self.bot.active_panel_view.refresh_panel()
+        self.stop()
+
+
+class RebootConfirmView(discord.ui.View):
+    def __init__(self, bot_instance, nodes, channel):
+        super().__init__(timeout=60)
+        self.bot = bot_instance
+        self.nodes = nodes
+        self.channel = channel
+
+    @discord.ui.button(label="Confirm reboot", style=discord.ButtonStyle.danger)
+    async def btn_confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        names = ", ".join(n["name"] for n in self.nodes)
+        await interaction.response.edit_message(
+            content=f"Queued **reboot** for **{names}**.",
+            view=None,
+        )
+        log_msg = await self.channel.send(
+            f"🚨 **[ACTION LOG]** `reboot` for: **{names}**."
+        )
+        self.bot.dismiss_status_message_later(log_msg)
+        for node in self.nodes:
+            await self.bot.deployment_queue.put(
+                {"node": node, "channel": self.channel, "action": "reboot"}
+            )
+        if self.bot.active_panel_view:
+            self.bot.active_panel_view._set_selection([])
+            await self.bot.active_panel_view.refresh_panel()
+        self.stop()
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def btn_cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Reboot cancelled.", view=None)
+        self.stop()
 
 
 class LiveControlPanelView(discord.ui.View):
@@ -1632,20 +1923,20 @@ class LiveControlPanelView(discord.ui.View):
         self.currently_selected_server_names = ordered
         self.bot.panel_selected_server_names = list(ordered)
 
-    def _apply_deploy_button_state(self, has_outdated):
+    def _apply_deploy_button_state(self, has_actionable):
         selected_count = len(self._selection_names())
-        if not has_outdated:
+        if not has_actionable:
             self.btn_deploy_selected.disabled = True
             self.btn_deploy_selected.label = "✅ All Servers Up To Date"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
             return
         if selected_count:
             self.btn_deploy_selected.disabled = False
-            self.btn_deploy_selected.label = f"🚀 Execute {selected_count} Selected Update(s)"
+            self.btn_deploy_selected.label = f"🚀 Execute {selected_count} Selected Action(s)"
             self.btn_deploy_selected.style = discord.ButtonStyle.danger
         else:
             self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "🚀 Execute Selected Updates"
+            self.btn_deploy_selected.label = "🚀 Execute Selected Actions"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
 
     def _rebuild_select_menu(self, options):
@@ -1655,7 +1946,7 @@ class LiveControlPanelView(discord.ui.View):
         if not options:
             self.select_menu = None
             self._set_selection([])
-            self._apply_deploy_button_state(has_outdated=False)
+            self._apply_deploy_button_state(has_actionable=False)
             return
 
         options = options[:DISCORD_SELECT_MAX_OPTIONS]
@@ -1667,7 +1958,7 @@ class LiveControlPanelView(discord.ui.View):
             opt.default = opt.value in selected_set
 
         self.select_menu = discord.ui.Select(
-            placeholder="Check one or multiple servers to queue for update...",
+            placeholder="Select yellow/red servers for update, restart or reboot...",
             min_values=0,
             max_values=len(options),
             options=options,
@@ -1676,7 +1967,7 @@ class LiveControlPanelView(discord.ui.View):
         )
         self.select_menu.callback = self.select_menu_callback
         self.add_item(self.select_menu)
-        self._apply_deploy_button_state(has_outdated=True)
+        self._apply_deploy_button_state(has_actionable=True)
 
     async def _edit_panel_view_only(self):
         if not (self.bot.panel_channel_id and self.bot.panel_message_id):
@@ -1726,7 +2017,7 @@ class LiveControlPanelView(discord.ui.View):
             status_text = classified["status_text"]
             ver_info = classified["ver_info"]
             task_info = classified["task_info"]
-            is_outdated = classified["is_outdated"]
+            needs_action = classified.get("needs_action", classified["is_outdated"])
             icon = classified["icon"]
             snapshots.append(
                 {
@@ -1738,13 +2029,13 @@ class LiveControlPanelView(discord.ui.View):
                 }
             )
 
-            if is_outdated:
+            if needs_action:
                 options.append(
                     discord.SelectOption(
                         label=node["name"],
-                        description=f"Port {node['port']} | Select for deployment queue",
+                        description=f"{status_text} | Port {node['port']}",
                         value=node["name"],
-                        emoji="⚠️",
+                        emoji=icon if icon in {"⚠️", "🛑"} else "⚠️",
                     )
                 )
 
@@ -1791,7 +2082,7 @@ class LiveControlPanelView(discord.ui.View):
             selected_set = set(selected)
             for opt in self.select_menu.options:
                 opt.default = opt.value in selected_set
-        self._apply_deploy_button_state(has_outdated=self.select_menu is not None)
+        self._apply_deploy_button_state(has_actionable=self.select_menu is not None)
         await self._edit_panel_view_only()
 
     async def refresh_panel(self):
@@ -1822,40 +2113,120 @@ class LiveControlPanelView(discord.ui.View):
             await self.bot.restore_or_recreate_panel()
 
     @discord.ui.button(
-        label="🚀 Execute Selected Updates",
+        label="🚀 Execute Selected Actions",
         style=discord.ButtonStyle.secondary,
         row=0,
         disabled=True,
         custom_id="dcs_panel:deploy",
     )
     async def btn_deploy_selected(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-
         selected = self._selection_names()
         if not selected:
-            warn = await interaction.followup.send(
+            await interaction.response.send_message(
                 "⚠️ You must select at least one server from the menu dropdown!",
                 ephemeral=True,
             )
-            self.bot.dismiss_status_message_later(warn)
+            try:
+                self.bot.dismiss_status_message_later(await interaction.original_response())
+            except Exception:
+                pass
             return
 
-        log_msg = await interaction.channel.send(
-            f"🚨 **[DEPLOYMENT LOG]** Initiating sequential cluster updates for: "
-            f"**{', '.join(selected)}**."
-        )
-        self.bot.dismiss_status_message_later(log_msg)
-
+        matched = []
         for server_name in selected:
-            matched_node = next((n for n in self.all_nodes_cached if n["name"] == server_name), None)
-            if matched_node:
-                await self.bot.deployment_queue.put({"node": matched_node, "channel": interaction.channel})
+            node = next((n for n in self.all_nodes_cached if n["name"] == server_name), None)
+            if node:
+                matched.append(node)
+        if not matched:
+            await interaction.response.send_message(
+                "⚠️ No matching servers found for the current selection.",
+                ephemeral=True,
+            )
+            return
 
-        self._set_selection([])
-        await self.refresh_panel()
+        view = PanelActionPickerView(self.bot, matched, interaction.channel)
+        await interaction.response.send_message(
+            f"Choose an action for **{', '.join(n['name'] for n in matched)}**:",
+            view=view,
+            ephemeral=True,
+        )
 
 
 # ==================== INITIALIZATION COMMAND ====================
+
+
+@bot.tree.command(
+    name="dcs-update-wiki",
+    description="Show status icon explanations and traffic-light logic (auto-dismisses).",
+)
+@has_dcs_management_permission()
+async def dcs_update_wiki(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await bot.dismiss_wiki_for_user(interaction.user.id, "replaced")
+
+    embed = discord.Embed(
+        title="DCS Norway — status wiki",
+        description=(
+            "Traffic-light logic for the live panel.\n"
+            "This message is removed when you switch channel, go offline, press **Lukk**, "
+            "or after 15 minutes."
+        ),
+        color=discord.Color.from_rgb(26, 132, 255),
+    )
+    embed.add_field(
+        name="🟢 Green",
+        value="**UP TO DATE** — node answers, no pending DCS/SRS update, SRS running when configured.",
+        inline=False,
+    )
+    embed.add_field(
+        name="⚠️ Yellow",
+        value=(
+            "**UPDATE READY** — DCS behind ED release\n"
+            "**SRS OUTDATED** — SRS behind GitHub release\n"
+            "**SRS DOWN** — SRS configured but SR-Server.exe is not running"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="🛑 Red",
+        value="**DCS DOWN** — only when DCS health is UNHEALTHY/DEAD (has run, then crashed/stopped).",
+        inline=False,
+    )
+    embed.add_field(
+        name="Other icons",
+        value=(
+            "⏸️ **NOT STARTED** — DCS never started (idle)\n"
+            "⏳ **STARTING** — process up, port not ready yet\n"
+            "🔐 **UNAUTHORIZED** — auth token mismatch\n"
+            "🔴 **OFFLINE** — node did not answer"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Priority",
+        value="Updates → SRS DOWN → STARTING → NOT STARTED → DCS crash → UP TO DATE",
+        inline=False,
+    )
+    embed.add_field(
+        name="Panel actions (yellow/red)",
+        value=(
+            "Select affected servers, then **Execute Selected Actions**:\n"
+            "• **Update** — DCS and/or SRS install\n"
+            "• **Restart DCS** / **Restart SRS**\n"
+            "• **Reboot Windows** (confirmation required)"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Status box",
+        value="ℹ️ status · ⚙️ DCS version · 📻 SRS version · 🖥️ task detail",
+        inline=False,
+    )
+    embed.set_footer(text=f"Bot v{CURRENT_BOT_VERSION}")
+
+    view = WikiDismissView(bot, interaction.user.id)
+    message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
+    bot.track_wiki_session(interaction.user.id, interaction.channel_id, message)
 
 
 @bot.tree.command(

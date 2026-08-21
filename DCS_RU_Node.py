@@ -64,7 +64,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.56"
+CURRENT_NODE_VERSION = "2.1.57"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -1192,6 +1192,55 @@ def start_srs_server_process(server_dir: str) -> bool:
         return False
 
 
+def execute_srs_restart(source="remote") -> bool:
+    """Stop SRS Server if running, then start it again."""
+    config = load_node_settings()
+    install_root = str(config.get("srs_install_folder") or "").strip()
+    dest = srs_server_dir(install_root)
+    tag = "REMOTE" if source == "remote" else "LOCAL"
+    if not dest:
+        append_activity_log(f"[{tag}] SRS restart failed — install folder is not set.")
+        return False
+    node_state["active_task"] = "Restarting SRS"
+    try:
+        if is_srs_process_running():
+            force_kill_srs()
+        started = start_srs_server_process(dest)
+        if started:
+            append_activity_log(f"[{tag}] SRS Server restart completed ✅")
+        else:
+            append_activity_log(f"[{tag}] SRS Server restart failed.")
+        return started
+    except Exception as e:
+        append_activity_log(f"[{tag}] SRS restart failed: {e}")
+        logging.error("SRS restart failed (%s): %s", source, e)
+        return False
+    finally:
+        node_state["active_task"] = "Idle"
+
+
+def execute_windows_reboot(source="remote", delay_seconds: int = 10) -> bool:
+    """Schedule a Windows reboot (operator-initiated)."""
+    tag = "REMOTE" if source == "remote" else "LOCAL"
+    delay = max(5, int(delay_seconds))
+    node_state["active_task"] = "Rebooting"
+    try:
+        append_activity_log(
+            f"[{tag}] Windows reboot requested — shutting down in {delay} seconds..."
+        )
+        subprocess.run(
+            f"shutdown /r /t {delay} /c \"DCS Norway Remote Updater reboot\"",
+            shell=True,
+            **_hidden_subprocess_kwargs(capture_output=False),
+        )
+        return True
+    except Exception as e:
+        append_activity_log(f"[{tag}] Windows reboot failed: {e}")
+        logging.error("Windows reboot failed (%s): %s", source, e)
+        node_state["active_task"] = "Idle"
+        return False
+
+
 def _zip_server_prefix(zf: zipfile.ZipFile) -> str:
     exe_prefixes = []
     server_prefixes = []
@@ -1594,6 +1643,70 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                                 "node_port": load_node_settings().get("network_port", "1015"),
                                 "source": "remote",
                             },
+                            daemon=True,
+                        ).start()
+                elif command == "OPERATOR_RESTART_DCS":
+                    if is_swapping or node_state["active_task"] != "Idle":
+                        response = {
+                            "status": "REJECTED_BUSY",
+                            "task": node_state["active_task"],
+                        }
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                    else:
+                        node_state["active_task"] = "Restarting DCS"
+                        response = {"status": "OK_STARTING"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log("[REMOTE] Operator requested DCS restart.")
+                        threading.Thread(
+                            target=execute_dcs_restart,
+                            kwargs={
+                                "node_port": load_node_settings().get("network_port", "1015"),
+                                "source": "remote",
+                            },
+                            daemon=True,
+                        ).start()
+                elif command == "RESTART_SRS":
+                    if is_swapping or node_state["active_task"] != "Idle":
+                        response = {
+                            "status": "REJECTED_BUSY",
+                            "task": node_state["active_task"],
+                        }
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                    elif not str(load_node_settings().get("srs_install_folder") or "").strip():
+                        conn.send((json.dumps({
+                            "status": "ERROR",
+                            "message": "SRS install folder is not set on this Node.",
+                        }) + "\n").encode("utf-8"))
+                        conn.close()
+                    else:
+                        response = {"status": "OK_STARTING"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log("[REMOTE] Operator requested SRS restart.")
+                        threading.Thread(
+                            target=execute_srs_restart,
+                            kwargs={"source": "remote"},
+                            daemon=True,
+                        ).start()
+                elif command == "REBOOT_WINDOWS":
+                    if is_swapping or node_state["active_task"] != "Idle":
+                        response = {
+                            "status": "REJECTED_BUSY",
+                            "task": node_state["active_task"],
+                        }
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                    else:
+                        response = {"status": "OK_STARTING"}
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log("[REMOTE] Operator requested Windows reboot.")
+                        threading.Thread(
+                            target=execute_windows_reboot,
+                            kwargs={"source": "remote", "delay_seconds": 10},
                             daemon=True,
                         ).start()
                 elif command == "EXIT_NODE":

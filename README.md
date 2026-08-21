@@ -86,7 +86,7 @@ $env:DISCORD_BOT_TOKEN = "..."
 python DCS_RU_Discord_Bot.py
 ```
 
-In Discord: `/dcs-panel-init` pins the live panel. On every bot restart the panel and pinned legend are refreshed automatically. `/dcs-panel-guide` can refresh the pinned legend without recreating the panel. The channel description/topic is now managed manually; keep the reference text in this README and update it in Discord when needed. Channel/message IDs are stored in `master_config.json`.
+In Discord: `/dcs-panel-init` pins the live panel. On every bot restart the panel and pinned legend are refreshed automatically. `/dcs-panel-guide` refreshes the pinned legend. `/dcs-update-wiki` shows an ephemeral status-logic wiki that auto-dismisses when you switch channel, go offline, press Lukk, or after 15 minutes. Yellow/red servers can be selected for Update, Restart DCS, Restart SRS, or Reboot. Channel/message IDs are stored in `master_config.json`.
 
 ## TCP protocol
 
