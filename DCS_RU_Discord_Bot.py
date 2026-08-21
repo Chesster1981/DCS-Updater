@@ -27,7 +27,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.65"
+CURRENT_BOT_VERSION = "2.1.66"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -604,6 +604,7 @@ class DCSClusterBot(commands.Bot):
                             self.panel_message_id,
                         )
                         await self.ensure_panel_channel_guide(channel)
+                        await self.purge_old_bot_messages(channel)
                         return
 
                     raise RuntimeError("no panel_message_id saved")
@@ -637,17 +638,28 @@ class DCSClusterBot(commands.Bot):
             self._restoring_panel = False
 
     async def purge_old_bot_messages(self, channel):
+        """Remove leftover bot chatter; keep the live panel and pinned guide."""
+        keep_ids = set()
+        if self.panel_message_id:
+            try:
+                keep_ids.add(int(self.panel_message_id))
+            except (TypeError, ValueError):
+                pass
         try:
-            async for message in channel.history(limit=50):
-                if message.author.id == self.user.id:
-                    if PANEL_CHANNEL_GUIDE_MARKER in (message.content or ""):
-                        continue
-                    if message.embeds or message.components:
-                        try:
-                            await message.delete()
-                            await asyncio.sleep(0.2)
-                        except Exception:
-                            pass
+            async for message in channel.history(limit=80):
+                if message.author.id != self.user.id:
+                    continue
+                if message.id in keep_ids:
+                    continue
+                content = message.content or ""
+                if PANEL_CHANNEL_GUIDE_MARKER in content:
+                    continue
+                # Delete embeds/components and plain status text (update/restart notices, logs).
+                try:
+                    await message.delete()
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error("Error purging historic channel messages: %s", e)
 
@@ -2445,10 +2457,16 @@ async def check_bot_update(interaction: discord.Interaction):
     }
     prefix = "✅" if result.get("ok") else "❌"
     status = await interaction.followup.send(f"{prefix} {result.get('message')}", ephemeral=True)
-    bot.dismiss_status_message_later(status)
     downloads = result.get("downloads")
     if result.get("ok") and result.get("updated") and downloads:
+        # Delete before exit — delayed dismiss never runs after os._exit / NSSM restart.
+        try:
+            await status.delete()
+        except Exception:
+            pass
         await bot._apply_self_update(downloads)
+        return
+    bot.dismiss_status_message_later(status)
 
 
 if __name__ == "__main__":
