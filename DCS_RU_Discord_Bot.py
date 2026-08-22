@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.75"
+CURRENT_BOT_VERSION = "2.1.76"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -67,7 +67,7 @@ Bot version — version of this Discord bot
 🔄 **Refresh Server Status** — manually refresh the panel
 🚀 **Select Actions** — after choosing from the dropdown: opens the action menu (start/restart, update, reboot)
 Dropdown **Select server(s)** — pick one or more yellow/red servers. Selection is kept across automatic refresh (every 30 s).
-✅ **All clear** — no yellow/red servers right now
+✅ **All servers operational** — no yellow/red servers right now
 
 **Deploy logic**
 • Only SRS outdated → SRS update only (`TRIGGER_SRS_UPDATE`), DCS is not touched.
@@ -2103,7 +2103,7 @@ class LiveControlPanelView(discord.ui.View):
             selected_count = int(selected_count)
         if not has_actionable and not selected_count:
             self.btn_deploy_selected.disabled = True
-            self.btn_deploy_selected.label = "✅ All clear"
+            self.btn_deploy_selected.label = "✅ All servers operational"
             self.btn_deploy_selected.style = discord.ButtonStyle.secondary
             return
         if selected_count:
