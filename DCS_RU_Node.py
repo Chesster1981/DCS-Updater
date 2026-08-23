@@ -64,7 +64,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.78"
+CURRENT_NODE_VERSION = "2.1.79"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -1222,11 +1222,33 @@ def execute_srs_restart(source="remote") -> bool:
         node_state["active_task"] = "Idle"
 
 
-def _has_active_rdp_session_quser() -> bool:
-    """Fallback RDP check via quser (locale-dependent state text)."""
+def _parse_wmic_command_lines(text: str):
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("commandline="):
+            continue
+        cmdline = stripped.split("=", 1)[1].strip().strip('"')
+        if cmdline:
+            yield cmdline
+
+
+def _iter_rustdesk_command_lines():
+    """Yield command lines for running RustDesk processes."""
+    if sys.platform != "win32":
+        return
+
+    # Prefer WMIC when available; fall back to CIM (WMIC removed on some Win11 installs).
     try:
         proc = subprocess.run(
-            ["quser"],
+            [
+                "wmic",
+                "process",
+                "where",
+                "name='rustdesk.exe'",
+                "get",
+                "CommandLine",
+                "/VALUE",
+            ],
             capture_output=True,
             text=True,
             timeout=15,
@@ -1234,60 +1256,55 @@ def _has_active_rdp_session_quser() -> bool:
             errors="replace",
             **_hidden_subprocess_kwargs(capture_output=True),
         )
-        text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
-        for line in text.splitlines():
-            lower = line.lower()
-            if "rdp-tcp" not in lower:
-                continue
-            if re.search(r"\b(active|aktiv)\b", lower):
-                return True
-        return False
+        lines = list(_parse_wmic_command_lines(f"{proc.stdout or ''}\n{proc.stderr or ''}"))
+        if lines or proc.returncode == 0:
+            for cmdline in lines:
+                yield cmdline
+            return
     except Exception as err:
-        logging.debug("quser RDP check failed: %s", err)
+        logging.debug("RustDesk WMIC scan failed: %s", err)
+
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_Process -Filter \"Name='rustdesk.exe'\").CommandLine",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            encoding="utf-8",
+            errors="replace",
+            **_hidden_subprocess_kwargs(capture_output=True),
+        )
+        for line in (proc.stdout or "").splitlines():
+            cmdline = line.strip().strip('"')
+            if cmdline:
+                yield cmdline
+    except Exception as err:
+        logging.debug("RustDesk CIM scan failed: %s", err)
+
+
+def has_active_rustdesk_session() -> bool:
+    """
+    True when RustDesk Connection Manager is running.
+    RustDesk starts `rustdesk.exe --cm` / `--cm-no-ui` only while a remote client is connected.
+    """
+    if sys.platform != "win32":
         return False
+    # Official flags: --cm and --cm-no-ui (connection manager).
+    cm_arg = re.compile(r"(?:^|[\s\"'])--cm(?:-no-ui)?(?:[\s\"']|$)", re.IGNORECASE)
+    for cmdline in _iter_rustdesk_command_lines():
+        if cm_arg.search(cmdline):
+            return True
+    return False
 
 
 def has_active_rdp_session() -> bool:
-    """True when an interactive Remote Desktop session is connected."""
-    if sys.platform != "win32":
-        return False
-    try:
-        wtsapi32 = ctypes.windll.wtsapi32
-        WTS_CURRENT_SERVER_HANDLE = 0
-        WTSActive = 0
-        WTSConnected = 1
-
-        class WTS_SESSION_INFOW(ctypes.Structure):
-            _fields_ = [
-                ("SessionId", ctypes.c_uint),
-                ("pWinStationName", ctypes.c_wchar_p),
-                ("State", ctypes.c_uint),
-            ]
-
-        session_count = ctypes.c_uint(0)
-        session_ptr = ctypes.POINTER(WTS_SESSION_INFOW)()
-        if not wtsapi32.WTSEnumerateSessionsW(
-            WTS_CURRENT_SERVER_HANDLE,
-            0,
-            1,
-            ctypes.byref(session_ptr),
-            ctypes.byref(session_count),
-        ):
-            return _has_active_rdp_session_quser()
-        try:
-            for idx in range(session_count.value):
-                session = session_ptr[idx]
-                station = (session.pWinStationName or "").lower()
-                if "rdp-tcp" not in station:
-                    continue
-                if session.State in (WTSActive, WTSConnected):
-                    return True
-            return False
-        finally:
-            wtsapi32.WTSFreeMemory(session_ptr)
-    except Exception as err:
-        logging.debug("WTS RDP check failed: %s", err)
-        return _has_active_rdp_session_quser()
+    """True when an interactive remote session (RustDesk) is connected."""
+    return has_active_rustdesk_session()
 
 
 def _perform_windows_shutdown(delay_seconds: int, source: str = "remote") -> bool:
@@ -1319,8 +1336,8 @@ def _perform_windows_shutdown(delay_seconds: int, source: str = "remote") -> boo
 
 def wait_for_rdp_clear_then_reboot(source="remote", shutdown_delay=10) -> bool:
     """
-    Postpone reboot while Remote Desktop is active.
-    After RDP goes inactive, wait rdp_inactive_reboot_delay_seconds (default 5 min).
+    Postpone reboot while RustDesk is connected.
+    After disconnect, wait rdp_inactive_reboot_delay_seconds (default 5 min).
     """
     cfg = load_node_settings()
     poll = max(15, RDP_REBOOT_POLL_SECONDS)
@@ -1330,28 +1347,28 @@ def wait_for_rdp_clear_then_reboot(source="remote", shutdown_delay=10) -> bool:
     )
     tag = "REMOTE" if source == "remote" else "PROCESS"
 
-    if has_active_rdp_session():
-        node_state["active_task"] = "Waiting for RDP"
+    if has_active_rustdesk_session():
+        node_state["active_task"] = "Waiting for RustDesk"
         append_activity_log(
-            f"[{tag}] Active Remote Desktop session — postponing Windows reboot."
+            f"[{tag}] Active RustDesk session - postponing Windows reboot."
         )
-        while has_active_rdp_session():
+        while has_active_rustdesk_session():
             time.sleep(poll)
 
         append_activity_log(
-            f"[{tag}] RDP inactive — waiting {post_clear // 60} min before Windows reboot..."
+            f"[{tag}] RustDesk disconnected - waiting {post_clear // 60} min before Windows reboot..."
         )
         clear_since = time.time()
         while True:
-            if has_active_rdp_session():
+            if has_active_rustdesk_session():
                 append_activity_log(
-                    f"[{tag}] RDP session resumed — reboot postponed again."
+                    f"[{tag}] RustDesk reconnected - reboot postponed again."
                 )
-                while has_active_rdp_session():
+                while has_active_rustdesk_session():
                     time.sleep(poll)
                 clear_since = time.time()
                 append_activity_log(
-                    f"[{tag}] RDP inactive again — waiting {post_clear // 60} min before reboot..."
+                    f"[{tag}] RustDesk disconnected again - waiting {post_clear // 60} min before reboot..."
                 )
                 continue
             if time.time() - clear_since >= post_clear:
@@ -1362,7 +1379,7 @@ def wait_for_rdp_clear_then_reboot(source="remote", shutdown_delay=10) -> bool:
 
 
 def execute_windows_reboot(source="remote", delay_seconds: int = 10) -> bool:
-    """Schedule a Windows reboot; defer while Remote Desktop is active."""
+    """Schedule a Windows reboot; defer while RustDesk is connected."""
     cfg = load_node_settings()
     if bool(cfg.get("defer_reboot_for_rdp", True)):
         return wait_for_rdp_clear_then_reboot(source=source, shutdown_delay=delay_seconds)
@@ -2255,7 +2272,7 @@ v_auto_restart = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Auto-restart DCS only after it was previously running", variable=v_auto_restart, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 v_defer_rdp = tk.BooleanVar()
-tk.Checkbutton(frame_settings, text="Defer Windows reboot while Remote Desktop is active (5 min after logout)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+tk.Checkbutton(frame_settings, text="Defer Windows reboot while RustDesk is connected (5 min after disconnect)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 btn_tray = tk.Frame(frame_settings, bg="#1C1C1F")
 btn_tray.pack(pady=15)
