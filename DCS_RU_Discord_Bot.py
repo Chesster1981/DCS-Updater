@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.76"
+CURRENT_BOT_VERSION = "2.1.77"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -79,7 +79,8 @@ Dropdown **Select server(s)** — pick one or more yellow/red servers. Selection
 
 **DM alerts (attention round)**
 Sent on **OFFLINE** and **DCS DOWN** (crash) — not when SRS is down or when a new DCS/SRS release becomes available.
-Flow: 5 min grace → automatic DCS restart via node → 10 min wait → DM channel members if the server is still not online.
+Flow: 5 min grace → automatic Windows reboot via node → 10 min wait → DM channel members if still down.
+After reboot, **NOT STARTED** / **STARTING** cancels the alert (expected when the host has no 24/7 mission).
 
 **Slash commands**
 `/dcs-panel-wiki` — temporary status-logic explanation (removed when you switch channel, close Discord, or press Close).
@@ -92,7 +93,7 @@ Flow: 5 min grace → automatic DCS restart via node → 10 min wait → DM chan
 STATUS_ALERT_TEST_USERNAME = None
 STATUS_ALERT_TEST_NAME_ALIASES = ("Chesster", "Chesster1981")
 STATUS_ALERT_DELAY_SECONDS = 300
-STATUS_RESTART_WAIT_SECONDS = 600
+STATUS_REBOOT_WAIT_SECONDS = 600
 STATUS_LOG_FILE = "dcs_ru_server_status.log"
 STATUS_LOG_REPEAT_SECONDS = 60
 ATTENTION_REPLY_TIMEOUT_SECONDS = 300
@@ -110,6 +111,8 @@ STATUS_SRS_AND_DCS_DOWN = "SRS + DCS DOWN"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED, STATUS_SRS_DOWN}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
 STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
+# After an automatic reboot, idle/boot states are expected (no 24/7 mission).
+STATUS_ALERT_RESOLVED = STATUS_RUNNING | STATUS_BOOT
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
 TASK_AWAITING_OPERATOR = "Action required"
 
@@ -770,6 +773,17 @@ class DCSClusterBot(commands.Bot):
         status = snap.get("status_text") or ""
         return status in STATUS_RUNNING
 
+    @staticmethod
+    def _is_status_alert_resolved(snap):
+        """True when a pending OFFLINE/DCS DOWN alert can be cancelled.
+
+        Running statuses clear the alert. Boot/idle (NOT STARTED, STARTING)
+        also clear it — after a Windows reboot that is expected when the
+        machine has no 24/7 mission loaded.
+        """
+        status = snap.get("status_text") or ""
+        return status in STATUS_ALERT_RESOLVED
+
     def _log_non_online_status(self, snap, extra="", force=False):
         """Append non-online server status to dcs_ru_server_status.log next to the bot."""
         if snap is None or self._is_server_online(snap):
@@ -799,19 +813,19 @@ class DCSClusterBot(commands.Bot):
             parts.append(extra)
         self._append_status_log_line(" | ".join(parts))
 
-    async def _request_node_restart(self, snap):
+    async def _request_node_reboot(self, snap):
         name = snap.get("name") or snap.get("key") or "unknown"
         ip = snap.get("ip")
         port = snap.get("port")
-        self._log_non_online_status(snap, extra="action=RESTART_DCS", force=True)
+        self._log_non_online_status(snap, extra="action=REBOOT_WINDOWS", force=True)
         if not ip or not port:
-            logger.warning("Cannot restart %s — missing ip/port", name)
-            self._log_non_online_status(snap, extra="restart=skipped_no_address", force=True)
+            logger.warning("Cannot reboot %s — missing ip/port", name)
+            self._log_non_online_status(snap, extra="reboot=skipped_no_address", force=True)
             return "missing-address"
-        logger.info("Requesting DCS restart on %s (%s:%s)", name, ip, port)
-        answer = await self.send_socket_command(ip, port, "RESTART_DCS")
+        logger.info("Requesting Windows reboot on %s (%s:%s)", name, ip, port)
+        answer = await self.send_socket_command(ip, port, "REBOOT_WINDOWS")
         if not answer:
-            self._log_non_online_status(snap, extra="restart=unreachable", force=True)
+            self._log_non_online_status(snap, extra="reboot=unreachable", force=True)
             return "unreachable"
         result = "unknown"
         if answer.startswith("{"):
@@ -823,8 +837,8 @@ class DCSClusterBot(commands.Bot):
             result = "UNKNOWN_COMMAND"
         else:
             result = answer[:80]
-        self._log_non_online_status(snap, extra=f"restart={result}", force=True)
-        logger.info("DCS restart response from %s: %s", name, result)
+        self._log_non_online_status(snap, extra=f"reboot={result}", force=True)
+        logger.info("Windows reboot response from %s: %s", name, result)
         return result
 
     def _describe_status_alert(self, prev, curr):
@@ -1010,16 +1024,17 @@ class DCSClusterBot(commands.Bot):
         if not members:
             return
         body = (
-            f"✅ {self._attention_server_label()} back in **ONLINE** status.\n"
+            f"✅ {self._attention_server_label()} no longer in a down state "
+            "(ONLINE, or NOT STARTED / STARTING after reboot).\n"
             "No further action is required."
         )
         for member in members:
             try:
                 await member.send(body)
-                logger.info("Sent ONLINE recovery DM to %s", member.display_name)
+                logger.info("Sent recovery DM to %s", member.display_name)
             except Exception as e:
                 logger.warning(
-                    "Failed to send ONLINE recovery DM to %s: %s",
+                    "Failed to send recovery DM to %s: %s",
                     getattr(member, "display_name", member),
                     e,
                 )
@@ -1196,19 +1211,25 @@ class DCSClusterBot(commands.Bot):
                 name = snap.get("name") or key
                 curr_status = snap.get("status_text") or ""
                 online = self._is_server_online(snap)
+                resolved = self._is_status_alert_resolved(snap)
 
                 if not online:
                     self._log_non_online_status(snap)
 
-                if pending and online:
+                if pending and resolved:
                     logger.info(
                         "Cancelling delayed status alert for %s — recovered to %s",
                         name,
                         curr_status,
                     )
                     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    recovered_tag = (
+                        "ONLINE"
+                        if online
+                        else ("BOOT" if curr_status in STATUS_BOOT else curr_status)
+                    )
                     self._append_status_log_line(
-                        f"{stamp} | {name} | {curr_status} | recovered=ONLINE"
+                        f"{stamp} | {name} | {curr_status} | recovered={recovered_tag}"
                     )
                     self._pending_status_alerts.pop(key, None)
                     continue
@@ -1221,17 +1242,19 @@ class DCSClusterBot(commands.Bot):
                         if elapsed < STATUS_ALERT_DELAY_SECONDS:
                             continue
                         logger.info(
-                            "Grace period elapsed for %s — requesting DCS restart",
+                            "Grace period elapsed for %s — requesting Windows reboot",
                             name,
                         )
-                        pending["phase"] = "restart_wait"
-                        pending["restart_at"] = now
-                        pending["restart_attempted"] = True
-                        await self._request_node_restart(snap)
+                        pending["phase"] = "reboot_wait"
+                        pending["reboot_at"] = now
+                        pending["reboot_attempted"] = True
+                        await self._request_node_reboot(snap)
                         continue
 
-                    restart_elapsed = now - pending.get("restart_at", pending["started_at"])
-                    if restart_elapsed < STATUS_RESTART_WAIT_SECONDS:
+                    reboot_elapsed = now - pending.get(
+                        "reboot_at", pending.get("restart_at", pending["started_at"])
+                    )
+                    if reboot_elapsed < STATUS_REBOOT_WAIT_SECONDS:
                         continue
                     text = self._describe_status_alert(pending["from_snap"], snap)
                     self._pending_status_alerts.pop(key, None)
@@ -1239,22 +1262,22 @@ class DCSClusterBot(commands.Bot):
                         icon = snap.get("icon") or ""
                         text = (
                             f"**{name}**\n"
-                            f"Still not ONLINE after automatic restart.\n"
+                            f"Still down after automatic Windows reboot.\n"
                             f"New status: {icon} **{curr_status}**."
                         )
                     text += (
-                        "\nAutomatic DCS restart was attempted after the grace period, "
-                        "but the server did not return to ONLINE."
+                        "\nAutomatic Windows reboot was attempted after the grace period, "
+                        "but the server did not return to ONLINE or NOT STARTED."
                     )
                     problems.append(text)
                     self._log_non_online_status(
                         snap,
-                        extra="action=DM_ALERT restart_did_not_recover",
+                        extra="action=DM_ALERT reboot_did_not_recover",
                         force=True,
                     )
                     continue
 
-                if online:
+                if resolved:
                     continue
                 text = self._describe_status_alert(prev, snap)
                 if not text:
@@ -1264,10 +1287,10 @@ class DCSClusterBot(commands.Bot):
                     "from_snap": prev,
                     "latest_snap": snap,
                     "phase": "grace",
-                    "restart_attempted": False,
+                    "reboot_attempted": False,
                 }
                 logger.info(
-                    "Delaying status alert for %s by %ss then restart (%s -> %s)",
+                    "Delaying status alert for %s by %ss then reboot (%s -> %s)",
                     name,
                     STATUS_ALERT_DELAY_SECONDS,
                     (prev or {}).get("status_text"),
