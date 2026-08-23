@@ -82,6 +82,8 @@ NODE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "watchdog_enabled": True,
     "watchdog_interval_seconds": 300,
     "auto_restart_dcs": True,
+    "defer_reboot_for_rdp": True,
+    "rdp_inactive_reboot_delay_seconds": 300,
     "dcs_server_exe": "",
     "dcs_server_process_names": [],
     "srs_install_folder": "",
@@ -148,6 +150,7 @@ def sanitize_node_settings(
         "reboot_after_deployment",
         "watchdog_enabled",
         "auto_restart_dcs",
+        "defer_reboot_for_rdp",
     }
     for key in NODE_SETTINGS_DEFAULTS:
         if key not in incoming:
@@ -166,6 +169,12 @@ def sanitize_node_settings(
             except (TypeError, ValueError):
                 merged[key] = NODE_SETTINGS_DEFAULTS[key]
         elif key == "watchdog_interval_seconds":
+            try:
+                seconds = int(value)
+            except (TypeError, ValueError):
+                seconds = NODE_SETTINGS_DEFAULTS[key]
+            merged[key] = max(60, seconds)
+        elif key == "rdp_inactive_reboot_delay_seconds":
             try:
                 seconds = int(value)
             except (TypeError, ValueError):

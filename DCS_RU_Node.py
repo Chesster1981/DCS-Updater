@@ -64,7 +64,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.76"
+CURRENT_NODE_VERSION = "2.1.77"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -92,6 +92,8 @@ WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
 WATCHDOG_STARTUP_DELAY_SECONDS = 300  # wait one interval after Node boot
 DCS_STARTUP_GRACE_SECONDS = 600  # process may exist minutes before the DCS port opens
 DCS_DOWN_GRACE_SECONDS = 300  # wait before auto-restart after DCS goes unhealthy/dead
+RDP_REBOOT_POLL_SECONDS = 30
+RDP_INACTIVE_REBOOT_DELAY_SECONDS = 300
 DCS_PORT_BASE = 10300
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 SRS_PROCESS_IMAGES = ("SR-Server.exe", "SRS-Server.exe", "SR_Server.exe")
@@ -210,6 +212,7 @@ def sync_settings_widgets(settings: dict):
             v_reboot.set(bool(settings.get("reboot_after_deployment", True)))
             v_watchdog.set(bool(settings.get("watchdog_enabled", True)))
             v_auto_restart.set(bool(settings.get("auto_restart_dcs", True)))
+            v_defer_rdp.set(bool(settings.get("defer_reboot_for_rdp", True)))
         except Exception:
             pass
 
@@ -1219,26 +1222,151 @@ def execute_srs_restart(source="remote") -> bool:
         node_state["active_task"] = "Idle"
 
 
-def execute_windows_reboot(source="remote", delay_seconds: int = 10) -> bool:
-    """Schedule a Windows reboot (operator-initiated)."""
-    tag = "REMOTE" if source == "remote" else "LOCAL"
-    delay = max(5, int(delay_seconds))
+def _has_active_rdp_session_quser() -> bool:
+    """Fallback RDP check via quser (locale-dependent state text)."""
+    try:
+        proc = subprocess.run(
+            ["quser"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            encoding="utf-8",
+            errors="replace",
+            **_hidden_subprocess_kwargs(capture_output=True),
+        )
+        text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+        for line in text.splitlines():
+            lower = line.lower()
+            if "rdp-tcp" not in lower:
+                continue
+            if re.search(r"\b(active|aktiv)\b", lower):
+                return True
+        return False
+    except Exception as err:
+        logging.debug("quser RDP check failed: %s", err)
+        return False
+
+
+def has_active_rdp_session() -> bool:
+    """True when an interactive Remote Desktop session is connected."""
+    if sys.platform != "win32":
+        return False
+    try:
+        wtsapi32 = ctypes.windll.wtsapi32
+        WTS_CURRENT_SERVER_HANDLE = 0
+        WTSActive = 0
+        WTSConnected = 1
+
+        class WTS_SESSION_INFOW(ctypes.Structure):
+            _fields_ = [
+                ("SessionId", ctypes.c_uint),
+                ("pWinStationName", ctypes.c_wchar_p),
+                ("State", ctypes.c_uint),
+            ]
+
+        session_count = ctypes.c_uint(0)
+        session_ptr = ctypes.POINTER(WTS_SESSION_INFOW)()
+        if not wtsapi32.WTSEnumerateSessionsW(
+            WTS_CURRENT_SERVER_HANDLE,
+            0,
+            1,
+            ctypes.byref(session_ptr),
+            ctypes.byref(session_count),
+        ):
+            return _has_active_rdp_session_quser()
+        try:
+            for idx in range(session_count.value):
+                session = session_ptr[idx]
+                station = (session.pWinStationName or "").lower()
+                if "rdp-tcp" not in station:
+                    continue
+                if session.State in (WTSActive, WTSConnected):
+                    return True
+            return False
+        finally:
+            wtsapi32.WTSFreeMemory(session_ptr)
+    except Exception as err:
+        logging.debug("WTS RDP check failed: %s", err)
+        return _has_active_rdp_session_quser()
+
+
+def _perform_windows_shutdown(delay_seconds: int, source: str = "remote") -> bool:
+    tag = "REMOTE" if source == "remote" else "PROCESS"
+    delay = max(0, int(delay_seconds))
     node_state["active_task"] = "Rebooting"
     try:
-        append_activity_log(
-            f"[{tag}] Windows reboot requested — shutting down in {delay} seconds..."
-        )
-        subprocess.run(
-            f"shutdown /r /t {delay} /c \"DCS Norway Remote Updater reboot\"",
-            shell=True,
-            **_hidden_subprocess_kwargs(capture_output=False),
-        )
+        if delay == 0:
+            append_activity_log(f"[{tag}] Rebooting Windows now.")
+            subprocess.run(
+                "shutdown /r /t 0",
+                shell=True,
+                **_hidden_subprocess_kwargs(capture_output=False),
+            )
+        else:
+            append_activity_log(f"[{tag}] Windows reboot in {delay} seconds...")
+            subprocess.run(
+                f'shutdown /r /t {delay} /c "DCS Norway Remote Updater reboot"',
+                shell=True,
+                **_hidden_subprocess_kwargs(capture_output=False),
+            )
         return True
     except Exception as e:
         append_activity_log(f"[{tag}] Windows reboot failed: {e}")
         logging.error("Windows reboot failed (%s): %s", source, e)
         node_state["active_task"] = "Idle"
         return False
+
+
+def wait_for_rdp_clear_then_reboot(source="remote", shutdown_delay=10) -> bool:
+    """
+    Postpone reboot while Remote Desktop is active.
+    After RDP goes inactive, wait rdp_inactive_reboot_delay_seconds (default 5 min).
+    """
+    cfg = load_node_settings()
+    poll = max(15, RDP_REBOOT_POLL_SECONDS)
+    post_clear = max(
+        60,
+        int(cfg.get("rdp_inactive_reboot_delay_seconds", RDP_INACTIVE_REBOOT_DELAY_SECONDS)),
+    )
+    tag = "REMOTE" if source == "remote" else "PROCESS"
+
+    if has_active_rdp_session():
+        node_state["active_task"] = "Waiting for RDP"
+        append_activity_log(
+            f"[{tag}] Active Remote Desktop session — postponing Windows reboot."
+        )
+        while has_active_rdp_session():
+            time.sleep(poll)
+
+        append_activity_log(
+            f"[{tag}] RDP inactive — waiting {post_clear // 60} min before Windows reboot..."
+        )
+        clear_since = time.time()
+        while True:
+            if has_active_rdp_session():
+                append_activity_log(
+                    f"[{tag}] RDP session resumed — reboot postponed again."
+                )
+                while has_active_rdp_session():
+                    time.sleep(poll)
+                clear_since = time.time()
+                append_activity_log(
+                    f"[{tag}] RDP inactive again — waiting {post_clear // 60} min before reboot..."
+                )
+                continue
+            if time.time() - clear_since >= post_clear:
+                break
+            time.sleep(min(poll, post_clear))
+
+    return _perform_windows_shutdown(shutdown_delay, source=source)
+
+
+def execute_windows_reboot(source="remote", delay_seconds: int = 10) -> bool:
+    """Schedule a Windows reboot; defer while Remote Desktop is active."""
+    cfg = load_node_settings()
+    if bool(cfg.get("defer_reboot_for_rdp", True)):
+        return wait_for_rdp_clear_then_reboot(source=source, shutdown_delay=delay_seconds)
+    return _perform_windows_shutdown(delay_seconds, source=source)
 
 
 def _zip_server_prefix(zf: zipfile.ZipFile) -> str:
@@ -1458,10 +1586,9 @@ def execute_deployment_pipeline():
             append_activity_log(f" ERROR during file restoration: ❌ {e}")
             
     if reboot_after_deployment:
-        append_activity_log(" [PROCESS] Windows reboot is enabled. ⚠️ Rebooting machine in 5 seconds...")
-        node_state["active_task"] = "Rebooting"
+        append_activity_log(" [PROCESS] Windows reboot is enabled.")
         time.sleep(5)
-        subprocess.run("shutdown /r /t 0", shell=True, **_hidden_subprocess_kwargs(capture_output=False))
+        execute_windows_reboot(source="process", delay_seconds=0)
     else:
         append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
         node_state["active_task"] = "Idle"
@@ -1530,6 +1657,7 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         "srs_running": is_srs_process_running() if srs_configured else False,
                         "srs_installed_version": get_srs_installed_version(),
                         "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
+                        "rdp_session_active": has_active_rdp_session(),
                     }
                     conn.send((json.dumps(response) + "\n").encode("utf-8"))
                     conn.close()
@@ -1886,6 +2014,7 @@ def show_settings_frame():
         v_reboot.set(bool(cfg.get("reboot_after_deployment", True)))
         v_watchdog.set(bool(cfg.get("watchdog_enabled", True)))
         v_auto_restart.set(bool(cfg.get("auto_restart_dcs", True)))
+        v_defer_rdp.set(bool(cfg.get("defer_reboot_for_rdp", True)))
         frame_settings.pack(fill="both", expand=True, padx=15, pady=10)
     except Exception as err:
         logging.error(f"UI settings frame assembly crashed: {err}")
@@ -1904,6 +2033,7 @@ def save_settings_to_file():
         "github_check_interval": github_interval_seconds(opt_update_var.get()),
         "watchdog_enabled": v_watchdog.get(),
         "auto_restart_dcs": v_auto_restart.get(),
+        "defer_reboot_for_rdp": v_defer_rdp.get(),
     }
     apply_node_settings(incoming, source="ui")
     show_main_frame()
@@ -2123,6 +2253,9 @@ tk.Checkbutton(frame_settings, text="Watch DCS server health every 5 minutes (pr
 
 v_auto_restart = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Auto-restart DCS only after it was previously running", variable=v_auto_restart, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+
+v_defer_rdp = tk.BooleanVar()
+tk.Checkbutton(frame_settings, text="Defer Windows reboot while Remote Desktop is active (5 min after logout)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 btn_tray = tk.Frame(frame_settings, bg="#1C1C1F")
 btn_tray.pack(pady=15)

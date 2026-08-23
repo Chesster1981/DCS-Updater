@@ -60,7 +60,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.76"
+CONTROL_PANEL_VERSION = "2.1.77"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -1042,7 +1042,8 @@ class MainWindow(QMainWindow):
         self.chk_reboot = QCheckBox("Reboot Windows after DCS update completes")
         self.chk_watchdog = QCheckBox("Watch DCS server health (process + port)")
         self.chk_auto_restart = QCheckBox("Auto-restart DCS only after it was previously running")
-        for chk in (self.chk_preserve, self.chk_reboot, self.chk_watchdog, self.chk_auto_restart):
+        self.chk_defer_rdp = QCheckBox("Defer Windows reboot while Remote Desktop is active (5 min after logout)")
+        for chk in (self.chk_preserve, self.chk_reboot, self.chk_watchdog, self.chk_auto_restart, self.chk_defer_rdp):
             chk.setChecked(True)
 
         node_form.addRow("Bind Address:", self.ent_node_bind)
@@ -1053,6 +1054,7 @@ class MainWindow(QMainWindow):
         node_form.addRow(self.chk_reboot)
         node_form.addRow(self.chk_watchdog)
         node_form.addRow(self.chk_auto_restart)
+        node_form.addRow(self.chk_defer_rdp)
         note = QLabel("DCS folder, SRS folder, server exe and process names are set locally on the Node.")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {STYLE_TEXT_MUTED}; font-size: 11px;")
@@ -1102,6 +1104,7 @@ class MainWindow(QMainWindow):
         self.chk_reboot.setChecked(bool(data.get("reboot_after_deployment", True)))
         self.chk_watchdog.setChecked(bool(data.get("watchdog_enabled", True)))
         self.chk_auto_restart.setChecked(bool(data.get("auto_restart_dcs", True)))
+        self.chk_defer_rdp.setChecked(bool(data.get("defer_reboot_for_rdp", True)))
 
     def _collect_node_settings_from_form(self):
         return {
@@ -1113,6 +1116,7 @@ class MainWindow(QMainWindow):
             "watchdog_enabled": self.chk_watchdog.isChecked(),
             "watchdog_interval_seconds": self.spn_watchdog_interval.value(),
             "auto_restart_dcs": self.chk_auto_restart.isChecked(),
+            "defer_reboot_for_rdp": self.chk_defer_rdp.isChecked(),
             "preserve_mission_scripting": self.chk_preserve.isChecked(),
         }
 
