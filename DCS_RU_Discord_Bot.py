@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.83"
+CURRENT_BOT_VERSION = "2.1.84"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -68,7 +68,7 @@ Bot version — version of this Discord bot
 🔄 **Refresh Server Status** — manually refresh the panel
 🚀 **Select Actions** — after choosing from the dropdown: opens the action menu (start/restart, update, reboot)
 Dropdown **Select server(s)** — pick one or more yellow/red servers. Selection is kept across automatic refresh (every 30 s).
-✅ **All servers operational** — no yellow/red servers right now
+✅ **All servers operational** — every server is green **UP TO DATE**. Any other status (OFFLINE, DCS DOWN, PAUSED, NOT STARTED, update/SRS issues) shows **Select Actions** instead.
 
 **Deploy logic**
 • Only SRS outdated → SRS update only (`TRIGGER_SRS_UPDATE`), DCS is not touched.
@@ -117,6 +117,7 @@ STATUS_ALERT_RESOLVED = STATUS_RUNNING | STATUS_BOOT
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
 TASK_AWAITING_OPERATOR = "Action required"
 TASK_NO_MISSION = "No mission loaded"
+PANEL_SELECT_EMOJIS = {"⚠️", "🛑", "🔴", "⏸️", "⏳", "🔐"}
 
 PANEL_ACTION_LABELS = {
     "restart_dcs": "Start/Restart DCS",
@@ -1820,6 +1821,7 @@ def classify_node_answer(answer, srs_latest_release=None):
                     is_outdated
                     or srs_down
                     or dcs_crashed
+                    or dcs_paused
                     or dcs_health == "NEVER_STARTED"
                 )
                 ver_info = f"{installed_ver}"
@@ -1892,6 +1894,10 @@ def classify_node_answer(answer, srs_latest_release=None):
     else:
         status_text = "OFFLINE"
         icon = "🔴"
+
+    # Panel actions are available for every non-green server, including OFFLINE.
+    if status_text != STATUS_UP_TO_DATE:
+        needs_action = True
 
     return {
         "status_text": status_text,
@@ -2197,7 +2203,7 @@ class LiveControlPanelView(discord.ui.View):
                         f"{snap.get('status_text', 'Selected')} | Port {node['port']}"
                     )[:100],
                     value=name,
-                    emoji=icon if icon in {"⚠️", "🛑"} else "📌",
+                    emoji=icon if icon in PANEL_SELECT_EMOJIS else "📌",
                     default=True,
                 )
             )
@@ -2347,7 +2353,7 @@ class LiveControlPanelView(discord.ui.View):
                         label=node["name"],
                         description=f"{status_text} | Port {node['port']}",
                         value=node["name"],
-                        emoji=icon if icon in {"⚠️", "🛑"} else "⚠️",
+                        emoji=icon if icon in PANEL_SELECT_EMOJIS else "📌",
                         default=node["name"] in selected_set,
                     )
                 )
