@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.80"
+CURRENT_BOT_VERSION = "2.1.81"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -47,6 +47,7 @@ Use `/dcs-panel-init` to create or restore the live panel at the bottom of this 
 ⚠️ **SRS + DCS DOWN** — both SRS and DCS are down, but DCS has never run (NEVER_STARTED). Caution.
 🛑 **SRS + DCS DOWN** — both SRS and DCS are down after DCS had been running (UNHEALTHY/DEAD). Red.
 ⏸️ **NOT STARTED** — DCS has never been started on the node (intentional idle). Yellow status (update/SRS) overrides this.
+⏸️ **PAUSED** — DCS is up (or idle) with an empty `missionList` in `serverSettings.lua` (no mission loaded). Not a crash.
 ⏳ **STARTING** — DCS process is running, but the port is not answering yet.
 🛑 **DCS DOWN** — DCS had been running and then crashed/stopped (UNHEALTHY/DEAD), while SRS is running.
 🔐 **UNAUTHORIZED** — auth_token does not match between bot and node.
@@ -107,11 +108,15 @@ STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_SRS_OUTDATED = "SRS OUTDATED"
 STATUS_SRS_DOWN = "SRS DOWN"
 STATUS_SRS_AND_DCS_DOWN = "SRS + DCS DOWN"
+STATUS_PAUSED = "DCS PAUSED"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED, STATUS_SRS_DOWN}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
-STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
+STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED", STATUS_PAUSED}
+# Idle/boot states must not start attention DMs or automatic recovery.
+STATUS_ALERT_RESOLVED = STATUS_RUNNING | STATUS_BOOT
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
 TASK_AWAITING_OPERATOR = "Action required"
+TASK_NO_MISSION = "No mission loaded"
 
 PANEL_ACTION_LABELS = {
     "restart_dcs": "Start/Restart DCS",
@@ -770,6 +775,15 @@ class DCSClusterBot(commands.Bot):
         status = snap.get("status_text") or ""
         return status in STATUS_RUNNING
 
+    @staticmethod
+    def _is_status_alert_resolved(snap):
+        """True when a pending down alert can be cancelled (online or intentional idle)."""
+        status = snap.get("status_text") or ""
+        health = str(snap.get("dcs_health") or "").strip().upper()
+        if status in STATUS_ALERT_RESOLVED:
+            return True
+        return health in {"HEALTHY", "PAUSED", "NEVER_STARTED", "STARTING"}
+
     def _log_non_online_status(self, snap, extra="", force=False):
         """Append non-online server status to dcs_ru_server_status.log next to the bot."""
         if snap is None or self._is_server_online(snap):
@@ -845,6 +859,10 @@ class DCSClusterBot(commands.Bot):
         prev_running = prev_status in STATUS_RUNNING or prev_health == "HEALTHY"
         curr_down = curr_status in STATUS_DOWN or curr_health in HEALTH_CRASHED
         crashed = prev_running and curr_down and prev_status not in STATUS_BOOT
+
+        # Intentional idle/pause must never start an attention round.
+        if curr_status in STATUS_BOOT or curr_health in {"PAUSED", "NEVER_STARTED", "STARTING"}:
+            return None
 
         if not left_up_to_date and not crashed:
             return None
@@ -1196,19 +1214,23 @@ class DCSClusterBot(commands.Bot):
                 name = snap.get("name") or key
                 curr_status = snap.get("status_text") or ""
                 online = self._is_server_online(snap)
+                resolved = self._is_status_alert_resolved(snap)
 
                 if not online:
                     self._log_non_online_status(snap)
 
-                if pending and online:
+                if pending and resolved:
                     logger.info(
                         "Cancelling delayed status alert for %s — recovered to %s",
                         name,
                         curr_status,
                     )
                     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    recovered_tag = "ONLINE" if online else (
+                        "IDLE" if curr_status in STATUS_BOOT else curr_status
+                    )
                     self._append_status_log_line(
-                        f"{stamp} | {name} | {curr_status} | recovered=ONLINE"
+                        f"{stamp} | {name} | {curr_status} | recovered={recovered_tag}"
                     )
                     self._pending_status_alerts.pop(key, None)
                     continue
@@ -1254,7 +1276,7 @@ class DCSClusterBot(commands.Bot):
                     )
                     continue
 
-                if online:
+                if resolved:
                     continue
                 text = self._describe_status_alert(prev, snap)
                 if not text:
@@ -1692,6 +1714,7 @@ PANEL_BOX_LINE_WIDTH = 13
 PANEL_STATUS_SHORT = {
     "DCS NOT STARTED": "NOT STARTED",
     "DCS STARTING": "STARTING",
+    "DCS PAUSED": "PAUSED",
     "SRS OUTDATED": "SRS OUTDATED",
     "SRS DOWN": "SRS DOWN",
     "SRS + DCS DOWN": "SRS+DCS DOWN",
@@ -1704,6 +1727,7 @@ PANEL_TASK_SHORT = {
     "DCS_server stopped": "Stopped",
     "Awaiting operator action": "Action needed",
     "Action required": "Action needed",
+    "No mission loaded": "No mission",
 }
 
 
@@ -1790,9 +1814,13 @@ def classify_node_answer(answer, srs_latest_release=None):
                 is_outdated = needs_dcs_update or needs_srs_update
                 srs_down = srs_configured and srs_running is False
                 dcs_crashed = dcs_health in HEALTH_CRASHED
+                dcs_paused = dcs_health == "PAUSED"
                 dcs_not_running = dcs_crashed or dcs_health == "NEVER_STARTED"
                 needs_action = (
-                    is_outdated or srs_down or dcs_crashed or dcs_health == "NEVER_STARTED"
+                    is_outdated
+                    or srs_down
+                    or dcs_crashed
+                    or dcs_health == "NEVER_STARTED"
                 )
                 ver_info = f"{installed_ver}"
 
@@ -1805,6 +1833,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif dcs_health == "STARTING":
                     # Real wait: process is up, port not ready yet.
                     task_info = "Awaiting DCS port"
+                elif dcs_paused:
+                    task_info = TASK_NO_MISSION
                 elif dcs_health == "NEVER_STARTED" or srs_down or dcs_crashed:
                     # No automatic boot is queued — operator must act.
                     task_info = TASK_AWAITING_OPERATOR
@@ -1832,6 +1862,11 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif dcs_health == "STARTING":
                     status_text = "DCS STARTING"
                     icon = "⏳"
+                elif dcs_paused:
+                    status_text = STATUS_PAUSED
+                    icon = "⏸️"
+                    if active_task == "Idle":
+                        task_info = TASK_NO_MISSION
                 elif dcs_health == "NEVER_STARTED":
                     status_text = "DCS NOT STARTED"
                     icon = "⏸️"
@@ -2528,6 +2563,7 @@ async def dcs_panel_wiki(interaction: discord.Interaction):
         name="Other icons",
         value=(
             "⏸️ **NOT STARTED** — DCS never started (idle; Action required — no auto-boot)\n"
+            "⏸️ **PAUSED** — empty missionList in serverSettings.lua (no mission loaded)\n"
             "⏳ **STARTING** — process up, port not ready yet (Port pending)\n"
             "🔐 **UNAUTHORIZED** — auth token mismatch\n"
             "🔴 **OFFLINE** — node did not answer"
@@ -2538,7 +2574,7 @@ async def dcs_panel_wiki(interaction: discord.Interaction):
         name="Priority",
         value=(
             "Updates → SRS+DCS DOWN → SRS DOWN → STARTING → "
-            "NOT STARTED → DCS crash → UP TO DATE"
+            "PAUSED → NOT STARTED → DCS crash → UP TO DATE"
         ),
         inline=False,
     )

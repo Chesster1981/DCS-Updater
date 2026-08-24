@@ -35,6 +35,7 @@ from dcs_ru_common import (
     parse_srs_autoconnect_version_line,
     srs_version_is_current,
     SRS_AUTOCONNECT_LUA,
+    mission_list_is_empty,
 )
 from brand_assets import (
     BRAND_ASSET_VERSION,
@@ -64,7 +65,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.80"
+CURRENT_NODE_VERSION = "2.1.81"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -103,6 +104,7 @@ SRS_PRESERVE_FILENAMES = ("server.cfg", "banned.txt")
 DCS_HEALTH_NEVER_STARTED = "NEVER_STARTED"
 DCS_HEALTH_STARTING = "STARTING"
 DCS_HEALTH_HEALTHY = "HEALTHY"
+DCS_HEALTH_PAUSED = "PAUSED"
 DCS_HEALTH_UNHEALTHY = "UNHEALTHY"
 DCS_HEALTH_DEAD = "DEAD"
 
@@ -116,6 +118,7 @@ node_state = {
     "dcs_ever_healthy": False,
     "dcs_process_seen_at": None,
     "dcs_down_since": None,
+    "mission_list_empty": None,
 }
 
 _watchdog_restart_times = []
@@ -751,11 +754,89 @@ def has_dcs_crash_dialog() -> bool:
         return False
 
 
+def resolve_dcs_saved_games_roots(config=None) -> list[str]:
+    """Candidate Saved Games write dirs for this Node (prefer exe-matched folder)."""
+    cfg = config if config is not None else load_node_settings()
+    override = str(cfg.get("dcs_saved_games_folder") or "").strip().strip('"')
+    if override:
+        return [os.path.normpath(override)]
+
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    saved_games = os.path.join(home, "Saved Games")
+    if not os.path.isdir(saved_games):
+        return []
+
+    preferred_names: list[str] = []
+    exe_path = resolve_dcs_server_exe_path(cfg)
+    if exe_path:
+        stem = os.path.splitext(os.path.basename(exe_path))[0]
+        if stem:
+            preferred_names.append(stem)
+    for extra in _config_server_name_extras(cfg):
+        stem = process_name_stem(extra)
+        if stem and stem not in preferred_names:
+            preferred_names.append(stem)
+
+    roots: list[str] = []
+    for name in preferred_names:
+        path = os.path.join(saved_games, name)
+        if os.path.isdir(path) and path not in roots:
+            roots.append(path)
+
+    try:
+        entries = sorted(os.listdir(saved_games))
+    except OSError:
+        entries = []
+    scored: list[tuple[float, str]] = []
+    for name in entries:
+        if not str(name).upper().startswith("DCS"):
+            continue
+        path = os.path.join(saved_games, name)
+        settings = os.path.join(path, "Config", "serverSettings.lua")
+        if not os.path.isfile(settings):
+            continue
+        if path in roots:
+            continue
+        try:
+            mtime = os.path.getmtime(settings)
+        except OSError:
+            mtime = 0.0
+        scored.append((mtime, path))
+    scored.sort(reverse=True)
+    for _mtime, path in scored:
+        roots.append(path)
+    return roots
+
+
+def resolve_server_settings_lua_path(config=None) -> str:
+    """Path to Config/serverSettings.lua for the active DCS write dir."""
+    for root in resolve_dcs_saved_games_roots(config):
+        path = os.path.join(root, "Config", "serverSettings.lua")
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def read_mission_list_empty(config=None) -> bool | None:
+    """True when serverSettings.lua missionList has no missions; None if unknown."""
+    path = resolve_server_settings_lua_path(config)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError as e:
+        logging.debug("Could not read serverSettings.lua (%s): %s", path, e)
+        return None
+    return mission_list_is_empty(text)
+
+
 def evaluate_dcs_health(node_port) -> str:
     """
     Classify DCS server state on every scan (nothing is locked from the first check):
     - HEALTHY: listening port (primary) and no crash dialog
     - STARTING: process seen but port not open yet, and DCS was never healthy this boot
+    - PAUSED: process up / port closed, and missionList is empty (intentional idle)
     - UNHEALTHY: crash dialog, or process alive / port closed after a prior healthy run
     - DEAD: process/port gone after having been healthy before
     - NEVER_STARTED: never seen a dedicated-server process this boot
@@ -764,6 +845,7 @@ def evaluate_dcs_health(node_port) -> str:
     port_up = is_dcs_port_listening(node_port)
     crash_dialog = has_dcs_crash_dialog()
     process_up = is_dcs_server_process_running(config)
+    mission_empty = read_mission_list_empty(config)
 
     if process_up and node_state.get("dcs_process_seen_at") is None:
         node_state["dcs_process_seen_at"] = time.time()
@@ -773,12 +855,20 @@ def evaluate_dcs_health(node_port) -> str:
     if port_up:
         return DCS_HEALTH_HEALTHY
     if process_up:
+        # No mission loaded → intentional pause (port will not answer).
+        if mission_empty is True:
+            return DCS_HEALTH_PAUSED
         if node_state.get("dcs_ever_healthy"):
             return DCS_HEALTH_UNHEALTHY
         seen_at = node_state.get("dcs_process_seen_at") or time.time()
         if time.time() - seen_at < DCS_STARTUP_GRACE_SECONDS:
             return DCS_HEALTH_STARTING
         return DCS_HEALTH_UNHEALTHY
+    # Process gone with an empty mission list after DCS has been seen = intentional idle.
+    if mission_empty is True and (
+        node_state.get("dcs_ever_healthy") or node_state.get("dcs_process_seen_at")
+    ):
+        return DCS_HEALTH_PAUSED
     if node_state.get("dcs_ever_healthy"):
         return DCS_HEALTH_DEAD
     return DCS_HEALTH_NEVER_STARTED
@@ -799,6 +889,7 @@ def refresh_dcs_health_state(node_port=None):
         node_state["dcs_down_since"] = None
     node_state["dcs_health"] = health
     node_state["dcs_running"] = health == DCS_HEALTH_HEALTHY
+    node_state["mission_list_empty"] = read_mission_list_empty()
     return health
 
 
@@ -929,9 +1020,13 @@ def execute_dcs_restart(node_port=None, source="watchdog") -> bool:
 
 def attempt_dcs_auto_restart(health: str, node_port) -> bool:
     """Restart DCS only after it was previously healthy (not on fresh boot)."""
-    if health in (DCS_HEALTH_NEVER_STARTED, DCS_HEALTH_STARTING):
+    if health in (
+        DCS_HEALTH_NEVER_STARTED,
+        DCS_HEALTH_STARTING,
+        DCS_HEALTH_PAUSED,
+    ):
         append_activity_log(
-            "[WATCHDOG] DCS has not finished starting since Node boot — skipping auto-restart."
+            f"[WATCHDOG] DCS health is {health} — skipping auto-restart."
         )
         return False
     if not node_state.get("dcs_ever_healthy"):
@@ -991,6 +1086,11 @@ def dcs_watchdog_loop():
                 append_activity_log(
                     f"[WATCHDOG] DCS starting — {describe_running_dcs_server_processes(cfg)}; "
                     f"waiting for port {dcs_port}."
+                )
+            elif health == DCS_HEALTH_PAUSED:
+                append_activity_log(
+                    f"[WATCHDOG] DCS paused — missionList empty in serverSettings.lua "
+                    f"(no auto-restart, port {dcs_port})."
                 )
             elif health == DCS_HEALTH_UNHEALTHY:
                 append_activity_log(
@@ -1692,6 +1792,7 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         "node_version": CURRENT_NODE_VERSION,
                         "dcs_running": dcs_health == DCS_HEALTH_HEALTHY,
                         "dcs_health": dcs_health,
+                        "mission_list_empty": node_state.get("mission_list_empty"),
                         "srs_configured": srs_configured,
                         "srs_running": is_srs_process_running() if srs_configured else False,
                         "srs_installed_version": get_srs_installed_version(),

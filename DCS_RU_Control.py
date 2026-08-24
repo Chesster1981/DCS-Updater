@@ -60,7 +60,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.80"
+CONTROL_PANEL_VERSION = "2.1.81"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -156,6 +156,7 @@ def save_config_to_file():
 _LIVE_STATUS_REDUNDANT_TASKS = frozenset({
     "Idle",
     "DCS not started",
+    "DCS paused (no mission)",
     "DCS starting (waiting for port)",
     "DCS not responding on port",
     "DCS server stopped/crashed",
@@ -169,6 +170,8 @@ def _dcs_live_key(data) -> str:
         return "up"
     if dcs_health == "STARTING":
         return "starting"
+    if dcs_health == "PAUSED":
+        return "paused"
     if dcs_health == "NEVER_STARTED":
         return "off"
     if dcs_health == "UNHEALTHY":
@@ -192,6 +195,7 @@ _LIVE_KEY_TIP = {
     "up": "up",
     "off": "off",
     "starting": "starting",
+    "paused": "paused",
     "down": "down",
     "noport": "no port",
     "na": "n/a",
@@ -332,6 +336,10 @@ def parse_socket_response(answer):
                 status = "STARTING"
                 if active_task == "Idle":
                     active_task = "DCS starting (waiting for port)"
+            elif dcs_health == "PAUSED":
+                status = "ONLINE"
+                if active_task == "Idle":
+                    active_task = "DCS paused (no mission)"
             elif dcs_health == "NEVER_STARTED":
                 status = "ONLINE"
                 if active_task == "Idle":
