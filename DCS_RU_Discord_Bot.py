@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.84"
+CURRENT_BOT_VERSION = "2.1.85"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1743,13 +1743,17 @@ def format_server_status_box(status_text: str, ver_info: str, task_info: str, sr
     """Fixed four-line status block so every server tile is the same height."""
     status_text = PANEL_STATUS_SHORT.get(status_text, status_text)
     task_info = PANEL_TASK_SHORT.get(task_info, task_info)
+    task_display = _panel_line(task_info)
+    # Discord ANSI yellow (no quotes) for the intentional idle task line.
+    if task_info == "No mission":
+        task_display = f"\x1b[33m{task_display}\x1b[0m"
     rows = [
         f"ℹ️ {_panel_line(status_text)}",
         f"⚙️ {_panel_line(ver_info)}",
         f"📻 {_panel_line(srs_info)}",
-        f"🖥️ {_panel_line(task_info)}",
+        f"🖥️ {task_display}",
     ]
-    return "```yaml\n" + "\n".join(rows) + "\n```"
+    return "```ansi\n" + "\n".join(rows) + "\n```"
 
 
 SRS_UNKNOWN_INSTALLED = frozenset(
