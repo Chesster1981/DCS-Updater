@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.86"
+CURRENT_BOT_VERSION = "2.1.87"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1741,7 +1741,8 @@ def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
 
 ANSI_RESET = "\x1b[0m"
 ANSI_GREEN = "\x1b[0;32m"
-ANSI_YELLOW = "\x1b[0;33m"
+# Discord's 0;33 reads as muddy brown/red; 1;33 is bright amber/gold.
+ANSI_YELLOW = "\x1b[1;33m"
 ANSI_RED = "\x1b[0;31m"
 ANSI_GRAY = "\x1b[0;30m"
 
