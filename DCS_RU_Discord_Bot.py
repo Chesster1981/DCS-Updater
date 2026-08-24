@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.87"
+CURRENT_BOT_VERSION = "2.1.88"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1740,10 +1740,10 @@ def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
 
 
 ANSI_RESET = "\x1b[0m"
-ANSI_GREEN = "\x1b[0;32m"
-# Discord's 0;33 reads as muddy brown/red; 1;33 is bright amber/gold.
-ANSI_YELLOW = "\x1b[1;33m"
-ANSI_RED = "\x1b[0;31m"
+# Discord ANSI palette (user-defined): Warning=31, Caution=33, OK=32
+ANSI_OK = "\x1b[0;32m"
+ANSI_CAUTION = "\x1b[0;33m"
+ANSI_WARNING = "\x1b[0;31m"
 ANSI_GRAY = "\x1b[0;30m"
 
 STATUS_GREEN = {STATUS_UP_TO_DATE, "UP TO DATE"}
@@ -1800,33 +1800,33 @@ def format_server_status_box(
 
     status_display = _panel_line(status_text)
     if status_text in STATUS_GREEN:
-        status_display = _ansi(ANSI_GREEN, status_display)
+        status_display = _ansi(ANSI_OK, status_display)
     elif status_text in STATUS_RED:
-        status_display = _ansi(ANSI_RED, status_display)
+        status_display = _ansi(ANSI_WARNING, status_display)
     elif status_text in STATUS_YELLOW:
-        status_display = _ansi(ANSI_YELLOW, status_display)
+        status_display = _ansi(ANSI_CAUTION, status_display)
 
     ver_display = _panel_line(ver_info)
     if _versions_match(ver_info, dcs_latest):
-        ver_display = _ansi(ANSI_GREEN, ver_display)
+        ver_display = _ansi(ANSI_OK, ver_display)
     elif ver_info not in {"Unknown", "UNKNOWN", "—", ""}:
         if dcs_latest and str(dcs_latest) not in {"Unknown", "Fetching...", ""}:
-            ver_display = _ansi(ANSI_YELLOW, ver_display)
+            ver_display = _ansi(ANSI_CAUTION, ver_display)
 
     srs_display = _panel_line(srs_info)
     if _versions_match(srs_info, srs_latest):
-        srs_display = _ansi(ANSI_GREEN, srs_display)
+        srs_display = _ansi(ANSI_OK, srs_display)
     elif srs_info not in {"—", "Unknown", "Not set", ""}:
         if srs_latest and str(srs_latest) not in {"Unknown", "Fetching...", ""}:
-            srs_display = _ansi(ANSI_YELLOW, srs_display)
+            srs_display = _ansi(ANSI_CAUTION, srs_display)
 
     task_display = _panel_line(task_info)
     if task_info in TASK_GREEN:
-        task_display = _ansi(ANSI_GREEN, task_display)
+        task_display = _ansi(ANSI_OK, task_display)
     elif task_info in TASK_RED:
-        task_display = _ansi(ANSI_RED, task_display)
+        task_display = _ansi(ANSI_WARNING, task_display)
     elif task_info in TASK_YELLOW:
-        task_display = _ansi(ANSI_YELLOW, task_display)
+        task_display = _ansi(ANSI_CAUTION, task_display)
 
     rows = [
         f"ℹ️ {status_display}",
