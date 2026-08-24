@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.85"
+CURRENT_BOT_VERSION = "2.1.86"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1739,18 +1739,98 @@ def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
     return cleaned[: width - 1] + "…"
 
 
-def format_server_status_box(status_text: str, ver_info: str, task_info: str, srs_info: str = "—") -> str:
+ANSI_RESET = "\x1b[0m"
+ANSI_GREEN = "\x1b[0;32m"
+ANSI_YELLOW = "\x1b[0;33m"
+ANSI_RED = "\x1b[0;31m"
+ANSI_GRAY = "\x1b[0;30m"
+
+STATUS_GREEN = {STATUS_UP_TO_DATE, "UP TO DATE"}
+STATUS_YELLOW = {
+    "UPDATE READY",
+    STATUS_SRS_OUTDATED,
+    STATUS_SRS_DOWN,
+    "DCS STARTING",
+    "DCS NOT STARTED",
+    "NOT STARTED",
+    "STARTING",
+    STATUS_PAUSED,
+    "PAUSED",
+}
+STATUS_RED = {
+    "DCS DOWN",
+    "OFFLINE",
+    STATUS_SRS_AND_DCS_DOWN,
+    "SRS+DCS DOWN",
+    "UNAUTHORIZED",
+}
+TASK_GREEN = {"Ready"}
+TASK_YELLOW = {"No mission", "Action needed", "Port pending", "Boot pending"}
+TASK_RED = {"Port down", "Crashed", "Stopped"}
+
+
+def _ansi(color: str, text: str) -> str:
+    if not text:
+        return text
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def _versions_match(installed: str, latest: str) -> bool:
+    inst = str(installed or "").strip().lstrip("vV")
+    lat = str(latest or "").strip().lstrip("vV")
+    if not inst or inst in {"Unknown", "UNKNOWN", "—", "-", ""}:
+        return False
+    if not lat or lat in {"Unknown", "Fetching...", "—", "-", ""}:
+        return False
+    return inst == lat
+
+
+def format_server_status_box(
+    status_text: str,
+    ver_info: str,
+    task_info: str,
+    srs_info: str = "—",
+    dcs_latest: str = "",
+    srs_latest: str = "",
+) -> str:
     """Fixed four-line status block so every server tile is the same height."""
     status_text = PANEL_STATUS_SHORT.get(status_text, status_text)
     task_info = PANEL_TASK_SHORT.get(task_info, task_info)
+
+    status_display = _panel_line(status_text)
+    if status_text in STATUS_GREEN:
+        status_display = _ansi(ANSI_GREEN, status_display)
+    elif status_text in STATUS_RED:
+        status_display = _ansi(ANSI_RED, status_display)
+    elif status_text in STATUS_YELLOW:
+        status_display = _ansi(ANSI_YELLOW, status_display)
+
+    ver_display = _panel_line(ver_info)
+    if _versions_match(ver_info, dcs_latest):
+        ver_display = _ansi(ANSI_GREEN, ver_display)
+    elif ver_info not in {"Unknown", "UNKNOWN", "—", ""}:
+        if dcs_latest and str(dcs_latest) not in {"Unknown", "Fetching...", ""}:
+            ver_display = _ansi(ANSI_YELLOW, ver_display)
+
+    srs_display = _panel_line(srs_info)
+    if _versions_match(srs_info, srs_latest):
+        srs_display = _ansi(ANSI_GREEN, srs_display)
+    elif srs_info not in {"—", "Unknown", "Not set", ""}:
+        if srs_latest and str(srs_latest) not in {"Unknown", "Fetching...", ""}:
+            srs_display = _ansi(ANSI_YELLOW, srs_display)
+
     task_display = _panel_line(task_info)
-    # Discord ANSI yellow (no quotes) for the intentional idle task line.
-    if task_info == "No mission":
-        task_display = f"\x1b[33m{task_display}\x1b[0m"
+    if task_info in TASK_GREEN:
+        task_display = _ansi(ANSI_GREEN, task_display)
+    elif task_info in TASK_RED:
+        task_display = _ansi(ANSI_RED, task_display)
+    elif task_info in TASK_YELLOW:
+        task_display = _ansi(ANSI_YELLOW, task_display)
+
     rows = [
-        f"ℹ️ {_panel_line(status_text)}",
-        f"⚙️ {_panel_line(ver_info)}",
-        f"📻 {_panel_line(srs_info)}",
+        f"ℹ️ {status_display}",
+        f"⚙️ {ver_display}",
+        f"📻 {srs_display}",
         f"🖥️ {task_display}",
     ]
     return "```ansi\n" + "\n".join(rows) + "\n```"
@@ -2367,6 +2447,8 @@ class LiveControlPanelView(discord.ui.View):
                 ver_info,
                 task_info,
                 classified.get("srs_info", "—"),
+                dcs_latest=dcs_latest_release,
+                srs_latest=srs_latest_release,
             )
 
             field_name = f"{icon}\u2001{node['name']}\u2001\u2001\u2001\u2001\u2001\u2001"

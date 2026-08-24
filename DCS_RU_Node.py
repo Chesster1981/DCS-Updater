@@ -62,10 +62,19 @@ def _hidden_subprocess_kwargs(capture_output=True):
     return kwargs
 
 
+def _clean_child_env():
+    """Drop PyInstaller/Qt vars so DCS/SRS do not inherit a broken plugin path."""
+    env = os.environ.copy()
+    for key in list(env):
+        if key.startswith(("QT_", "_PYI", "_MEI", "PYINSTALLER")):
+            env.pop(key, None)
+    return env
+
+
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.85"
+CURRENT_NODE_VERSION = "2.1.86"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -942,6 +951,7 @@ def start_dcs_server_process():
             stderr=subprocess.DEVNULL,
             close_fds=True,
             creationflags=flags,
+            env=_clean_child_env(),
         )
         return True
     except Exception as e:
@@ -1287,6 +1297,7 @@ def start_srs_server_process(server_dir: str) -> bool:
             stderr=subprocess.DEVNULL,
             close_fds=True,
             creationflags=flags,
+            env=_clean_child_env(),
         )
         append_activity_log(f"[SRS] Started {os.path.basename(exe_path)}")
         return True
