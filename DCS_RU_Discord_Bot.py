@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.80"
+CURRENT_BOT_VERSION = "2.1.88"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -47,6 +47,7 @@ Use `/dcs-panel-init` to create or restore the live panel at the bottom of this 
 ⚠️ **SRS + DCS DOWN** — both SRS and DCS are down, but DCS has never run (NEVER_STARTED). Caution.
 🛑 **SRS + DCS DOWN** — both SRS and DCS are down after DCS had been running (UNHEALTHY/DEAD). Red.
 ⏸️ **NOT STARTED** — DCS has never been started on the node (intentional idle). Yellow status (update/SRS) overrides this.
+⏸️ **PAUSED** — DCS is up (or idle) with an empty `missionList` in `serverSettings.lua` (no mission loaded). Not a crash.
 ⏳ **STARTING** — DCS process is running, but the port is not answering yet.
 🛑 **DCS DOWN** — DCS had been running and then crashed/stopped (UNHEALTHY/DEAD), while SRS is running.
 🔐 **UNAUTHORIZED** — auth_token does not match between bot and node.
@@ -67,7 +68,7 @@ Bot version — version of this Discord bot
 🔄 **Refresh Server Status** — manually refresh the panel
 🚀 **Select Actions** — after choosing from the dropdown: opens the action menu (start/restart, update, reboot)
 Dropdown **Select server(s)** — pick one or more yellow/red servers. Selection is kept across automatic refresh (every 30 s).
-✅ **All servers operational** — no yellow/red servers right now
+✅ **All servers operational** — every server is green **UP TO DATE**. Any other status (OFFLINE, DCS DOWN, PAUSED, NOT STARTED, update/SRS issues) shows **Select Actions** instead.
 
 **Deploy logic**
 • Only SRS outdated → SRS update only (`TRIGGER_SRS_UPDATE`), DCS is not touched.
@@ -107,11 +108,16 @@ STATUS_UP_TO_DATE = "UP TO DATE"
 STATUS_SRS_OUTDATED = "SRS OUTDATED"
 STATUS_SRS_DOWN = "SRS DOWN"
 STATUS_SRS_AND_DCS_DOWN = "SRS + DCS DOWN"
+STATUS_PAUSED = "DCS PAUSED"
 STATUS_RUNNING = {"UP TO DATE", "UPDATE READY", STATUS_SRS_OUTDATED, STATUS_SRS_DOWN}
 STATUS_DOWN = {"DCS DOWN", "OFFLINE"}
-STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED"}
+STATUS_BOOT = {"DCS STARTING", "DCS NOT STARTED", STATUS_PAUSED}
+# Idle/boot states must not start attention DMs or automatic recovery.
+STATUS_ALERT_RESOLVED = STATUS_RUNNING | STATUS_BOOT
 HEALTH_CRASHED = {"DEAD", "UNHEALTHY"}
 TASK_AWAITING_OPERATOR = "Action required"
+TASK_NO_MISSION = "No mission loaded"
+PANEL_SELECT_EMOJIS = {"⚠️", "🛑", "🔴", "⏸️", "⏳", "🔐"}
 
 PANEL_ACTION_LABELS = {
     "restart_dcs": "Start/Restart DCS",
@@ -770,6 +776,15 @@ class DCSClusterBot(commands.Bot):
         status = snap.get("status_text") or ""
         return status in STATUS_RUNNING
 
+    @staticmethod
+    def _is_status_alert_resolved(snap):
+        """True when a pending down alert can be cancelled (online or intentional idle)."""
+        status = snap.get("status_text") or ""
+        health = str(snap.get("dcs_health") or "").strip().upper()
+        if status in STATUS_ALERT_RESOLVED:
+            return True
+        return health in {"HEALTHY", "PAUSED", "NEVER_STARTED", "STARTING"}
+
     def _log_non_online_status(self, snap, extra="", force=False):
         """Append non-online server status to dcs_ru_server_status.log next to the bot."""
         if snap is None or self._is_server_online(snap):
@@ -845,6 +860,10 @@ class DCSClusterBot(commands.Bot):
         prev_running = prev_status in STATUS_RUNNING or prev_health == "HEALTHY"
         curr_down = curr_status in STATUS_DOWN or curr_health in HEALTH_CRASHED
         crashed = prev_running and curr_down and prev_status not in STATUS_BOOT
+
+        # Intentional idle/pause must never start an attention round.
+        if curr_status in STATUS_BOOT or curr_health in {"PAUSED", "NEVER_STARTED", "STARTING"}:
+            return None
 
         if not left_up_to_date and not crashed:
             return None
@@ -1196,19 +1215,23 @@ class DCSClusterBot(commands.Bot):
                 name = snap.get("name") or key
                 curr_status = snap.get("status_text") or ""
                 online = self._is_server_online(snap)
+                resolved = self._is_status_alert_resolved(snap)
 
                 if not online:
                     self._log_non_online_status(snap)
 
-                if pending and online:
+                if pending and resolved:
                     logger.info(
                         "Cancelling delayed status alert for %s — recovered to %s",
                         name,
                         curr_status,
                     )
                     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    recovered_tag = "ONLINE" if online else (
+                        "IDLE" if curr_status in STATUS_BOOT else curr_status
+                    )
                     self._append_status_log_line(
-                        f"{stamp} | {name} | {curr_status} | recovered=ONLINE"
+                        f"{stamp} | {name} | {curr_status} | recovered={recovered_tag}"
                     )
                     self._pending_status_alerts.pop(key, None)
                     continue
@@ -1254,7 +1277,7 @@ class DCSClusterBot(commands.Bot):
                     )
                     continue
 
-                if online:
+                if resolved:
                     continue
                 text = self._describe_status_alert(prev, snap)
                 if not text:
@@ -1692,6 +1715,7 @@ PANEL_BOX_LINE_WIDTH = 13
 PANEL_STATUS_SHORT = {
     "DCS NOT STARTED": "NOT STARTED",
     "DCS STARTING": "STARTING",
+    "DCS PAUSED": "PAUSED",
     "SRS OUTDATED": "SRS OUTDATED",
     "SRS DOWN": "SRS DOWN",
     "SRS + DCS DOWN": "SRS+DCS DOWN",
@@ -1704,6 +1728,7 @@ PANEL_TASK_SHORT = {
     "DCS_server stopped": "Stopped",
     "Awaiting operator action": "Action needed",
     "Action required": "Action needed",
+    "No mission loaded": "No mission",
 }
 
 
@@ -1714,17 +1739,102 @@ def _panel_line(text: str, width: int = PANEL_BOX_LINE_WIDTH) -> str:
     return cleaned[: width - 1] + "…"
 
 
-def format_server_status_box(status_text: str, ver_info: str, task_info: str, srs_info: str = "—") -> str:
+ANSI_RESET = "\x1b[0m"
+# Discord ANSI palette (user-defined): Warning=31, Caution=33, OK=32
+ANSI_OK = "\x1b[0;32m"
+ANSI_CAUTION = "\x1b[0;33m"
+ANSI_WARNING = "\x1b[0;31m"
+ANSI_GRAY = "\x1b[0;30m"
+
+STATUS_GREEN = {STATUS_UP_TO_DATE, "UP TO DATE"}
+STATUS_YELLOW = {
+    "UPDATE READY",
+    STATUS_SRS_OUTDATED,
+    STATUS_SRS_DOWN,
+    "DCS STARTING",
+    "DCS NOT STARTED",
+    "NOT STARTED",
+    "STARTING",
+    STATUS_PAUSED,
+    "PAUSED",
+}
+STATUS_RED = {
+    "DCS DOWN",
+    "OFFLINE",
+    STATUS_SRS_AND_DCS_DOWN,
+    "SRS+DCS DOWN",
+    "UNAUTHORIZED",
+}
+TASK_GREEN = {"Ready"}
+TASK_YELLOW = {"No mission", "Action needed", "Port pending", "Boot pending"}
+TASK_RED = {"Port down", "Crashed", "Stopped"}
+
+
+def _ansi(color: str, text: str) -> str:
+    if not text:
+        return text
+    return f"{color}{text}{ANSI_RESET}"
+
+
+def _versions_match(installed: str, latest: str) -> bool:
+    inst = str(installed or "").strip().lstrip("vV")
+    lat = str(latest or "").strip().lstrip("vV")
+    if not inst or inst in {"Unknown", "UNKNOWN", "—", "-", ""}:
+        return False
+    if not lat or lat in {"Unknown", "Fetching...", "—", "-", ""}:
+        return False
+    return inst == lat
+
+
+def format_server_status_box(
+    status_text: str,
+    ver_info: str,
+    task_info: str,
+    srs_info: str = "—",
+    dcs_latest: str = "",
+    srs_latest: str = "",
+) -> str:
     """Fixed four-line status block so every server tile is the same height."""
     status_text = PANEL_STATUS_SHORT.get(status_text, status_text)
     task_info = PANEL_TASK_SHORT.get(task_info, task_info)
+
+    status_display = _panel_line(status_text)
+    if status_text in STATUS_GREEN:
+        status_display = _ansi(ANSI_OK, status_display)
+    elif status_text in STATUS_RED:
+        status_display = _ansi(ANSI_WARNING, status_display)
+    elif status_text in STATUS_YELLOW:
+        status_display = _ansi(ANSI_CAUTION, status_display)
+
+    ver_display = _panel_line(ver_info)
+    if _versions_match(ver_info, dcs_latest):
+        ver_display = _ansi(ANSI_OK, ver_display)
+    elif ver_info not in {"Unknown", "UNKNOWN", "—", ""}:
+        if dcs_latest and str(dcs_latest) not in {"Unknown", "Fetching...", ""}:
+            ver_display = _ansi(ANSI_CAUTION, ver_display)
+
+    srs_display = _panel_line(srs_info)
+    if _versions_match(srs_info, srs_latest):
+        srs_display = _ansi(ANSI_OK, srs_display)
+    elif srs_info not in {"—", "Unknown", "Not set", ""}:
+        if srs_latest and str(srs_latest) not in {"Unknown", "Fetching...", ""}:
+            srs_display = _ansi(ANSI_CAUTION, srs_display)
+
+    task_display = _panel_line(task_info)
+    if task_info in TASK_GREEN:
+        task_display = _ansi(ANSI_OK, task_display)
+    elif task_info in TASK_RED:
+        task_display = _ansi(ANSI_WARNING, task_display)
+    elif task_info in TASK_YELLOW:
+        task_display = _ansi(ANSI_CAUTION, task_display)
+
     rows = [
-        f"ℹ️ {_panel_line(status_text)}",
-        f"⚙️ {_panel_line(ver_info)}",
-        f"📻 {_panel_line(srs_info)}",
-        f"🖥️ {_panel_line(task_info)}",
+        f"ℹ️ {status_display}",
+        f"⚙️ {ver_display}",
+        f"📻 {srs_display}",
+        f"🖥️ {task_display}",
     ]
-    return "```yaml\n" + "\n".join(rows) + "\n```"
+    return "```ansi\n" + "\n".join(rows) + "\n```"
 
 
 SRS_UNKNOWN_INSTALLED = frozenset(
@@ -1790,9 +1900,14 @@ def classify_node_answer(answer, srs_latest_release=None):
                 is_outdated = needs_dcs_update or needs_srs_update
                 srs_down = srs_configured and srs_running is False
                 dcs_crashed = dcs_health in HEALTH_CRASHED
+                dcs_paused = dcs_health == "PAUSED"
                 dcs_not_running = dcs_crashed or dcs_health == "NEVER_STARTED"
                 needs_action = (
-                    is_outdated or srs_down or dcs_crashed or dcs_health == "NEVER_STARTED"
+                    is_outdated
+                    or srs_down
+                    or dcs_crashed
+                    or dcs_paused
+                    or dcs_health == "NEVER_STARTED"
                 )
                 ver_info = f"{installed_ver}"
 
@@ -1805,6 +1920,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif dcs_health == "STARTING":
                     # Real wait: process is up, port not ready yet.
                     task_info = "Awaiting DCS port"
+                elif dcs_paused:
+                    task_info = TASK_NO_MISSION
                 elif dcs_health == "NEVER_STARTED" or srs_down or dcs_crashed:
                     # No automatic boot is queued — operator must act.
                     task_info = TASK_AWAITING_OPERATOR
@@ -1832,6 +1949,11 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif dcs_health == "STARTING":
                     status_text = "DCS STARTING"
                     icon = "⏳"
+                elif dcs_paused:
+                    status_text = STATUS_PAUSED
+                    icon = "⏸️"
+                    if active_task == "Idle":
+                        task_info = TASK_NO_MISSION
                 elif dcs_health == "NEVER_STARTED":
                     status_text = "DCS NOT STARTED"
                     icon = "⏸️"
@@ -1857,6 +1979,10 @@ def classify_node_answer(answer, srs_latest_release=None):
     else:
         status_text = "OFFLINE"
         icon = "🔴"
+
+    # Panel actions are available for every non-green server, including OFFLINE.
+    if status_text != STATUS_UP_TO_DATE:
+        needs_action = True
 
     return {
         "status_text": status_text,
@@ -2162,7 +2288,7 @@ class LiveControlPanelView(discord.ui.View):
                         f"{snap.get('status_text', 'Selected')} | Port {node['port']}"
                     )[:100],
                     value=name,
-                    emoji=icon if icon in {"⚠️", "🛑"} else "📌",
+                    emoji=icon if icon in PANEL_SELECT_EMOJIS else "📌",
                     default=True,
                 )
             )
@@ -2312,7 +2438,7 @@ class LiveControlPanelView(discord.ui.View):
                         label=node["name"],
                         description=f"{status_text} | Port {node['port']}",
                         value=node["name"],
-                        emoji=icon if icon in {"⚠️", "🛑"} else "⚠️",
+                        emoji=icon if icon in PANEL_SELECT_EMOJIS else "📌",
                         default=node["name"] in selected_set,
                     )
                 )
@@ -2322,6 +2448,8 @@ class LiveControlPanelView(discord.ui.View):
                 ver_info,
                 task_info,
                 classified.get("srs_info", "—"),
+                dcs_latest=dcs_latest_release,
+                srs_latest=srs_latest_release,
             )
 
             field_name = f"{icon}\u2001{node['name']}\u2001\u2001\u2001\u2001\u2001\u2001"
@@ -2528,6 +2656,7 @@ async def dcs_panel_wiki(interaction: discord.Interaction):
         name="Other icons",
         value=(
             "⏸️ **NOT STARTED** — DCS never started (idle; Action required — no auto-boot)\n"
+            "⏸️ **PAUSED** — empty missionList in serverSettings.lua (no mission loaded)\n"
             "⏳ **STARTING** — process up, port not ready yet (Port pending)\n"
             "🔐 **UNAUTHORIZED** — auth token mismatch\n"
             "🔴 **OFFLINE** — node did not answer"
@@ -2538,7 +2667,7 @@ async def dcs_panel_wiki(interaction: discord.Interaction):
         name="Priority",
         value=(
             "Updates → SRS+DCS DOWN → SRS DOWN → STARTING → "
-            "NOT STARTED → DCS crash → UP TO DATE"
+            "PAUSED → NOT STARTED → DCS crash → UP TO DATE"
         ),
         inline=False,
     )
