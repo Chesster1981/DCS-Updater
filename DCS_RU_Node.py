@@ -64,7 +64,7 @@ def _hidden_subprocess_kwargs(capture_output=True):
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.79"
+CURRENT_NODE_VERSION = "2.1.80"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 
@@ -1307,6 +1307,28 @@ def has_active_rdp_session() -> bool:
     return has_active_rustdesk_session()
 
 
+def rustdesk_session_monitor_loop():
+    """Log RustDesk connect/disconnect so operators can verify detection without rebooting."""
+    last_active = None
+    poll = max(15, RDP_REBOOT_POLL_SECONDS)
+    while node_state.get("is_running", True):
+        try:
+            active = has_active_rustdesk_session()
+            if last_active is None:
+                if active:
+                    append_activity_log("[RUSTDESK] Session detected (already connected).")
+                else:
+                    append_activity_log("[RUSTDESK] No active session.")
+            elif active and not last_active:
+                append_activity_log("[RUSTDESK] Session became active.")
+            elif last_active and not active:
+                append_activity_log("[RUSTDESK] Session ended.")
+            last_active = active
+        except Exception as err:
+            logging.debug("RustDesk session monitor failed: %s", err)
+        time.sleep(poll)
+
+
 def _perform_windows_shutdown(delay_seconds: int, source: str = "remote") -> bool:
     tag = "REMOTE" if source == "remote" else "PROCESS"
     delay = max(0, int(delay_seconds))
@@ -2290,6 +2312,7 @@ get_dcs_versions_local()
 
 threading.Thread(target=github_update_monitor_loop, daemon=True).start()
 threading.Thread(target=dcs_watchdog_loop, daemon=True).start()
+threading.Thread(target=rustdesk_session_monitor_loop, daemon=True).start()
 threading.Thread(target=lambda: get_srs_latest_version_cached(allow_fetch=True), daemon=True).start()
 refresh_dcs_health_state()
 
