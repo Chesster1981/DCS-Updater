@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.88"
+CURRENT_BOT_VERSION = "2.1.89"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -266,6 +266,7 @@ class DCSClusterBot(commands.Bot):
         self._attention_contacted = []
         self._attention_server_names = []
         self._wiki_sessions = {}
+        self._pending_dismiss_tasks = set()
 
     def dismiss_status_message_later(self, message):
         """Delete a transient Discord status message after a short delay."""
@@ -276,10 +277,23 @@ class DCSClusterBot(commands.Bot):
             try:
                 await asyncio.sleep(STATUS_MESSAGE_DISMISS_SECONDS)
                 await message.delete()
-            except Exception:
+            except discord.NotFound:
                 pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to dismiss status message %s: %s",
+                    getattr(message, "id", "?"),
+                    e,
+                )
+            finally:
+                self._pending_dismiss_tasks.discard(task)
 
-        asyncio.create_task(_delete())
+        try:
+            task = asyncio.get_running_loop().create_task(_delete())
+        except RuntimeError:
+            logger.warning("Cannot schedule status message dismiss — no running event loop")
+            return
+        self._pending_dismiss_tasks.add(task)
 
     def load_cluster_config(self):
         data = load_master_config(self.config_path)
@@ -1311,19 +1325,26 @@ class DCSClusterBot(commands.Bot):
 
     async def send_socket_command(self, ip, port, command_str):
         payload = wrap_command(command_str, self.auth_token)
+        writer = None
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, int(port)),
-                timeout=self.socket_timeout,
-            )
-            writer.write(payload.encode("utf-8"))
-            await writer.drain()
-            data = await reader.read(4096)
-            writer.close()
-            await writer.wait_closed()
-            return data.decode("utf-8").strip()
+            async def _exchange():
+                nonlocal writer
+                reader, writer = await asyncio.open_connection(ip, int(port))
+                writer.write(payload.encode("utf-8"))
+                await writer.drain()
+                data = await reader.read(4096)
+                return data.decode("utf-8").strip()
+
+            return await asyncio.wait_for(_exchange(), timeout=self.socket_timeout)
         except Exception:
             return None
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
+                except Exception:
+                    pass
 
     @tasks.loop(seconds=3)
     async def queue_processor_loop(self):
@@ -1463,6 +1484,10 @@ class DCSClusterBot(commands.Bot):
             f"⏳ **[QUEUE]** Connecting to `{name}` for **{action}**..."
         )
         status_messages = [status_msg]
+        if action == "reboot":
+            # Reboot can drop the TCP socket before a reply; start the 10s dismiss
+            # now so the connecting line cannot linger if the exchange hangs.
+            self.dismiss_status_message_later(status_msg)
         try:
             if action in ("update", "update_dcs", "update_srs"):
                 ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
@@ -1532,7 +1557,12 @@ class DCSClusterBot(commands.Bot):
             elif action == "reboot":
                 ans = await self.send_socket_command(node["ip"], node["port"], "REBOOT_WINDOWS")
                 if not ans:
-                    await status_msg.edit(content=f"❌ **[{name}]** Connection timeout.")
+                    await status_msg.edit(
+                        content=(
+                            f"🔁 **[{name}]** Reboot command sent — no reply from node "
+                            "(offline, or already restarting)."
+                        )
+                    )
                 elif "UNKNOWN_COMMAND" in str(ans):
                     await status_msg.edit(content=f"❌ **[{name}]** Node is too old for REBOOT_WINDOWS.")
                 else:

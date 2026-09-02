@@ -74,9 +74,12 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.88"
+CURRENT_NODE_VERSION = "2.1.89"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
+NODE_MAIN_WINDOW_SIZE = "560x580"
+NODE_WINDOW_MIN_WIDTH = 560
+NODE_WINDOW_MIN_HEIGHT = 400
 
 server_socket = None
 listener_thread = None
@@ -2139,9 +2142,27 @@ def force_github_update_check(silent=False):
     return True
 
 
-def show_main_frame(): 
+def fit_root_to_content(content, *, extra_w=40, extra_h=36):
+    """Resize the Node window so `content` (and its widgets) is fully visible."""
+    root.update_idletasks()
+    need_w = max(NODE_WINDOW_MIN_WIDTH, int(content.winfo_reqwidth()) + extra_w)
+    need_h = max(NODE_WINDOW_MIN_HEIGHT, int(content.winfo_reqheight()) + extra_h)
+    try:
+        max_w = max(NODE_WINDOW_MIN_WIDTH, int(root.winfo_screenwidth() * 0.92))
+        max_h = max(NODE_WINDOW_MIN_HEIGHT, int(root.winfo_screenheight() * 0.88))
+    except tk.TclError:
+        max_w, max_h = need_w, need_h
+    width = min(need_w, max_w)
+    height = min(need_h, max_h)
+    root.minsize(NODE_WINDOW_MIN_WIDTH, NODE_WINDOW_MIN_HEIGHT)
+    root.geometry(f"{width}x{height}")
+
+
+def show_main_frame():
     frame_settings.pack_forget()
     frame_main.pack(fill="both", expand=True)
+    root.minsize(NODE_WINDOW_MIN_WIDTH, NODE_WINDOW_MIN_HEIGHT)
+    root.geometry(NODE_MAIN_WINDOW_SIZE)
 
 def show_settings_frame():
     try:
@@ -2167,6 +2188,7 @@ def show_settings_frame():
         v_auto_restart.set(bool(cfg.get("auto_restart_dcs", True)))
         v_defer_rdp.set(bool(cfg.get("defer_reboot_for_rdp", True)))
         frame_settings.pack(fill="both", expand=True, padx=15, pady=10)
+        fit_root_to_content(frame_settings)
     except Exception as err:
         logging.error(f"UI settings frame assembly crashed: {err}")
         messagebox.showerror("UI Error", f"Settings crash prevented. Log: {err}")
@@ -2217,7 +2239,8 @@ def setup_tray_icon():
 # =========================================================================
 root = tk.Tk()
 root.title(f"DCS Norway Remote Updater Node (v{CURRENT_NODE_VERSION})")
-root.geometry("560x580")
+root.geometry(NODE_MAIN_WINDOW_SIZE)
+root.minsize(NODE_WINDOW_MIN_WIDTH, NODE_WINDOW_MIN_HEIGHT)
 root.configure(bg="#1C1C1F")
 
 root.protocol('WM_DELETE_WINDOW', lambda: root.withdraw())
@@ -2409,7 +2432,7 @@ v_defer_rdp = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Defer Windows reboot while RustDesk is connected (5 min after disconnect)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 btn_tray = tk.Frame(frame_settings, bg="#1C1C1F")
-btn_tray.pack(pady=15)
+btn_tray.pack(pady=(20, 24))
 
 tk.Button(btn_tray, text=" 💾 Save & Apply", font=("Arial", 10, "bold"), bg="#1C7430", fg="white", padx=15, command=save_settings_to_file, relief="flat").grid(row=0, column=0, padx=5)
 tk.Button(btn_tray, text="Cancel", font=("Arial", 10), bg="#5A6268", fg="white", padx=15, command=show_main_frame, relief="flat").grid(row=0, column=1, padx=5)
