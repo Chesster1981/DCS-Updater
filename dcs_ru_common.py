@@ -87,6 +87,7 @@ NODE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "dcs_server_exe": "",
     "dcs_server_process_names": [],
     "srs_install_folder": "",
+    "dcs_saved_games_folder": "",
 }
 
 NODE_LOCAL_ONLY_SETTING_KEYS = (
@@ -94,6 +95,7 @@ NODE_LOCAL_ONLY_SETTING_KEYS = (
     "dcs_server_exe",
     "dcs_server_process_names",
     "srs_install_folder",
+    "dcs_saved_games_folder",
 )
 
 NODE_GITHUB_INTERVAL_CHOICES: tuple[tuple[int, str], ...] = (
@@ -195,9 +197,90 @@ def sanitize_node_settings(
                 merged[key] = [str(part).strip() for part in value if str(part).strip()]
         elif key == "bind_address":
             merged[key] = str(value).strip() or "0.0.0.0"
-        elif key in ("dcs_main_folder", "auth_token", "dcs_server_exe", "srs_install_folder"):
+        elif key in (
+            "dcs_main_folder",
+            "auth_token",
+            "dcs_server_exe",
+            "srs_install_folder",
+            "dcs_saved_games_folder",
+        ):
             merged[key] = str(value).strip() if value is not None else ""
     return merged
+
+
+def strip_lua_line_comments(text: str) -> str:
+    """Remove Lua `-- ...` line comments (not block comments)."""
+    lines = []
+    for line in str(text or "").splitlines():
+        in_single = False
+        in_double = False
+        cut = len(line)
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif ch == "-" and not in_single and not in_double:
+                if i + 1 < len(line) and line[i + 1] == "-":
+                    cut = i
+                    break
+            i += 1
+        lines.append(line[:cut])
+    return "\n".join(lines)
+
+
+def extract_lua_table_body(text: str, key: str) -> Optional[str]:
+    """Return the inside of `{...}` assigned to a Lua table key, or None."""
+    cleaned = strip_lua_line_comments(text)
+    patterns = (
+        rf'\["{re.escape(key)}"\]\s*=\s*\{{',
+        rf"\['{re.escape(key)}'\]\s*=\s*\{{",
+        rf"\b{re.escape(key)}\s*=\s*\{{",
+    )
+    start = None
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            start = match.end() - 1
+            break
+    if start is None:
+        return None
+    depth = 0
+    for index, ch in enumerate(cleaned[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return cleaned[start + 1 : index]
+    return None
+
+
+def parse_lua_mission_list(server_settings_text: str) -> Optional[list[str]]:
+    """Parse ["missionList"] entries from serverSettings.lua.
+
+    Returns a list of mission path strings, or None if missionList is missing.
+    """
+    body = extract_lua_table_body(server_settings_text, "missionList")
+    if body is None:
+        return None
+    entries: list[str] = []
+    for match in re.finditer(r'"([^"]+)"|\'([^\']+)\'', body):
+        value = match.group(1) if match.group(1) is not None else match.group(2)
+        text = str(value or "").strip()
+        if text:
+            entries.append(text)
+    return entries
+
+
+def mission_list_is_empty(server_settings_text: str) -> Optional[bool]:
+    """True when missionList exists and has no mission paths; None if unreadable."""
+    entries = parse_lua_mission_list(server_settings_text)
+    if entries is None:
+        return None
+    return len(entries) == 0
 
 
 def wrap_command(command: str, auth_token: Optional[str] = None) -> str:

@@ -35,6 +35,7 @@ from dcs_ru_common import (
     parse_srs_autoconnect_version_line,
     srs_version_is_current,
     SRS_AUTOCONNECT_LUA,
+    mission_list_is_empty,
 )
 from brand_assets import (
     BRAND_ASSET_VERSION,
@@ -61,12 +62,24 @@ def _hidden_subprocess_kwargs(capture_output=True):
     return kwargs
 
 
+def _clean_child_env():
+    """Drop PyInstaller/Qt vars so DCS/SRS do not inherit a broken plugin path."""
+    env = os.environ.copy()
+    for key in list(env):
+        if key.startswith(("QT_", "_PYI", "_MEI", "PYINSTALLER")):
+            env.pop(key, None)
+    return env
+
+
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.80"
+CURRENT_NODE_VERSION = "2.1.92"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
+NODE_MAIN_WINDOW_SIZE = "560x580"
+NODE_WINDOW_MIN_WIDTH = 560
+NODE_WINDOW_MIN_HEIGHT = 400
 
 server_socket = None
 listener_thread = None
@@ -92,8 +105,7 @@ WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
 WATCHDOG_STARTUP_DELAY_SECONDS = 300  # wait one interval after Node boot
 DCS_STARTUP_GRACE_SECONDS = 600  # process may exist minutes before the DCS port opens
 DCS_DOWN_GRACE_SECONDS = 300  # wait before auto-restart after DCS goes unhealthy/dead
-RDP_REBOOT_POLL_SECONDS = 30
-RDP_INACTIVE_REBOOT_DELAY_SECONDS = 300
+RDP_SESSION_POLL_SECONDS = 30
 DCS_PORT_BASE = 10300
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 SRS_PROCESS_IMAGES = ("SR-Server.exe", "SRS-Server.exe", "SR_Server.exe")
@@ -103,6 +115,7 @@ SRS_PRESERVE_FILENAMES = ("server.cfg", "banned.txt")
 DCS_HEALTH_NEVER_STARTED = "NEVER_STARTED"
 DCS_HEALTH_STARTING = "STARTING"
 DCS_HEALTH_HEALTHY = "HEALTHY"
+DCS_HEALTH_PAUSED = "PAUSED"
 DCS_HEALTH_UNHEALTHY = "UNHEALTHY"
 DCS_HEALTH_DEAD = "DEAD"
 
@@ -116,6 +129,7 @@ node_state = {
     "dcs_ever_healthy": False,
     "dcs_process_seen_at": None,
     "dcs_down_since": None,
+    "mission_list_empty": None,
 }
 
 _watchdog_restart_times = []
@@ -751,11 +765,89 @@ def has_dcs_crash_dialog() -> bool:
         return False
 
 
+def resolve_dcs_saved_games_roots(config=None) -> list[str]:
+    """Candidate Saved Games write dirs for this Node (prefer exe-matched folder)."""
+    cfg = config if config is not None else load_node_settings()
+    override = str(cfg.get("dcs_saved_games_folder") or "").strip().strip('"')
+    if override:
+        return [os.path.normpath(override)]
+
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    saved_games = os.path.join(home, "Saved Games")
+    if not os.path.isdir(saved_games):
+        return []
+
+    preferred_names: list[str] = []
+    exe_path = resolve_dcs_server_exe_path(cfg)
+    if exe_path:
+        stem = os.path.splitext(os.path.basename(exe_path))[0]
+        if stem:
+            preferred_names.append(stem)
+    for extra in _config_server_name_extras(cfg):
+        stem = process_name_stem(extra)
+        if stem and stem not in preferred_names:
+            preferred_names.append(stem)
+
+    roots: list[str] = []
+    for name in preferred_names:
+        path = os.path.join(saved_games, name)
+        if os.path.isdir(path) and path not in roots:
+            roots.append(path)
+
+    try:
+        entries = sorted(os.listdir(saved_games))
+    except OSError:
+        entries = []
+    scored: list[tuple[float, str]] = []
+    for name in entries:
+        if not str(name).upper().startswith("DCS"):
+            continue
+        path = os.path.join(saved_games, name)
+        settings = os.path.join(path, "Config", "serverSettings.lua")
+        if not os.path.isfile(settings):
+            continue
+        if path in roots:
+            continue
+        try:
+            mtime = os.path.getmtime(settings)
+        except OSError:
+            mtime = 0.0
+        scored.append((mtime, path))
+    scored.sort(reverse=True)
+    for _mtime, path in scored:
+        roots.append(path)
+    return roots
+
+
+def resolve_server_settings_lua_path(config=None) -> str:
+    """Path to Config/serverSettings.lua for the active DCS write dir."""
+    for root in resolve_dcs_saved_games_roots(config):
+        path = os.path.join(root, "Config", "serverSettings.lua")
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def read_mission_list_empty(config=None) -> bool | None:
+    """True when serverSettings.lua missionList has no missions; None if unknown."""
+    path = resolve_server_settings_lua_path(config)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError as e:
+        logging.debug("Could not read serverSettings.lua (%s): %s", path, e)
+        return None
+    return mission_list_is_empty(text)
+
+
 def evaluate_dcs_health(node_port) -> str:
     """
     Classify DCS server state on every scan (nothing is locked from the first check):
     - HEALTHY: listening port (primary) and no crash dialog
     - STARTING: process seen but port not open yet, and DCS was never healthy this boot
+    - PAUSED: process up / port closed, and missionList is empty (intentional idle)
     - UNHEALTHY: crash dialog, or process alive / port closed after a prior healthy run
     - DEAD: process/port gone after having been healthy before
     - NEVER_STARTED: never seen a dedicated-server process this boot
@@ -764,6 +856,7 @@ def evaluate_dcs_health(node_port) -> str:
     port_up = is_dcs_port_listening(node_port)
     crash_dialog = has_dcs_crash_dialog()
     process_up = is_dcs_server_process_running(config)
+    mission_empty = read_mission_list_empty(config)
 
     if process_up and node_state.get("dcs_process_seen_at") is None:
         node_state["dcs_process_seen_at"] = time.time()
@@ -773,12 +866,20 @@ def evaluate_dcs_health(node_port) -> str:
     if port_up:
         return DCS_HEALTH_HEALTHY
     if process_up:
+        # No mission loaded → intentional pause (port will not answer).
+        if mission_empty is True:
+            return DCS_HEALTH_PAUSED
         if node_state.get("dcs_ever_healthy"):
             return DCS_HEALTH_UNHEALTHY
         seen_at = node_state.get("dcs_process_seen_at") or time.time()
         if time.time() - seen_at < DCS_STARTUP_GRACE_SECONDS:
             return DCS_HEALTH_STARTING
         return DCS_HEALTH_UNHEALTHY
+    # Process gone with an empty mission list after DCS has been seen = intentional idle.
+    if mission_empty is True and (
+        node_state.get("dcs_ever_healthy") or node_state.get("dcs_process_seen_at")
+    ):
+        return DCS_HEALTH_PAUSED
     if node_state.get("dcs_ever_healthy"):
         return DCS_HEALTH_DEAD
     return DCS_HEALTH_NEVER_STARTED
@@ -799,6 +900,7 @@ def refresh_dcs_health_state(node_port=None):
         node_state["dcs_down_since"] = None
     node_state["dcs_health"] = health
     node_state["dcs_running"] = health == DCS_HEALTH_HEALTHY
+    node_state["mission_list_empty"] = read_mission_list_empty()
     return health
 
 
@@ -851,6 +953,7 @@ def start_dcs_server_process():
             stderr=subprocess.DEVNULL,
             close_fds=True,
             creationflags=flags,
+            env=_clean_child_env(),
         )
         return True
     except Exception as e:
@@ -929,9 +1032,13 @@ def execute_dcs_restart(node_port=None, source="watchdog") -> bool:
 
 def attempt_dcs_auto_restart(health: str, node_port) -> bool:
     """Restart DCS only after it was previously healthy (not on fresh boot)."""
-    if health in (DCS_HEALTH_NEVER_STARTED, DCS_HEALTH_STARTING):
+    if health in (
+        DCS_HEALTH_NEVER_STARTED,
+        DCS_HEALTH_STARTING,
+        DCS_HEALTH_PAUSED,
+    ):
         append_activity_log(
-            "[WATCHDOG] DCS has not finished starting since Node boot — skipping auto-restart."
+            f"[WATCHDOG] DCS health is {health} — skipping auto-restart."
         )
         return False
     if not node_state.get("dcs_ever_healthy"):
@@ -991,6 +1098,11 @@ def dcs_watchdog_loop():
                 append_activity_log(
                     f"[WATCHDOG] DCS starting — {describe_running_dcs_server_processes(cfg)}; "
                     f"waiting for port {dcs_port}."
+                )
+            elif health == DCS_HEALTH_PAUSED:
+                append_activity_log(
+                    f"[WATCHDOG] DCS paused — missionList empty in serverSettings.lua "
+                    f"(no auto-restart, port {dcs_port})."
                 )
             elif health == DCS_HEALTH_UNHEALTHY:
                 append_activity_log(
@@ -1187,6 +1299,7 @@ def start_srs_server_process(server_dir: str) -> bool:
             stderr=subprocess.DEVNULL,
             close_fds=True,
             creationflags=flags,
+            env=_clean_child_env(),
         )
         append_activity_log(f"[SRS] Started {os.path.basename(exe_path)}")
         return True
@@ -1310,7 +1423,7 @@ def has_active_rdp_session() -> bool:
 def rustdesk_session_monitor_loop():
     """Log RustDesk connect/disconnect so operators can verify detection without rebooting."""
     last_active = None
-    poll = max(15, RDP_REBOOT_POLL_SECONDS)
+    poll = max(15, RDP_SESSION_POLL_SECONDS)
     while node_state.get("is_running", True):
         try:
             active = has_active_rustdesk_session()
@@ -1356,55 +1469,22 @@ def _perform_windows_shutdown(delay_seconds: int, source: str = "remote") -> boo
         return False
 
 
-def wait_for_rdp_clear_then_reboot(source="remote", shutdown_delay=10) -> bool:
-    """
-    Postpone reboot while RustDesk is connected.
-    After disconnect, wait rdp_inactive_reboot_delay_seconds (default 5 min).
-    """
+def reboot_blocked_by_rdp() -> bool:
+    """True when reboot must be refused because an interactive RustDesk session is active."""
     cfg = load_node_settings()
-    poll = max(15, RDP_REBOOT_POLL_SECONDS)
-    post_clear = max(
-        60,
-        int(cfg.get("rdp_inactive_reboot_delay_seconds", RDP_INACTIVE_REBOOT_DELAY_SECONDS)),
-    )
-    tag = "REMOTE" if source == "remote" else "PROCESS"
-
-    if has_active_rustdesk_session():
-        node_state["active_task"] = "Waiting for RustDesk"
-        append_activity_log(
-            f"[{tag}] Active RustDesk session - postponing Windows reboot."
-        )
-        while has_active_rustdesk_session():
-            time.sleep(poll)
-
-        append_activity_log(
-            f"[{tag}] RustDesk disconnected - waiting {post_clear // 60} min before Windows reboot..."
-        )
-        clear_since = time.time()
-        while True:
-            if has_active_rustdesk_session():
-                append_activity_log(
-                    f"[{tag}] RustDesk reconnected - reboot postponed again."
-                )
-                while has_active_rustdesk_session():
-                    time.sleep(poll)
-                clear_since = time.time()
-                append_activity_log(
-                    f"[{tag}] RustDesk disconnected again - waiting {post_clear // 60} min before reboot..."
-                )
-                continue
-            if time.time() - clear_since >= post_clear:
-                break
-            time.sleep(min(poll, post_clear))
-
-    return _perform_windows_shutdown(shutdown_delay, source=source)
+    return bool(cfg.get("defer_reboot_for_rdp", True)) and has_active_rdp_session()
 
 
 def execute_windows_reboot(source="remote", delay_seconds: int = 10) -> bool:
-    """Schedule a Windows reboot; defer while RustDesk is connected."""
-    cfg = load_node_settings()
-    if bool(cfg.get("defer_reboot_for_rdp", True)):
-        return wait_for_rdp_clear_then_reboot(source=source, shutdown_delay=delay_seconds)
+    """Schedule a Windows reboot, or refuse if RustDesk is connected (someone is working)."""
+    tag = "REMOTE" if source == "remote" else "PROCESS"
+    if reboot_blocked_by_rdp():
+        append_activity_log(
+            f"[{tag}] Reboot refused — active RustDesk session "
+            "(someone is working on the server)."
+        )
+        node_state["active_task"] = "Idle"
+        return False
     return _perform_windows_shutdown(delay_seconds, source=source)
 
 
@@ -1627,7 +1707,11 @@ def execute_deployment_pipeline():
     if reboot_after_deployment:
         append_activity_log(" [PROCESS] Windows reboot is enabled.")
         time.sleep(5)
-        execute_windows_reboot(source="process", delay_seconds=0)
+        if not execute_windows_reboot(source="process", delay_seconds=0):
+            append_activity_log(
+                " [PROCESS] Finished without reboot (blocked by active RustDesk session)."
+            )
+            node_state["active_task"] = "Idle"
     else:
         append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
         node_state["active_task"] = "Idle"
@@ -1692,6 +1776,7 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         "node_version": CURRENT_NODE_VERSION,
                         "dcs_running": dcs_health == DCS_HEALTH_HEALTHY,
                         "dcs_health": dcs_health,
+                        "mission_list_empty": node_state.get("mission_list_empty"),
                         "srs_configured": srs_configured,
                         "srs_running": is_srs_process_running() if srs_configured else False,
                         "srs_installed_version": get_srs_installed_version(),
@@ -1879,6 +1964,19 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         }
                         conn.send((json.dumps(response) + "\n").encode("utf-8"))
                         conn.close()
+                    elif reboot_blocked_by_rdp():
+                        response = {
+                            "status": "REJECTED_RDP",
+                            "message": (
+                                "Active RustDesk session — reboot refused while "
+                                "someone is working on the server."
+                            ),
+                        }
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log(
+                            "[REMOTE] Windows reboot refused — active RustDesk session."
+                        )
                     else:
                         response = {"status": "OK_STARTING"}
                         conn.send((json.dumps(response) + "\n").encode("utf-8"))
@@ -2027,9 +2125,27 @@ def force_github_update_check(silent=False):
     return True
 
 
-def show_main_frame(): 
+def fit_root_to_content(content, *, extra_w=40, extra_h=36):
+    """Resize the Node window so `content` (and its widgets) is fully visible."""
+    root.update_idletasks()
+    need_w = max(NODE_WINDOW_MIN_WIDTH, int(content.winfo_reqwidth()) + extra_w)
+    need_h = max(NODE_WINDOW_MIN_HEIGHT, int(content.winfo_reqheight()) + extra_h)
+    try:
+        max_w = max(NODE_WINDOW_MIN_WIDTH, int(root.winfo_screenwidth() * 0.92))
+        max_h = max(NODE_WINDOW_MIN_HEIGHT, int(root.winfo_screenheight() * 0.88))
+    except tk.TclError:
+        max_w, max_h = need_w, need_h
+    width = min(need_w, max_w)
+    height = min(need_h, max_h)
+    root.minsize(NODE_WINDOW_MIN_WIDTH, NODE_WINDOW_MIN_HEIGHT)
+    root.geometry(f"{width}x{height}")
+
+
+def show_main_frame():
     frame_settings.pack_forget()
     frame_main.pack(fill="both", expand=True)
+    root.minsize(NODE_WINDOW_MIN_WIDTH, NODE_WINDOW_MIN_HEIGHT)
+    root.geometry(NODE_MAIN_WINDOW_SIZE)
 
 def show_settings_frame():
     try:
@@ -2055,6 +2171,7 @@ def show_settings_frame():
         v_auto_restart.set(bool(cfg.get("auto_restart_dcs", True)))
         v_defer_rdp.set(bool(cfg.get("defer_reboot_for_rdp", True)))
         frame_settings.pack(fill="both", expand=True, padx=15, pady=10)
+        fit_root_to_content(frame_settings)
     except Exception as err:
         logging.error(f"UI settings frame assembly crashed: {err}")
         messagebox.showerror("UI Error", f"Settings crash prevented. Log: {err}")
@@ -2105,7 +2222,8 @@ def setup_tray_icon():
 # =========================================================================
 root = tk.Tk()
 root.title(f"DCS Norway Remote Updater Node (v{CURRENT_NODE_VERSION})")
-root.geometry("560x580")
+root.geometry(NODE_MAIN_WINDOW_SIZE)
+root.minsize(NODE_WINDOW_MIN_WIDTH, NODE_WINDOW_MIN_HEIGHT)
 root.configure(bg="#1C1C1F")
 
 root.protocol('WM_DELETE_WINDOW', lambda: root.withdraw())
@@ -2294,10 +2412,10 @@ v_auto_restart = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Auto-restart DCS only after it was previously running", variable=v_auto_restart, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 v_defer_rdp = tk.BooleanVar()
-tk.Checkbutton(frame_settings, text="Defer Windows reboot while RustDesk is connected (5 min after disconnect)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+tk.Checkbutton(frame_settings, text="Block Windows reboot while RustDesk is connected (someone is working)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 btn_tray = tk.Frame(frame_settings, bg="#1C1C1F")
-btn_tray.pack(pady=15)
+btn_tray.pack(pady=(20, 24))
 
 tk.Button(btn_tray, text=" 💾 Save & Apply", font=("Arial", 10, "bold"), bg="#1C7430", fg="white", padx=15, command=save_settings_to_file, relief="flat").grid(row=0, column=0, padx=5)
 tk.Button(btn_tray, text="Cancel", font=("Arial", 10), bg="#5A6268", fg="white", padx=15, command=show_main_frame, relief="flat").grid(row=0, column=1, padx=5)

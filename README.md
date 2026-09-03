@@ -102,11 +102,25 @@ In the Control Panel: right-click a server row for **Start / Restart DCS**, **St
 | `CHECK_NODE_UPDATE` | Force immediate GitHub Node self-update check |
 | `OPERATOR_RESTART_DCS` | Start/restart DCS (no hourly auto-restart limit) |
 | `RESTART_SRS` | Start/restart SRS Server |
-| `REBOOT_WINDOWS` | Schedule host reboot (~10s) |
+| `REBOOT_WINDOWS` | Schedule host reboot (~10s), or `REJECTED_RDP` if RustDesk is connected |
 | `EXIT_NODE` | `ACK_EXIT` (localhost + auth when a token is set) |
 
 With auth: `mytoken|PING_STATUS`
 
 ## PyInstaller
+
+Node and Control Panel **must** ship as Windows `.exe` on every GitHub release (they self-update from those assets).
+
+On the Linux cloud agent:
+
+```bash
+# once per environment
+sudo dpkg --add-architecture i386 && sudo apt-get update
+sudo apt-get install -y wine64 wine32:i386 xvfb
+bash tools/setup_wine_python.sh   # Wine + Python 3.13.5 + PyInstaller 6.22.0 + PySide6 6.8.3
+
+# every release
+bash tools/build_windows_exes.sh  # writes dist/*.exe
+```
 
 When building an exe, include `dcs_ru_common.py` (e.g. `--hidden-import=dcs_ru_common`, or ship the file next to the entrypoint).
