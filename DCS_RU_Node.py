@@ -74,7 +74,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.90"
+CURRENT_NODE_VERSION = "2.1.91"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -105,8 +105,7 @@ WATCHDOG_DEFAULT_INTERVAL = 300  # 5 minutes
 WATCHDOG_STARTUP_DELAY_SECONDS = 300  # wait one interval after Node boot
 DCS_STARTUP_GRACE_SECONDS = 600  # process may exist minutes before the DCS port opens
 DCS_DOWN_GRACE_SECONDS = 300  # wait before auto-restart after DCS goes unhealthy/dead
-RDP_REBOOT_POLL_SECONDS = 30
-RDP_INACTIVE_REBOOT_DELAY_SECONDS = 300
+RDP_SESSION_POLL_SECONDS = 30
 DCS_PORT_BASE = 10300
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 SRS_PROCESS_IMAGES = ("SR-Server.exe", "SRS-Server.exe", "SR_Server.exe")
@@ -1424,7 +1423,7 @@ def has_active_rdp_session() -> bool:
 def rustdesk_session_monitor_loop():
     """Log RustDesk connect/disconnect so operators can verify detection without rebooting."""
     last_active = None
-    poll = max(15, RDP_REBOOT_POLL_SECONDS)
+    poll = max(15, RDP_SESSION_POLL_SECONDS)
     while node_state.get("is_running", True):
         try:
             active = has_active_rustdesk_session()
@@ -1470,55 +1469,22 @@ def _perform_windows_shutdown(delay_seconds: int, source: str = "remote") -> boo
         return False
 
 
-def wait_for_rdp_clear_then_reboot(source="remote", shutdown_delay=10) -> bool:
-    """
-    Postpone reboot while RustDesk is connected.
-    After disconnect, wait rdp_inactive_reboot_delay_seconds (default 5 min).
-    """
+def reboot_blocked_by_rdp() -> bool:
+    """True when reboot must be refused because an interactive RustDesk session is active."""
     cfg = load_node_settings()
-    poll = max(15, RDP_REBOOT_POLL_SECONDS)
-    post_clear = max(
-        60,
-        int(cfg.get("rdp_inactive_reboot_delay_seconds", RDP_INACTIVE_REBOOT_DELAY_SECONDS)),
-    )
-    tag = "REMOTE" if source == "remote" else "PROCESS"
-
-    if has_active_rustdesk_session():
-        node_state["active_task"] = "Waiting for RustDesk"
-        append_activity_log(
-            f"[{tag}] Active RustDesk session - postponing Windows reboot."
-        )
-        while has_active_rustdesk_session():
-            time.sleep(poll)
-
-        append_activity_log(
-            f"[{tag}] RustDesk disconnected - waiting {post_clear // 60} min before Windows reboot..."
-        )
-        clear_since = time.time()
-        while True:
-            if has_active_rustdesk_session():
-                append_activity_log(
-                    f"[{tag}] RustDesk reconnected - reboot postponed again."
-                )
-                while has_active_rustdesk_session():
-                    time.sleep(poll)
-                clear_since = time.time()
-                append_activity_log(
-                    f"[{tag}] RustDesk disconnected again - waiting {post_clear // 60} min before reboot..."
-                )
-                continue
-            if time.time() - clear_since >= post_clear:
-                break
-            time.sleep(min(poll, post_clear))
-
-    return _perform_windows_shutdown(shutdown_delay, source=source)
+    return bool(cfg.get("defer_reboot_for_rdp", True)) and has_active_rdp_session()
 
 
 def execute_windows_reboot(source="remote", delay_seconds: int = 10) -> bool:
-    """Schedule a Windows reboot; defer while RustDesk is connected."""
-    cfg = load_node_settings()
-    if bool(cfg.get("defer_reboot_for_rdp", True)):
-        return wait_for_rdp_clear_then_reboot(source=source, shutdown_delay=delay_seconds)
+    """Schedule a Windows reboot, or refuse if RustDesk is connected (someone is working)."""
+    tag = "REMOTE" if source == "remote" else "PROCESS"
+    if reboot_blocked_by_rdp():
+        append_activity_log(
+            f"[{tag}] Reboot refused — active RustDesk session "
+            "(someone is working on the server)."
+        )
+        node_state["active_task"] = "Idle"
+        return False
     return _perform_windows_shutdown(delay_seconds, source=source)
 
 
@@ -1741,7 +1707,11 @@ def execute_deployment_pipeline():
     if reboot_after_deployment:
         append_activity_log(" [PROCESS] Windows reboot is enabled.")
         time.sleep(5)
-        execute_windows_reboot(source="process", delay_seconds=0)
+        if not execute_windows_reboot(source="process", delay_seconds=0):
+            append_activity_log(
+                " [PROCESS] Finished without reboot (blocked by active RustDesk session)."
+            )
+            node_state["active_task"] = "Idle"
     else:
         append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
         node_state["active_task"] = "Idle"
@@ -1994,6 +1964,19 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         }
                         conn.send((json.dumps(response) + "\n").encode("utf-8"))
                         conn.close()
+                    elif reboot_blocked_by_rdp():
+                        response = {
+                            "status": "REJECTED_RDP",
+                            "message": (
+                                "Active RustDesk session — reboot refused while "
+                                "someone is working on the server."
+                            ),
+                        }
+                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log(
+                            "[REMOTE] Windows reboot refused — active RustDesk session."
+                        )
                     else:
                         response = {"status": "OK_STARTING"}
                         conn.send((json.dumps(response) + "\n").encode("utf-8"))
@@ -2429,7 +2412,7 @@ v_auto_restart = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Auto-restart DCS only after it was previously running", variable=v_auto_restart, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 v_defer_rdp = tk.BooleanVar()
-tk.Checkbutton(frame_settings, text="Defer Windows reboot while RustDesk is connected (5 min after disconnect)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
+tk.Checkbutton(frame_settings, text="Block Windows reboot while RustDesk is connected (someone is working)", variable=v_defer_rdp, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)
 
 btn_tray = tk.Frame(frame_settings, bg="#1C1C1F")
 btn_tray.pack(pady=(20, 24))

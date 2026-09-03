@@ -102,7 +102,7 @@ In the Control Panel: right-click a server row for **Start / Restart DCS**, **St
 | `CHECK_NODE_UPDATE` | Force immediate GitHub Node self-update check |
 | `OPERATOR_RESTART_DCS` | Start/restart DCS (no hourly auto-restart limit) |
 | `RESTART_SRS` | Start/restart SRS Server |
-| `REBOOT_WINDOWS` | Schedule host reboot (~10s) |
+| `REBOOT_WINDOWS` | Schedule host reboot (~10s), or `REJECTED_RDP` if RustDesk is connected |
 | `EXIT_NODE` | `ACK_EXIT` (localhost + auth when a token is set) |
 
 With auth: `mytoken|PING_STATUS`

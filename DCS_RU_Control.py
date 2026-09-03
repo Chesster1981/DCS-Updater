@@ -60,7 +60,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.1.90"
+CONTROL_PANEL_VERSION = "2.1.91"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -691,7 +691,8 @@ class MainWindow(QMainWindow):
                 "Reboot Windows",
                 confirm_text=(
                     f"Reboot Windows on '{name}'?\n\n"
-                    "The host will restart in about 10 seconds."
+                    "The host will restart in about 10 seconds.\n"
+                    "If RustDesk is connected, the reboot will be refused."
                 ),
             )
 
@@ -746,6 +747,12 @@ class MainWindow(QMainWindow):
                 if status == "REJECTED_BUSY":
                     global_signals.append_log.emit(
                         f" [ ⚠️ {n}] Node busy: {res.get('task', 'unknown')}"
+                    )
+                    return
+                if status == "REJECTED_RDP":
+                    global_signals.append_log.emit(
+                        f" [ ⚠️ {n}] Reboot refused — RustDesk session active "
+                        "(someone is working on the server)."
                     )
                     return
                 if status == "ERROR":
@@ -1050,7 +1057,7 @@ class MainWindow(QMainWindow):
         self.chk_reboot = QCheckBox("Reboot Windows after DCS update completes")
         self.chk_watchdog = QCheckBox("Watch DCS server health (process + port)")
         self.chk_auto_restart = QCheckBox("Auto-restart DCS only after it was previously running")
-        self.chk_defer_rdp = QCheckBox("Defer Windows reboot while RustDesk is connected (5 min after disconnect)")
+        self.chk_defer_rdp = QCheckBox("Block Windows reboot while RustDesk is connected (someone is working)")
         for chk in (self.chk_preserve, self.chk_reboot, self.chk_watchdog, self.chk_auto_restart, self.chk_defer_rdp):
             chk.setChecked(True)
 

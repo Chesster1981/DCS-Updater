@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.90"
+CURRENT_BOT_VERSION = "2.1.91"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1571,6 +1571,20 @@ class DCSClusterBot(commands.Bot):
                         if res.get("status") == "OK_STARTING":
                             await status_msg.edit(
                                 content=f"🔁 **[{name}]** Windows reboot scheduled."
+                            )
+                        elif res.get("status") == "REJECTED_RDP":
+                            await status_msg.edit(
+                                content=(
+                                    f"⚠️ **[{name}]** Reboot refused — RustDesk session "
+                                    "active (someone is working on the server)."
+                                )
+                            )
+                        elif res.get("status") == "REJECTED_BUSY":
+                            await status_msg.edit(
+                                content=(
+                                    f"⚠️ **[{name}]** Reboot refused — node busy: "
+                                    f"`{res.get('task', 'unknown')}`."
+                                )
                             )
                         else:
                             await status_msg.edit(
