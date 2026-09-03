@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.91"
+CURRENT_BOT_VERSION = "2.1.92"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -77,10 +77,11 @@ Dropdown **Select server(s)** — pick one or more yellow/red servers. Selection
 • Idle server (DCS not started) can still receive an SRS update.
 • SRS DOWN alone (without a version mismatch) can be restarted from the panel (Restart SRS).
 • Yellow/red status enables the action button: Update, Restart DCS, Restart SRS, or Reboot.
+• **RustDesk active** — all Discord actions (update/restart/reboot) and automatic DCS restart are suspended while someone is connected remotely.
 
 **DM alerts (attention round)**
 Sent on **OFFLINE** and **DCS DOWN** (crash) — not when SRS is down or when a new DCS/SRS release becomes available.
-Flow: 5 min grace → automatic DCS restart via node → 10 min wait → DM channel members if the server is still not online.
+Flow: 5 min grace → automatic DCS restart via node (skipped while RustDesk is active) → 10 min wait → DM channel members if the server is still not online.
 
 **Slash commands**
 `/dcs-panel-wiki` — temporary status-logic explanation (removed when you switch channel, close Discord, or press Close).
@@ -828,6 +829,33 @@ class DCSClusterBot(commands.Bot):
             parts.append(extra)
         self._append_status_log_line(" | ".join(parts))
 
+    @staticmethod
+    def ping_has_active_rdp(answer) -> bool:
+        """True when Node reports an active RustDesk remote session."""
+        if not answer or not str(answer).startswith("{"):
+            return False
+        try:
+            return bool(json.loads(answer).get("rdp_session_active"))
+        except Exception:
+            return False
+
+    async def _node_has_active_rdp(self, ip, port) -> bool:
+        if not ip or not port:
+            return False
+        answer = await self.send_socket_command(ip, port, "PING_STATUS")
+        return self.ping_has_active_rdp(answer)
+
+    async def _partition_nodes_by_rdp(self, nodes):
+        """Split nodes into (allowed, blocked_names) based on live RustDesk state."""
+        allowed = []
+        blocked = []
+        for node in nodes:
+            if await self._node_has_active_rdp(node.get("ip"), node.get("port")):
+                blocked.append(node["name"])
+            else:
+                allowed.append(node)
+        return allowed, blocked
+
     async def _request_node_restart(self, snap):
         name = snap.get("name") or snap.get("key") or "unknown"
         ip = snap.get("ip")
@@ -837,6 +865,13 @@ class DCSClusterBot(commands.Bot):
             logger.warning("Cannot restart %s — missing ip/port", name)
             self._log_non_online_status(snap, extra="restart=skipped_no_address", force=True)
             return "missing-address"
+        if await self._node_has_active_rdp(ip, port):
+            logger.info(
+                "Auto-restart suspended for %s — RustDesk session active",
+                name,
+            )
+            self._log_non_online_status(snap, extra="restart=suspended_rdp", force=True)
+            return "suspended_rdp"
         logger.info("Requesting DCS restart on %s (%s:%s)", name, ip, port)
         answer = await self.send_socket_command(ip, port, "RESTART_DCS")
         if not answer:
@@ -1261,10 +1296,18 @@ class DCSClusterBot(commands.Bot):
                             "Grace period elapsed for %s — requesting DCS restart",
                             name,
                         )
+                        restart_result = await self._request_node_restart(snap)
+                        if restart_result == "suspended_rdp":
+                            # Keep waiting in grace until RustDesk disconnects.
+                            logger.info(
+                                "Keeping %s in grace — Discord actions suspended "
+                                "while RustDesk is active",
+                                name,
+                            )
+                            continue
                         pending["phase"] = "restart_wait"
                         pending["restart_at"] = now
                         pending["restart_attempted"] = True
-                        await self._request_node_restart(snap)
                         continue
 
                     restart_elapsed = now - pending.get("restart_at", pending["started_at"])
@@ -1489,8 +1532,17 @@ class DCSClusterBot(commands.Bot):
             # now so the connecting line cannot linger if the exchange hangs.
             self.dismiss_status_message_later(status_msg)
         try:
+            ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
+            if self.ping_has_active_rdp(ping):
+                await status_msg.edit(
+                    content=(
+                        f"⚠️ **[{name}]** Action suspended — RustDesk session active "
+                        "(someone is working on the server)."
+                    )
+                )
+                return
+
             if action in ("update", "update_dcs", "update_srs"):
-                ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
                 classified = classify_node_answer(ping, srs_latest_release=srs_latest)
                 needs_dcs = classified.get("needs_dcs_update", False)
                 needs_srs = classified.get("needs_srs_update", False)
@@ -1773,6 +1825,7 @@ PANEL_TASK_SHORT = {
     "Awaiting operator action": "Action needed",
     "Action required": "Action needed",
     "No mission loaded": "No mission",
+    "RustDesk active": "RustDesk",
 }
 
 
@@ -1810,7 +1863,7 @@ STATUS_RED = {
     "UNAUTHORIZED",
 }
 TASK_GREEN = {"Ready"}
-TASK_YELLOW = {"No mission", "Action needed", "Port pending", "Boot pending"}
+TASK_YELLOW = {"No mission", "Action needed", "Port pending", "Boot pending", "RustDesk"}
 TASK_RED = {"Port down", "Crashed", "Stopped"}
 
 
@@ -1911,6 +1964,7 @@ def classify_node_answer(answer, srs_latest_release=None):
     dcs_health = ""
     dcs_running = None
     srs_running = None
+    rdp_session_active = False
 
     if answer and answer.startswith("{"):
         try:
@@ -1924,6 +1978,7 @@ def classify_node_answer(answer, srs_latest_release=None):
                 dcs_health = str(res.get("dcs_health", "")).strip().upper()
                 dcs_running = res.get("dcs_running", True)
                 active_task = res.get("active_task", "Idle")
+                rdp_session_active = bool(res.get("rdp_session_active"))
                 srs_installed_raw = str(res.get("srs_installed_version") or "").strip()
                 srs_configured = bool(res.get("srs_configured", True))
                 srs_running = bool(res.get("srs_running", False)) if srs_configured else None
@@ -1961,6 +2016,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                     task_info = "Restarting SRS"
                 elif active_task != "Idle":
                     task_info = active_task
+                elif rdp_session_active:
+                    task_info = "RustDesk active"
                 elif dcs_health == "STARTING":
                     # Real wait: process is up, port not ready yet.
                     task_info = "Awaiting DCS port"
@@ -1983,12 +2040,12 @@ def classify_node_answer(answer, srs_latest_release=None):
                     status_text = STATUS_SRS_AND_DCS_DOWN
                     # Red only if DCS has run before and then failed.
                     icon = "🛑" if dcs_crashed else "⚠️"
-                    if active_task == "Idle":
+                    if active_task == "Idle" and not rdp_session_active:
                         task_info = TASK_AWAITING_OPERATOR
                 elif srs_down:
                     status_text = STATUS_SRS_DOWN
                     icon = "⚠️"
-                    if active_task == "Idle":
+                    if active_task == "Idle" and not rdp_session_active:
                         task_info = TASK_AWAITING_OPERATOR
                 elif dcs_health == "STARTING":
                     status_text = "DCS STARTING"
@@ -1996,12 +2053,12 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif dcs_paused:
                     status_text = STATUS_PAUSED
                     icon = "⏸️"
-                    if active_task == "Idle":
+                    if active_task == "Idle" and not rdp_session_active:
                         task_info = TASK_NO_MISSION
                 elif dcs_health == "NEVER_STARTED":
                     status_text = "DCS NOT STARTED"
                     icon = "⏸️"
-                    if active_task == "Idle":
+                    if active_task == "Idle" and not rdp_session_active:
                         task_info = TASK_AWAITING_OPERATOR
                 elif dcs_crashed:
                     status_text = "DCS DOWN"
@@ -2017,6 +2074,9 @@ def classify_node_answer(answer, srs_latest_release=None):
                 else:
                     status_text = STATUS_UP_TO_DATE
                     icon = "🟢"
+
+                if rdp_session_active and active_task == "Idle":
+                    task_info = "RustDesk active"
         except Exception:
             status_text = "OFFLINE"
             icon = "🔴"
@@ -2042,6 +2102,7 @@ def classify_node_answer(answer, srs_latest_release=None):
         "dcs_health": dcs_health,
         "dcs_running": dcs_running,
         "srs_running": srs_running,
+        "rdp_session_active": rdp_session_active,
     }
 
 
@@ -2116,14 +2177,38 @@ class PanelActionPickerView(discord.ui.View):
             await interaction.response.edit_message(
                 content=(
                     f"⚠️ Confirm **Reboot Server** for **{names}**?\n"
-                    "This will reboot the host OS in ~10 seconds."
+                    "This will reboot the host OS in ~10 seconds.\n"
+                    "Suspended automatically if RustDesk is connected."
                 ),
                 view=confirm,
             )
             return
 
-        await interaction.response.edit_message(
-            content=f"Queued **{action_label}** for **{names}**.",
+        await interaction.response.defer()
+        allowed, blocked = await self.bot._partition_nodes_by_rdp(self.nodes)
+        if blocked and not allowed:
+            await interaction.edit_original_response(
+                content=(
+                    f"⚠️ **{action_label}** suspended — RustDesk session active on: "
+                    f"**{', '.join(blocked)}**."
+                ),
+                view=None,
+            )
+            try:
+                self.bot.dismiss_status_message_later(await interaction.original_response())
+            except Exception:
+                pass
+            self.stop()
+            return
+
+        queued_names = ", ".join(n["name"] for n in allowed)
+        note = ""
+        if blocked:
+            note = (
+                f"\n⚠️ Skipped (RustDesk active): **{', '.join(blocked)}**."
+            )
+        await interaction.edit_original_response(
+            content=f"Queued **{action_label}** for **{queued_names}**.{note}",
             view=None,
         )
         try:
@@ -2131,10 +2216,10 @@ class PanelActionPickerView(discord.ui.View):
         except Exception:
             pass
         log_msg = await self.channel.send(
-            f"🚨 **[ACTION LOG]** {action_label} for: **{names}**."
+            f"🚨 **[ACTION LOG]** {action_label} for: **{queued_names}**."
         )
         self.bot.dismiss_status_message_later(log_msg)
-        for node in self.nodes:
+        for node in allowed:
             await self.bot.deployment_queue.put(
                 {"node": node, "channel": self.channel, "action": action}
             )
@@ -2153,10 +2238,30 @@ class RebootConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Confirm reboot", style=discord.ButtonStyle.danger)
     async def btn_confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        names = ", ".join(n["name"] for n in self.nodes)
         action_label = PANEL_ACTION_LABELS["reboot"]
-        await interaction.response.edit_message(
-            content=f"Queued **{action_label}** for **{names}**.",
+        await interaction.response.defer()
+        allowed, blocked = await self.bot._partition_nodes_by_rdp(self.nodes)
+        if blocked and not allowed:
+            await interaction.edit_original_response(
+                content=(
+                    f"⚠️ **{action_label}** suspended — RustDesk session active on: "
+                    f"**{', '.join(blocked)}**."
+                ),
+                view=None,
+            )
+            try:
+                self.bot.dismiss_status_message_later(await interaction.original_response())
+            except Exception:
+                pass
+            self.stop()
+            return
+
+        queued_names = ", ".join(n["name"] for n in allowed)
+        note = ""
+        if blocked:
+            note = f"\n⚠️ Skipped (RustDesk active): **{', '.join(blocked)}**."
+        await interaction.edit_original_response(
+            content=f"Queued **{action_label}** for **{queued_names}**.{note}",
             view=None,
         )
         try:
@@ -2164,10 +2269,10 @@ class RebootConfirmView(discord.ui.View):
         except Exception:
             pass
         log_msg = await self.channel.send(
-            f"🚨 **[ACTION LOG]** {action_label} for: **{names}**."
+            f"🚨 **[ACTION LOG]** {action_label} for: **{queued_names}**."
         )
         self.bot.dismiss_status_message_later(log_msg)
-        for node in self.nodes:
+        for node in allowed:
             await self.bot.deployment_queue.put(
                 {"node": node, "channel": self.channel, "action": "reboot"}
             )
@@ -2721,7 +2826,8 @@ async def dcs_panel_wiki(interaction: discord.Interaction):
             "Use **Select server(s)**, then **Select Actions**:\n"
             "• **Start/Restart DCS** / **Start/Restart SRS**\n"
             "• **Update DCS** / **Update SRS**\n"
-            "• **Reboot Server** (confirmation required)"
+            "• **Reboot Server** (confirmation required)\n"
+            "• Task **RustDesk** — all Discord actions + auto-restart are suspended"
         ),
         inline=False,
     )
