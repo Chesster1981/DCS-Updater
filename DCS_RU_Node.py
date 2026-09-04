@@ -74,7 +74,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.92"
+CURRENT_NODE_VERSION = "2.1.93"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -1400,19 +1400,176 @@ def _iter_rustdesk_command_lines():
         logging.debug("RustDesk CIM scan failed: %s", err)
 
 
+_RUSTDESK_CM_ARG = re.compile(
+    r"(?:^|[\s\"'])--cm(?:-no-ui)?(?:[\s\"']|$)", re.IGNORECASE
+)
+_RUSTDESK_INFRA_PORTS = frozenset(range(21114, 21120))
+_NETSTAT_ESTABLISHED_STATES = frozenset({"ESTABLISHED", "ETABLERT"})
+
+
+def _parse_wmic_process_ids(text: str):
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.lower().startswith("processid="):
+            continue
+        raw = stripped.split("=", 1)[1].strip()
+        if raw.isdigit():
+            yield int(raw)
+
+
+def _iter_rustdesk_pids():
+    """Yield PIDs for running rustdesk.exe processes."""
+    if sys.platform != "win32":
+        return
+    try:
+        proc = subprocess.run(
+            [
+                "wmic",
+                "process",
+                "where",
+                "name='rustdesk.exe'",
+                "get",
+                "ProcessId",
+                "/VALUE",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            encoding="utf-8",
+            errors="replace",
+            **_hidden_subprocess_kwargs(capture_output=True),
+        )
+        pids = list(_parse_wmic_process_ids(f"{proc.stdout or ''}\n{proc.stderr or ''}"))
+        if pids or proc.returncode == 0:
+            for pid in pids:
+                yield pid
+            return
+    except Exception as err:
+        logging.debug("RustDesk WMIC PID scan failed: %s", err)
+
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_Process -Filter \"Name='rustdesk.exe'\").ProcessId",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            encoding="utf-8",
+            errors="replace",
+            **_hidden_subprocess_kwargs(capture_output=True),
+        )
+        for line in (proc.stdout or "").splitlines():
+            raw = line.strip()
+            if raw.isdigit():
+                yield int(raw)
+    except Exception as err:
+        logging.debug("RustDesk CIM PID scan failed: %s", err)
+
+
+def _split_ip_port(endpoint: str):
+    text = str(endpoint or "").strip()
+    if not text:
+        return "", 0
+    if text.startswith("["):
+        close = text.find("]")
+        if close > 1 and close + 1 < len(text) and text[close + 1] == ":":
+            port_raw = text[close + 2 :]
+            if port_raw.isdigit():
+                return text[1:close], int(port_raw)
+            return text[1:close], 0
+    host, sep, port_raw = text.rpartition(":")
+    if sep and port_raw.isdigit():
+        return host, int(port_raw)
+    return text, 0
+
+
+def _is_loopback_host(host: str) -> bool:
+    name = str(host or "").strip("[]").lower()
+    return name in {"127.0.0.1", "::1", "0.0.0.0", "::"} or name.startswith("127.")
+
+
+def _count_rustdesk_sessions_from_netstat(pids) -> int:
+    """
+    Estimate connected operators from ESTABLISHED TCP owned by rustdesk.exe.
+
+    Direct/P2P: unique remote IPs on non-infra ports.
+    Relayed: one ESTABLISHED connection to remote port 21117 per session.
+    """
+    pid_set = {int(pid) for pid in (pids or []) if int(pid) > 0}
+    if not pid_set:
+        return 0
+    try:
+        proc = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            encoding="utf-8",
+            errors="replace",
+            **_hidden_subprocess_kwargs(capture_output=True),
+        )
+        text = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    except Exception as err:
+        logging.debug("RustDesk netstat scan failed: %s", err)
+        return 0
+
+    p2p_ips = set()
+    relay_conns = 0
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        state = parts[-2].upper()
+        if state not in _NETSTAT_ESTABLISHED_STATES:
+            continue
+        pid_raw = parts[-1]
+        if not pid_raw.isdigit() or int(pid_raw) not in pid_set:
+            continue
+        _local_host, local_port = _split_ip_port(parts[1])
+        remote_host, remote_port = _split_ip_port(parts[2])
+        if _is_loopback_host(remote_host):
+            continue
+        if remote_port == 21117:
+            relay_conns += 1
+            continue
+        if remote_port in _RUSTDESK_INFRA_PORTS or local_port in _RUSTDESK_INFRA_PORTS:
+            continue
+        if remote_host:
+            p2p_ips.add(remote_host)
+    return len(p2p_ips) + relay_conns
+
+
+def count_active_rustdesk_sessions() -> int:
+    """
+    Number of connected RustDesk operators.
+    Connection Manager (`--cm`) means at least one session; netstat refines the count.
+    """
+    if sys.platform != "win32":
+        return 0
+    cm_count = 0
+    for cmdline in _iter_rustdesk_command_lines():
+        if _RUSTDESK_CM_ARG.search(cmdline):
+            cm_count += 1
+    if cm_count <= 0:
+        return 0
+    try:
+        net_count = _count_rustdesk_sessions_from_netstat(list(_iter_rustdesk_pids()))
+    except Exception as err:
+        logging.debug("RustDesk session count failed: %s", err)
+        net_count = 0
+    return max(cm_count, net_count, 1)
+
+
 def has_active_rustdesk_session() -> bool:
     """
     True when RustDesk Connection Manager is running.
     RustDesk starts `rustdesk.exe --cm` / `--cm-no-ui` only while a remote client is connected.
     """
-    if sys.platform != "win32":
-        return False
-    # Official flags: --cm and --cm-no-ui (connection manager).
-    cm_arg = re.compile(r"(?:^|[\s\"'])--cm(?:-no-ui)?(?:[\s\"']|$)", re.IGNORECASE)
-    for cmdline in _iter_rustdesk_command_lines():
-        if cm_arg.search(cmdline):
-            return True
-    return False
+    return count_active_rustdesk_sessions() > 0
 
 
 def has_active_rdp_session() -> bool:
@@ -1422,21 +1579,25 @@ def has_active_rdp_session() -> bool:
 
 def rustdesk_session_monitor_loop():
     """Log RustDesk connect/disconnect so operators can verify detection without rebooting."""
-    last_active = None
+    last_count = None
     poll = max(15, RDP_SESSION_POLL_SECONDS)
     while node_state.get("is_running", True):
         try:
-            active = has_active_rustdesk_session()
-            if last_active is None:
-                if active:
-                    append_activity_log("[RUSTDESK] Session detected (already connected).")
+            count = count_active_rustdesk_sessions()
+            if last_count is None:
+                if count:
+                    append_activity_log(
+                        f"[RUSTDESK] Session detected (already connected, {count})."
+                    )
                 else:
                     append_activity_log("[RUSTDESK] No active session.")
-            elif active and not last_active:
-                append_activity_log("[RUSTDESK] Session became active.")
-            elif last_active and not active:
+            elif count and not last_count:
+                append_activity_log(f"[RUSTDESK] Session became active ({count}).")
+            elif last_count and not count:
                 append_activity_log("[RUSTDESK] Session ended.")
-            last_active = active
+            elif count != last_count:
+                append_activity_log(f"[RUSTDESK] Session count changed: {last_count} -> {count}.")
+            last_count = count
         except Exception as err:
             logging.debug("RustDesk session monitor failed: %s", err)
         time.sleep(poll)
@@ -1768,6 +1929,7 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                     srs_configured = bool(
                         str(load_node_settings().get("srs_install_folder") or "").strip()
                     )
+                    rd_count = count_active_rustdesk_sessions()
                     response = {
                         "status": "ACK",
                         "installed_version": inst_v,
@@ -1781,7 +1943,8 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         "srs_running": is_srs_process_running() if srs_configured else False,
                         "srs_installed_version": get_srs_installed_version(),
                         "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
-                        "rdp_session_active": has_active_rdp_session(),
+                        "rdp_session_active": rd_count > 0,
+                        "rdp_session_count": rd_count,
                     }
                     conn.send((json.dumps(response) + "\n").encode("utf-8"))
                     conn.close()

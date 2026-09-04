@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.92"
+CURRENT_BOT_VERSION = "2.1.93"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -57,7 +57,7 @@ Use `/dcs-panel-init` to create or restore the live panel at the bottom of this 
 ℹ️ Status text (e.g. UP TO DATE, SRS DOWN, DCS DOWN)
 ⚙️ Installed DCS version
 📻 Installed SRS version (from `scripts/DCS-SRS-AutoConnectGameGUI.lua` on the node)
-🖥️ Task / machine status (e.g. Ready, Action required, Port pending)
+🖥️ Task / machine status (e.g. Ready, Action required, RD Active (n))
 
 **Footer under the panel**
 ED Release Version — latest DCS World version from ED
@@ -1807,7 +1807,7 @@ def has_dcs_management_permission():
     return app_commands.check(predicate)
 
 
-PANEL_BOX_LINE_WIDTH = 13
+PANEL_BOX_LINE_WIDTH = 14
 PANEL_STATUS_SHORT = {
     "DCS NOT STARTED": "NOT STARTED",
     "DCS STARTING": "STARTING",
@@ -1825,7 +1825,7 @@ PANEL_TASK_SHORT = {
     "Awaiting operator action": "Action needed",
     "Action required": "Action needed",
     "No mission loaded": "No mission",
-    "RustDesk active": "RustDesk",
+    "RustDesk active": "RD Active (1)",
 }
 
 
@@ -1863,8 +1863,34 @@ STATUS_RED = {
     "UNAUTHORIZED",
 }
 TASK_GREEN = {"Ready"}
-TASK_YELLOW = {"No mission", "Action needed", "Port pending", "Boot pending", "RustDesk"}
+TASK_YELLOW = {"No mission", "Action needed", "Port pending", "Boot pending"}
 TASK_RED = {"Port down", "Crashed", "Stopped"}
+
+
+def _rd_active_task_label(count) -> str:
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    return f"RD Active ({n})"
+
+
+def _rdp_session_count_from_res(res, active: bool) -> int:
+    raw = (res or {}).get("rdp_session_count")
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        count = 0
+    if active and count < 1:
+        return 1
+    return max(0, count)
+
+
+def _is_rd_active_task(task_info: str) -> bool:
+    text = str(task_info or "").strip()
+    return text.startswith("RD Active (") or text in {"RustDesk", "RustDesk active"}
 
 
 def _ansi(color: str, text: str) -> str:
@@ -1922,7 +1948,7 @@ def format_server_status_box(
         task_display = _ansi(ANSI_OK, task_display)
     elif task_info in TASK_RED:
         task_display = _ansi(ANSI_WARNING, task_display)
-    elif task_info in TASK_YELLOW:
+    elif task_info in TASK_YELLOW or _is_rd_active_task(task_info):
         task_display = _ansi(ANSI_CAUTION, task_display)
 
     rows = [
@@ -1965,6 +1991,7 @@ def classify_node_answer(answer, srs_latest_release=None):
     dcs_running = None
     srs_running = None
     rdp_session_active = False
+    rdp_session_count = 0
 
     if answer and answer.startswith("{"):
         try:
@@ -1979,6 +2006,7 @@ def classify_node_answer(answer, srs_latest_release=None):
                 dcs_running = res.get("dcs_running", True)
                 active_task = res.get("active_task", "Idle")
                 rdp_session_active = bool(res.get("rdp_session_active"))
+                rdp_session_count = _rdp_session_count_from_res(res, rdp_session_active)
                 srs_installed_raw = str(res.get("srs_installed_version") or "").strip()
                 srs_configured = bool(res.get("srs_configured", True))
                 srs_running = bool(res.get("srs_running", False)) if srs_configured else None
@@ -2017,7 +2045,7 @@ def classify_node_answer(answer, srs_latest_release=None):
                 elif active_task != "Idle":
                     task_info = active_task
                 elif rdp_session_active:
-                    task_info = "RustDesk active"
+                    task_info = _rd_active_task_label(rdp_session_count)
                 elif dcs_health == "STARTING":
                     # Real wait: process is up, port not ready yet.
                     task_info = "Awaiting DCS port"
@@ -2076,7 +2104,7 @@ def classify_node_answer(answer, srs_latest_release=None):
                     icon = "🟢"
 
                 if rdp_session_active and active_task == "Idle":
-                    task_info = "RustDesk active"
+                    task_info = _rd_active_task_label(rdp_session_count)
         except Exception:
             status_text = "OFFLINE"
             icon = "🔴"
@@ -2103,6 +2131,7 @@ def classify_node_answer(answer, srs_latest_release=None):
         "dcs_running": dcs_running,
         "srs_running": srs_running,
         "rdp_session_active": rdp_session_active,
+        "rdp_session_count": rdp_session_count,
     }
 
 
