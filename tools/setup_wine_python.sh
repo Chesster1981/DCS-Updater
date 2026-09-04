@@ -48,7 +48,7 @@ fi
 
 echo "==> Installing PyInstaller toolchain"
 # PySide6 6.8.3: last line that loads under Wine without icuuc.dll (6.9+ needs ICU).
-printf 'C:\\Python313\\python.exe -m pip install pyinstaller==6.22.0 Pillow pystray PySide6==6.8.3\r\n' \
+printf 'C:\\Python313\\python.exe -m pip install pyinstaller==6.22.0 Pillow==12.3.0 pystray PySide6==6.8.3\r\n' \
   > "$WORKDIR/pip_toolchain.bat"
 run_wine_cmd() {
   if command -v xvfb-run >/dev/null 2>&1; then

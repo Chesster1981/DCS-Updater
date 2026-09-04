@@ -74,7 +74,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.93"
+CURRENT_NODE_VERSION = "2.1.94"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -320,6 +320,10 @@ def _execute_silent_node_binary_swap(download_url):
             f.write("    exit /b 1\n")
             f.write(")\n")
             f.write("echo [5/5] Starting updated Node...\n")
+            # Fresh unpack dir: do not inherit the old frozen Node's _MEI / Pillow binaries.
+            f.write("set PYINSTALLER_RESET_ENVIRONMENT=1\n")
+            f.write("set _MEIPASS=\n")
+            f.write("set _PYI_APPLICATION_HOME_DIR=\n")
             f.write('start "" "%EXE_PATH%"\n')
             f.write("timeout /t 2 /nobreak > nul\n")
             f.write('del "%~f0"\n')
@@ -328,6 +332,7 @@ def _execute_silent_node_binary_swap(download_url):
         subprocess.Popen(
             f'cmd.exe /c start /b "" "{bat_path}"',
             shell=True,
+            env=_clean_child_env(),
             **_hidden_subprocess_kwargs(capture_output=False),
         )
         
