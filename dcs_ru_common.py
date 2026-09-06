@@ -284,10 +284,16 @@ def mission_list_is_empty(server_settings_text: str) -> Optional[bool]:
 
 
 def parse_lua_max_players(server_settings_text: str) -> Optional[int]:
-    """Parse maxPlayers from serverSettings.lua."""
-    match = re.search(r'\["maxPlayers"\]\s*=\s*(\d+)', server_settings_text or "")
-    if not match:
-        match = re.search(r"\bmaxPlayers\s*=\s*(\d+)", server_settings_text or "")
+    """Parse maxPlayers from serverSettings.lua.
+
+    DCS writes this as a quoted string (``["maxPlayers"] = "16"``) more often
+    than as a bare integer. Accept both, plus single-quoted Lua forms.
+    """
+    text = server_settings_text or ""
+    match = re.search(
+        r"""(?:\[["']maxPlayers["']\]|\bmaxPlayers)\s*=\s*["']?(\d+)["']?""",
+        text,
+    )
     if not match:
         return None
     value = int(match.group(1))
