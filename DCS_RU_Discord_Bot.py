@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.0"
+CURRENT_BOT_VERSION = "2.2.1"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -2799,11 +2799,12 @@ class LiveControlPanelView(discord.ui.View):
         custom_id="dcs_panel:players",
     )
     async def btn_players(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
         view = self.bot.active_panel_view or self
         nodes = view.all_nodes_cached or self.all_nodes_cached or self.bot.load_cluster_nodes()
         if not nodes:
-            await interaction.followup.send("No servers configured.", ephemeral=True)
+            empty = await interaction.followup.send("No servers configured.")
+            self.bot.dismiss_status_message_later(empty)
             return
         tasks_list = [
             self.bot.send_socket_command(n["ip"], n["port"], "PING_STATUS") for n in nodes
@@ -2844,7 +2845,8 @@ class LiveControlPanelView(discord.ui.View):
             )
         footer = f"{total} client(s) total" if any_data else "No player data"
         embed.set_footer(text=footer)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        listing_msg = await interaction.followup.send(embed=embed)
+        self.bot.dismiss_status_message_later(listing_msg)
 
     @discord.ui.button(
         label="Select Actions",
