@@ -36,7 +36,9 @@ from dcs_ru_common import (
     srs_version_is_current,
     SRS_AUTOCONNECT_LUA,
     mission_list_is_empty,
+    parse_lua_max_players,
 )
+from dcs_webgui import derive_webgui_port, query_dcs_webgui_players
 from brand_assets import (
     BRAND_ASSET_VERSION,
     BRAND_PNG_MD5,
@@ -74,7 +76,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.1.94"
+CURRENT_NODE_VERSION = "2.2.0"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -107,6 +109,8 @@ DCS_STARTUP_GRACE_SECONDS = 600  # process may exist minutes before the DCS port
 DCS_DOWN_GRACE_SECONDS = 300  # wait before auto-restart after DCS goes unhealthy/dead
 RDP_SESSION_POLL_SECONDS = 30
 DCS_PORT_BASE = 10300
+WEBGUI_PLAYERS_CACHE_SECONDS = 5
+WEBGUI_PLAYERS_TIMEOUT = 1.5
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 SRS_PROCESS_IMAGES = ("SR-Server.exe", "SRS-Server.exe", "SR_Server.exe")
 SRS_PRESERVE_FILENAMES = ("server.cfg", "banned.txt")
@@ -130,6 +134,15 @@ node_state = {
     "dcs_process_seen_at": None,
     "dcs_down_since": None,
     "mission_list_empty": None,
+}
+
+_webgui_players_lock = threading.Lock()
+_webgui_players_cache = {
+    "at": 0.0,
+    "port": None,
+    "count": None,
+    "names": [],
+    "max_players": None,
 }
 
 _watchdog_restart_times = []
@@ -471,6 +484,52 @@ def derive_dcs_port(node_port) -> int:
     except (TypeError, ValueError):
         suffix = 15
     return DCS_PORT_BASE + suffix
+
+
+def read_max_players_from_lua(config=None) -> int | None:
+    path = resolve_server_settings_lua_path(config)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return parse_lua_max_players(handle.read())
+    except OSError:
+        return None
+
+
+def read_dcs_player_snapshot(node_port, dcs_health: str) -> tuple[int | None, list[str], int | None]:
+    """Connected clients from local WebGUI 88xx, excluding the admin/host slot."""
+    max_players = read_max_players_from_lua()
+    if dcs_health not in (DCS_HEALTH_HEALTHY, DCS_HEALTH_PAUSED):
+        return None, [], max_players
+    webgui_port = derive_webgui_port(node_port)
+    now = time.time()
+    with _webgui_players_lock:
+        cached = _webgui_players_cache
+        if (
+            cached["port"] == webgui_port
+            and cached["count"] is not None
+            and now - cached["at"] < WEBGUI_PLAYERS_CACHE_SECONDS
+        ):
+            return cached["count"], list(cached["names"]), cached["max_players"] if cached["max_players"] is not None else max_players
+    snapshot = query_dcs_webgui_players(
+        webgui_port, host="127.0.0.1", timeout=WEBGUI_PLAYERS_TIMEOUT
+    )
+    if not snapshot:
+        return None, [], max_players
+    count = int(snapshot["count"])
+    names = [str(n) for n in snapshot.get("names") or [] if str(n).strip()]
+    with _webgui_players_lock:
+        _webgui_players_cache.update(
+            {
+                "at": now,
+                "port": webgui_port,
+                "count": count,
+                "names": names,
+                "max_players": max_players,
+            }
+        )
+    return count, names, max_players
 
 
 def is_dcs_port_listening(node_port, host="127.0.0.1", timeout=2.0) -> bool:
@@ -1935,6 +1994,9 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         str(load_node_settings().get("srs_install_folder") or "").strip()
                     )
                     rd_count = count_active_rustdesk_sessions()
+                    dcs_players, dcs_player_names, dcs_max_players = read_dcs_player_snapshot(
+                        node_port, dcs_health
+                    )
                     response = {
                         "status": "ACK",
                         "installed_version": inst_v,
@@ -1950,6 +2012,9 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                         "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
                         "rdp_session_active": rd_count > 0,
                         "rdp_session_count": rd_count,
+                        "dcs_players": dcs_players,
+                        "dcs_max_players": dcs_max_players,
+                        "dcs_player_names": dcs_player_names,
                     }
                     conn.send((json.dumps(response) + "\n").encode("utf-8"))
                     conn.close()

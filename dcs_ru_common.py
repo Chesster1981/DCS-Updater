@@ -283,6 +283,17 @@ def mission_list_is_empty(server_settings_text: str) -> Optional[bool]:
     return len(entries) == 0
 
 
+def parse_lua_max_players(server_settings_text: str) -> Optional[int]:
+    """Parse maxPlayers from serverSettings.lua."""
+    match = re.search(r'\["maxPlayers"\]\s*=\s*(\d+)', server_settings_text or "")
+    if not match:
+        match = re.search(r"\bmaxPlayers\s*=\s*(\d+)", server_settings_text or "")
+    if not match:
+        return None
+    value = int(match.group(1))
+    return value if value > 0 else None
+
+
 def wrap_command(command: str, auth_token: Optional[str] = None) -> str:
     """Build a wire payload. When auth_token is set: TOKEN|COMMAND\\n"""
     cmd = command.strip()

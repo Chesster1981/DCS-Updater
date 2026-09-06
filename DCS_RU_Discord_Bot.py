@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.1.94"
+CURRENT_BOT_VERSION = "2.2.0"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -58,6 +58,7 @@ Use `/dcs-panel-init` to create or restore the live panel at the bottom of this 
 ⚙️ Installed DCS version
 📻 Installed SRS version (from `scripts/DCS-SRS-AutoConnectGameGUI.lua` on the node)
 🖥️ Task / machine status (e.g. Ready, Action required, RD Active (n))
+👥 Connected DCS clients (admin/host slot excluded). Press **👥 Players** for names.
 
 **Footer under the panel**
 ED Release Version — latest DCS World version from ED
@@ -66,6 +67,7 @@ Bot version — version of this Discord bot
 
 **Buttons and menu**
 🔄 **Refresh Server Status** — manually refresh the panel
+👥 **Players** — list connected client names per server (admin/host slot excluded)
 🚀 **Select Actions** — after choosing from the dropdown: opens the action menu (start/restart, update, reboot)
 Dropdown **Select server(s)** — pick one or more yellow/red servers. Selection is kept across automatic refresh (every 30 s).
 ✅ **All servers operational** — every server is green **UP TO DATE**. Any other status (OFFLINE, DCS DOWN, PAUSED, NOT STARTED, update/SRS issues) shows **Select Actions** instead.
@@ -1916,8 +1918,10 @@ def format_server_status_box(
     srs_info: str = "—",
     dcs_latest: str = "",
     srs_latest: str = "",
+    players_info=None,
+    max_players=None,
 ) -> str:
-    """Fixed four-line status block so every server tile is the same height."""
+    """Fixed five-line status block so every server tile is the same height."""
     status_text = PANEL_STATUS_SHORT.get(status_text, status_text)
     task_info = PANEL_TASK_SHORT.get(task_info, task_info)
 
@@ -1951,11 +1955,30 @@ def format_server_status_box(
     elif task_info in TASK_YELLOW or _is_rd_active_task(task_info):
         task_display = _ansi(ANSI_CAUTION, task_display)
 
+    players_n = None
+    if players_info is None:
+        players_display = "—"
+    else:
+        try:
+            players_n = int(players_info)
+            try:
+                cap = int(max_players) if max_players is not None else 0
+            except (TypeError, ValueError):
+                cap = 0
+            players_display = f"{players_n}/{cap}" if cap > 0 else str(players_n)
+        except (TypeError, ValueError):
+            players_display = "—"
+            players_n = None
+    players_display = _panel_line(players_display)
+    if players_n and players_n > 0:
+        players_display = _ansi(ANSI_OK, players_display)
+
     rows = [
         f"ℹ️ {status_display}",
         f"⚙️ {ver_display}",
         f"📻 {srs_display}",
         f"🖥️ {task_display}",
+        f"👥 {players_display}",
     ]
     return "```ansi\n" + "\n".join(rows) + "\n```"
 
@@ -1992,6 +2015,9 @@ def classify_node_answer(answer, srs_latest_release=None):
     srs_running = None
     rdp_session_active = False
     rdp_session_count = 0
+    dcs_players = None
+    dcs_max_players = None
+    dcs_player_names = []
 
     if answer and answer.startswith("{"):
         try:
@@ -2007,6 +2033,23 @@ def classify_node_answer(answer, srs_latest_release=None):
                 active_task = res.get("active_task", "Idle")
                 rdp_session_active = bool(res.get("rdp_session_active"))
                 rdp_session_count = _rdp_session_count_from_res(res, rdp_session_active)
+                raw_players = res.get("dcs_players")
+                if raw_players is not None:
+                    try:
+                        dcs_players = int(raw_players)
+                    except (TypeError, ValueError):
+                        dcs_players = None
+                raw_max = res.get("dcs_max_players")
+                if raw_max is not None:
+                    try:
+                        dcs_max_players = int(raw_max)
+                    except (TypeError, ValueError):
+                        dcs_max_players = None
+                raw_names = res.get("dcs_player_names")
+                if isinstance(raw_names, list):
+                    dcs_player_names = [
+                        str(name).strip() for name in raw_names if str(name).strip()
+                    ]
                 srs_installed_raw = str(res.get("srs_installed_version") or "").strip()
                 srs_configured = bool(res.get("srs_configured", True))
                 srs_running = bool(res.get("srs_running", False)) if srs_configured else None
@@ -2132,6 +2175,9 @@ def classify_node_answer(answer, srs_latest_release=None):
         "srs_running": srs_running,
         "rdp_session_active": rdp_session_active,
         "rdp_session_count": rdp_session_count,
+        "dcs_players": dcs_players,
+        "dcs_max_players": dcs_max_players,
+        "dcs_player_names": dcs_player_names,
     }
 
 
@@ -2628,6 +2674,8 @@ class LiveControlPanelView(discord.ui.View):
                 classified.get("srs_info", "—"),
                 dcs_latest=dcs_latest_release,
                 srs_latest=srs_latest_release,
+                players_info=classified.get("dcs_players"),
+                max_players=classified.get("dcs_max_players"),
             )
 
             field_name = f"{icon}\u2001{node['name']}\u2001\u2001\u2001\u2001\u2001\u2001"
@@ -2745,6 +2793,60 @@ class LiveControlPanelView(discord.ui.View):
             await self.bot.restore_or_recreate_panel()
 
     @discord.ui.button(
+        label="👥 Players",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+        custom_id="dcs_panel:players",
+    )
+    async def btn_players(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        view = self.bot.active_panel_view or self
+        nodes = view.all_nodes_cached or self.all_nodes_cached or self.bot.load_cluster_nodes()
+        if not nodes:
+            await interaction.followup.send("No servers configured.", ephemeral=True)
+            return
+        tasks_list = [
+            self.bot.send_socket_command(n["ip"], n["port"], "PING_STATUS") for n in nodes
+        ]
+        responses = await asyncio.gather(*tasks_list)
+        embed = discord.Embed(
+            title="👥 Connected clients",
+            description="Admin/host slot is excluded from these lists.",
+            color=discord.Color.from_rgb(26, 132, 255),
+        )
+        total = 0
+        any_data = False
+        for node, answer in zip(nodes, responses):
+            classified = classify_node_answer(answer)
+            names = classified.get("dcs_player_names") or []
+            count = classified.get("dcs_players")
+            cap = classified.get("dcs_max_players")
+            if count is None:
+                embed.add_field(
+                    name=node["name"],
+                    value="_No player data (node offline or WebGUI unreachable)_",
+                    inline=False,
+                )
+                continue
+            any_data = True
+            total += count
+            cap_txt = f"/{cap}" if cap else ""
+            if names:
+                listing = "\n".join(
+                    f"• {discord.utils.escape_markdown(name)}" for name in names
+                )
+            else:
+                listing = "_No clients connected_"
+            embed.add_field(
+                name=f"{node['name']} ({count}{cap_txt})",
+                value=listing[:1024],
+                inline=False,
+            )
+        footer = f"{total} client(s) total" if any_data else "No player data"
+        embed.set_footer(text=footer)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(
         label="Select Actions",
         style=discord.ButtonStyle.secondary,
         row=0,
@@ -2856,13 +2958,14 @@ async def dcs_panel_wiki(interaction: discord.Interaction):
             "• **Start/Restart DCS** / **Start/Restart SRS**\n"
             "• **Update DCS** / **Update SRS**\n"
             "• **Reboot Server** (confirmation required)\n"
-            "• Task **RustDesk** — all Discord actions + auto-restart are suspended"
+            "• Task **RustDesk** — all Discord actions + auto-restart are suspended\n"
+            "• **👥 Players** — connected client names (admin/host slot excluded)"
         ),
         inline=False,
     )
     embed.add_field(
         name="Status box",
-        value="ℹ️ status · ⚙️ DCS version · 📻 SRS version · 🖥️ task detail",
+        value="ℹ️ status · ⚙️ DCS version · 📻 SRS version · 🖥️ task · 👥 clients (👥 Players for names)",
         inline=False,
     )
     embed.set_footer(text=f"Bot v{CURRENT_BOT_VERSION}")

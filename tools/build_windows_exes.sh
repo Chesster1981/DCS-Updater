@@ -40,6 +40,7 @@ try:
         "--name", "DCS.Norway.Remote.Updater.Node",
         "--icon", r"Z:\workspace\Logo.ico",
         "--hidden-import=dcs_ru_common",
+        "--hidden-import=dcs_webgui",
         "--hidden-import=brand_assets",
         "--collect-all=tkinter",
         "--distpath", r"Z:\workspace\dist",

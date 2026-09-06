@@ -96,7 +96,7 @@ In the Control Panel: right-click a server row for **Start / Restart DCS**, **St
 
 | Command | Response |
 |---------|----------|
-| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_running`, `srs_running`, SRS fields |
+| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_running`, `srs_running`, SRS fields, `dcs_players`, `dcs_player_names` (admin/host slot excluded) |
 | `TRIGGER_DCS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `UNAUTHORIZED` |
 | `TRIGGER_SRS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `ERROR` / `UNAUTHORIZED` |
 | `CHECK_NODE_UPDATE` | Force immediate GitHub Node self-update check |
@@ -123,4 +123,4 @@ bash tools/setup_wine_python.sh   # Wine + Python 3.13.5 + PyInstaller 6.22.0 + 
 bash tools/build_windows_exes.sh  # writes dist/*.exe
 ```
 
-When building an exe, include `dcs_ru_common.py` (e.g. `--hidden-import=dcs_ru_common`, or ship the file next to the entrypoint).
+When building an exe, include `dcs_ru_common.py` (e.g. `--hidden-import=dcs_ru_common`, or ship the file next to the entrypoint). Node also needs `--hidden-import=dcs_webgui`.
