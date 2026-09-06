@@ -60,7 +60,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.2.2"
+CONTROL_PANEL_VERSION = "2.2.3"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -203,14 +203,78 @@ _LIVE_KEY_TIP = {
 }
 
 
+def _rd_active_task_label(count) -> str:
+    try:
+        n = int(count)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    return f"RD Active ({n})"
+
+
+def _is_rd_active_task(task_info: str) -> bool:
+    text = str(task_info or "").strip()
+    return text.startswith("RD Active (") or text in {"RustDesk", "RustDesk active"}
+
+
+def _players_live_key(data) -> str:
+    raw = data.get("dcs_players") if isinstance(data, dict) else None
+    if raw is None:
+        return "—"
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return "—"
+    cap_raw = data.get("dcs_max_players")
+    try:
+        cap = int(cap_raw) if cap_raw is not None else 0
+    except (TypeError, ValueError):
+        cap = 0
+    return f"{n}/{cap}" if cap > 0 else str(n)
+
+
+def _rd_live_key(data) -> str | None:
+    if not isinstance(data, dict) or not data.get("rdp_session_active"):
+        return None
+    raw = data.get("rdp_session_count")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    return str(n)
+
+
+def _player_count_color(key: str) -> str:
+    text = str(key or "").strip()
+    if text in ("—", "-", "?", "unknown", "none", ""):
+        return STYLE_TEXT_MUTED
+    try:
+        n = int(text.split("/", 1)[0])
+    except (TypeError, ValueError):
+        return STYLE_TEXT_MUTED
+    return STYLE_STATUS_GREEN if n > 0 else STYLE_TEXT_MUTED
+
+
 def format_live_services(data):
     """
-    Compact Live Status payload: 'DCS|off · SRS|up'
-    Display shows only 'DCS · SRS'; color + tooltip carry the state.
+    Compact Live Status payload: 'DCS|off · SRS|up · P|4/16 · RD|1'
+    DCS/SRS show as names (color = state). P shows the client count. RD shows
+    only when a RustDesk session is active.
     """
     if not isinstance(data, dict) or data.get("status") == "UNAUTHORIZED":
         return ""
-    return f"DCS|{_dcs_live_key(data)} · SRS|{_srs_live_key(data)}"
+    parts = [
+        f"DCS|{_dcs_live_key(data)}",
+        f"SRS|{_srs_live_key(data)}",
+        f"P|{_players_live_key(data)}",
+    ]
+    rd = _rd_live_key(data)
+    if rd:
+        parts.append(f"RD|{rd}")
+    return " · ".join(parts)
 
 
 def live_service_key_color(key: str) -> str:
@@ -223,11 +287,15 @@ def live_service_key_color(key: str) -> str:
 
 
 def _parse_live_service_token(token: str):
-    """'DCS|off' or legacy 'DCS off' -> (name, key)."""
+    """'DCS|off' or legacy 'DCS off' -> (name, key). Player/RD keys keep original case."""
     raw = str(token or "").strip()
     if "|" in raw:
         name, _, key = raw.partition("|")
-        return name.strip(), (key.strip().lower() or "unknown")
+        name = name.strip()
+        key = key.strip()
+        if name.upper() in ("DCS", "SRS"):
+            return name, (key.lower() or "unknown")
+        return name, (key or "unknown")
     parts = raw.split(None, 1)
     if len(parts) == 2 and parts[0].upper() in ("DCS", "SRS"):
         word = parts[1].strip().lower()
@@ -244,6 +312,35 @@ def _parse_live_service_token(token: str):
     if raw.upper() in ("DCS", "SRS"):
         return raw, "unknown"
     return raw, "unknown"
+
+
+def _live_token_visible(name: str, key: str) -> str:
+    n = str(name or "").strip().upper()
+    if n in ("P", "PLAYERS"):
+        return str(key or "—")
+    if n == "RD":
+        if key in ("off", "0", "na", "", "unknown"):
+            return ""
+        return _rd_active_task_label(key)
+    return str(name or "").strip()
+
+
+def _live_token_color(name: str, key: str) -> str:
+    n = str(name or "").strip().upper()
+    if n in ("P", "PLAYERS"):
+        return _player_count_color(key)
+    if n == "RD":
+        return STYLE_STATUS_WARN
+    return live_service_key_color(key)
+
+
+def _live_token_tip(name: str, key: str) -> str:
+    n = str(name or "").strip().upper()
+    if n in ("P", "PLAYERS"):
+        return f"clients {key}"
+    if n == "RD":
+        return _rd_active_task_label(key)
+    return f"{name} {_LIVE_KEY_TIP.get(key, key)}"
 
 
 def format_live_status_display(label: str):
@@ -264,19 +361,20 @@ def format_live_status_display(label: str):
 
     tokens = [p.strip() for p in core.split("·") if p.strip()]
     parsed = [_parse_live_service_token(t) for t in tokens]
+    parsed = [(n, k) for n, k in parsed if _live_token_visible(n, k)]
     if len(parsed) < 2 or not any(n.upper() in ("DCS", "SRS") for n, _ in parsed):
         return plain_in, plain_in, False, plain_in
 
-    names = [name for name, _ in parsed]
-    plain = " · ".join(names)
-    tip_bits = [f"{name} {_LIVE_KEY_TIP.get(key, key)}" for name, key in parsed]
-    tip_detail = " · ".join(tip_bits)
+    labels = [_live_token_visible(name, key) for name, key in parsed]
+    plain = " · ".join(labels)
+    tip_detail = " · ".join(_live_token_tip(name, key) for name, key in parsed)
 
     spans = []
     for name, key in parsed:
-        color = live_service_key_color(key)
+        color = _live_token_color(name, key)
         spans.append(
-            f'<span style="color:{color}; font-weight:700;">{html.escape(name)}</span>'
+            f'<span style="color:{color}; font-weight:700;">'
+            f"{html.escape(_live_token_visible(name, key))}</span>"
         )
     rich = '<span style="color:#8E8E93; font-weight:700;"> · </span>'.join(spans)
     if task_suffix:
@@ -304,6 +402,12 @@ def _live_services_need_warn(live: str) -> bool:
     warn_keys = ("|off", "|starting", "|down", "|noport", "|unknown", "|na")
     if any(k in live_l for k in warn_keys):
         return True
+    if any(s in live_l for s in (" · rd|", "rd|")):
+        # RD|1 is caution; do not treat P|1 as RD.
+        for token in str(live or "").split("·"):
+            name, key = _parse_live_service_token(token)
+            if name.upper() == "RD" and key not in ("off", "0", "na", "", "unknown"):
+                return True
     # Legacy plaintext forms
     return any(
         s in live_l
@@ -329,6 +433,8 @@ def parse_socket_response(answer):
             dcs_running = data.get("dcs_running", True)
             active_task = data.get("active_task", "Idle")
             live_services = format_live_services(data)
+            if data.get("rdp_session_active") and active_task == "Idle":
+                active_task = _rd_active_task_label(data.get("rdp_session_count"))
 
             if dcs_health == "HEALTHY" or dcs_running is True:
                 status = "ONLINE"
@@ -1500,7 +1606,11 @@ class MainWindow(QMainWindow):
                     if _live_services_need_warn(live):
                         c = STYLE_STATUS_WARN
                     label = live
-                    if active_task and active_task not in _LIVE_STATUS_REDUNDANT_TASKS:
+                    if (
+                        active_task
+                        and active_task not in _LIVE_STATUS_REDUNDANT_TASKS
+                        and not _is_rd_active_task(active_task)
+                    ):
                         label = f"{live} ({active_task})"
                 elif status == "ONLINE":
                     label = status if active_task == "Idle" else f"{status} ({active_task})"
