@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.3"
+CURRENT_BOT_VERSION = "2.2.4"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -90,7 +90,9 @@ Flow: 5 min grace → automatic DCS restart via node (skipped while RustDesk is 
 `/dcs-panel-init` · `/dcs-panel-update`
 
 **Other symbols**
-🛸 Panel title · ⏳ / 🎉 / ❌ Messages during the deploy queue"""
+🛸 Panel title · ⏳ / 🎉 / ❌ Messages during the deploy queue (auto-delete after 10 s)
+
+This channel keeps the live panel (and this pinned guide). Queue, Players, and action lines are temporary. Crash/offline **server alert** posts stay until the server is back ONLINE, then they are removed."""
 # Set to a Discord username to DM only that person while testing.
 # None = page panel-channel members one at a time (online first).
 STATUS_ALERT_TEST_USERNAME = None
@@ -104,6 +106,8 @@ ATTENTION_QUESTION = "Are you available to attend the issue ? Please reply (Yes/
 ATTENTION_YES_REPLIES = {"ja", "yes"}
 ATTENTION_NO_REPLIES = {"no", "nei"}
 STATUS_MESSAGE_DISMISS_SECONDS = 10
+PANEL_CHANNEL_PURGE_SECONDS = 120
+PANEL_CHANNEL_ALERT_MARKER = "**DCS Norway — server alert**"
 WIKI_AUTO_DISMISS_SECONDS = 900
 BOT_PID_FILE = "dcs_ru_discord_bot.pid"
 DISCORD_SELECT_MAX_OPTIONS = 25
@@ -270,15 +274,24 @@ class DCSClusterBot(commands.Bot):
         self._attention_server_names = []
         self._wiki_sessions = {}
         self._pending_dismiss_tasks = set()
+        self._last_panel_chatter_purge = 0.0
+        self._panel_alert_messages = []
+        self._panel_alerts_need_sweep = True
 
-    def dismiss_status_message_later(self, message):
+    def dismiss_status_message_later(self, message, after_seconds=None):
         """Delete a transient Discord status message after a short delay."""
         if message is None:
             return
+        delay = (
+            STATUS_MESSAGE_DISMISS_SECONDS
+            if after_seconds is None
+            else max(0, int(after_seconds))
+        )
 
         async def _delete():
             try:
-                await asyncio.sleep(STATUS_MESSAGE_DISMISS_SECONDS)
+                if delay:
+                    await asyncio.sleep(delay)
                 await message.delete()
             except discord.NotFound:
                 pass
@@ -699,7 +712,7 @@ class DCSClusterBot(commands.Bot):
             self._restoring_panel = False
 
     async def purge_old_bot_messages(self, channel):
-        """Remove leftover bot chatter; keep the live panel and pinned guide."""
+        """Remove leftover bot chatter; keep the live panel, pinned guide, and open alerts."""
         keep_ids = set()
         if self.panel_message_id:
             try:
@@ -715,6 +728,8 @@ class DCSClusterBot(commands.Bot):
                 content = message.content or ""
                 if PANEL_CHANNEL_GUIDE_MARKER in content:
                     continue
+                if self._is_panel_action_alert(content):
+                    continue
                 # Delete embeds/components and plain status text (update/restart notices, logs).
                 try:
                     await message.delete()
@@ -723,6 +738,27 @@ class DCSClusterBot(commands.Bot):
                     pass
         except Exception as e:
             logger.error("Error purging historic channel messages: %s", e)
+
+    @staticmethod
+    def _is_panel_action_alert(content):
+        text = str(content or "")
+        return PANEL_CHANNEL_ALERT_MARKER in text or "🚨 **DCS Norway — server alert**" in text
+
+    async def _maybe_purge_panel_chatter(self):
+        """Drop leftover bot lines in #server-status so only panel + pinned guide remain."""
+        now = time.monotonic()
+        if now - self._last_panel_chatter_purge < PANEL_CHANNEL_PURGE_SECONDS:
+            return
+        if not self.panel_channel_id:
+            return
+        try:
+            channel = await self.get_panel_channel()
+        except Exception:
+            return
+        if channel is None:
+            return
+        self._last_panel_chatter_purge = now
+        await self.purge_old_bot_messages(channel)
 
     async def ensure_panel_channel_guide(self, channel):
         """Refresh the pinned legend message after restart/init."""
@@ -1106,6 +1142,46 @@ class DCSClusterBot(commands.Bot):
                 event.set()
         if "recovered" in str(reason or "").lower():
             await self._notify_servers_back_online()
+            await self._dismiss_panel_action_alerts()
+
+    async def _dismiss_panel_action_alerts(self):
+        """Remove #server-status crash/offline alerts once the cause is fixed."""
+        pending = list(self._panel_alert_messages)
+        need_sweep = bool(pending) or self._panel_alerts_need_sweep
+        self._panel_alert_messages = []
+        self._panel_alerts_need_sweep = False
+        if not need_sweep:
+            return
+        for message in pending:
+            try:
+                await message.delete()
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                logger.warning(
+                    "Failed to delete recovered panel alert %s: %s",
+                    getattr(message, "id", "?"),
+                    e,
+                )
+        try:
+            channel = await self.get_panel_channel()
+        except Exception:
+            channel = None
+        if channel is None:
+            return
+        try:
+            async for message in channel.history(limit=80):
+                if message.author.id != self.user.id:
+                    continue
+                if not self._is_panel_action_alert(message.content or ""):
+                    continue
+                try:
+                    await message.delete()
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning("Failed to sweep recovered panel alerts: %s", e)
 
     async def _start_attention_round(self, body, guild):
         self._attention_issue_body = body
@@ -1247,7 +1323,9 @@ class DCSClusterBot(commands.Bot):
             prefix = f"{mentions}\n" if mentions else ""
             if STATUS_ALERT_TEST_USERNAME and not mentions:
                 prefix = f"**{STATUS_ALERT_TEST_USERNAME}**\n"
-            await channel.send(prefix + body)
+            alert_msg = await channel.send(prefix + body)
+            self._panel_alert_messages.append(alert_msg)
+            self._panel_alerts_need_sweep = True
             logger.info("Posted status alert in panel channel %s", channel.id)
         except Exception as e:
             logger.warning("Failed to post status alert in panel channel: %s", e)
@@ -1774,6 +1852,10 @@ class DCSClusterBot(commands.Bot):
                 await self.active_panel_view.refresh_panel()
             except Exception as e:
                 logger.error("Suppressed automated background refresh exception: %s", e)
+            try:
+                await self._maybe_purge_panel_chatter()
+            except Exception as e:
+                logger.warning("Panel channel chatter purge failed: %s", e)
 
     @tasks.loop(minutes=BOT_GITHUB_CHECK_MINUTES)
     async def github_self_update_loop(self):
