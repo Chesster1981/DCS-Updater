@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.3"
+CURRENT_BOT_VERSION = "2.2.4"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -90,7 +90,9 @@ Flow: 5 min grace → automatic DCS restart via node (skipped while RustDesk is 
 `/dcs-panel-init` · `/dcs-panel-update`
 
 **Other symbols**
-🛸 Panel title · ⏳ / 🎉 / ❌ Messages during the deploy queue"""
+🛸 Panel title · ⏳ / 🎉 / ❌ Messages during the deploy queue (auto-delete after 10 s)
+
+This channel keeps the live panel (and this pinned guide). Queue, Players, action, and crash-alert lines are temporary and are deleted automatically."""
 # Set to a Discord username to DM only that person while testing.
 # None = page panel-channel members one at a time (online first).
 STATUS_ALERT_TEST_USERNAME = None
@@ -104,6 +106,7 @@ ATTENTION_QUESTION = "Are you available to attend the issue ? Please reply (Yes/
 ATTENTION_YES_REPLIES = {"ja", "yes"}
 ATTENTION_NO_REPLIES = {"no", "nei"}
 STATUS_MESSAGE_DISMISS_SECONDS = 10
+PANEL_CHANNEL_PURGE_SECONDS = 120
 WIKI_AUTO_DISMISS_SECONDS = 900
 BOT_PID_FILE = "dcs_ru_discord_bot.pid"
 DISCORD_SELECT_MAX_OPTIONS = 25
@@ -270,15 +273,22 @@ class DCSClusterBot(commands.Bot):
         self._attention_server_names = []
         self._wiki_sessions = {}
         self._pending_dismiss_tasks = set()
+        self._last_panel_chatter_purge = 0.0
 
-    def dismiss_status_message_later(self, message):
+    def dismiss_status_message_later(self, message, after_seconds=None):
         """Delete a transient Discord status message after a short delay."""
         if message is None:
             return
+        delay = (
+            STATUS_MESSAGE_DISMISS_SECONDS
+            if after_seconds is None
+            else max(0, int(after_seconds))
+        )
 
         async def _delete():
             try:
-                await asyncio.sleep(STATUS_MESSAGE_DISMISS_SECONDS)
+                if delay:
+                    await asyncio.sleep(delay)
                 await message.delete()
             except discord.NotFound:
                 pass
@@ -723,6 +733,22 @@ class DCSClusterBot(commands.Bot):
                     pass
         except Exception as e:
             logger.error("Error purging historic channel messages: %s", e)
+
+    async def _maybe_purge_panel_chatter(self):
+        """Drop leftover bot lines in #server-status so only panel + pinned guide remain."""
+        now = time.monotonic()
+        if now - self._last_panel_chatter_purge < PANEL_CHANNEL_PURGE_SECONDS:
+            return
+        if not self.panel_channel_id:
+            return
+        try:
+            channel = await self.get_panel_channel()
+        except Exception:
+            return
+        if channel is None:
+            return
+        self._last_panel_chatter_purge = now
+        await self.purge_old_bot_messages(channel)
 
     async def ensure_panel_channel_guide(self, channel):
         """Refresh the pinned legend message after restart/init."""
@@ -1247,7 +1273,8 @@ class DCSClusterBot(commands.Bot):
             prefix = f"{mentions}\n" if mentions else ""
             if STATUS_ALERT_TEST_USERNAME and not mentions:
                 prefix = f"**{STATUS_ALERT_TEST_USERNAME}**\n"
-            await channel.send(prefix + body)
+            alert_msg = await channel.send(prefix + body)
+            self.dismiss_status_message_later(alert_msg)
             logger.info("Posted status alert in panel channel %s", channel.id)
         except Exception as e:
             logger.warning("Failed to post status alert in panel channel: %s", e)
@@ -1774,6 +1801,10 @@ class DCSClusterBot(commands.Bot):
                 await self.active_panel_view.refresh_panel()
             except Exception as e:
                 logger.error("Suppressed automated background refresh exception: %s", e)
+            try:
+                await self._maybe_purge_panel_chatter()
+            except Exception as e:
+                logger.warning("Panel channel chatter purge failed: %s", e)
 
     @tasks.loop(minutes=BOT_GITHUB_CHECK_MINUTES)
     async def github_self_update_loop(self):
