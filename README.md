@@ -57,7 +57,7 @@ Important fields:
 - `bind_address` — prefer a LAN IP instead of `0.0.0.0` when possible
 - `auth_token` — must match `master_config.json`
 - `dcs_main_folder` — DCS root folder
-- `preserve_mission_scripting` / `reboot_after_deployment`
+- `preserve_mission_scripting` / `preserve_webgui_app_js` / `reboot_after_deployment`
 
 ### 3. Discord token (environment variable)
 

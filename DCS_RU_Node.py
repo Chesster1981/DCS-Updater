@@ -76,7 +76,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.4"
+CURRENT_NODE_VERSION = "2.2.5"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -236,6 +236,7 @@ def sync_settings_widgets(settings: dict):
             ent_auth.insert(0, str(settings.get("auth_token", "")))
             opt_update_var.set(github_interval_label(settings.get("github_check_interval", 43200)))
             v_preserve.set(bool(settings.get("preserve_mission_scripting", True)))
+            v_preserve_app_js.set(bool(settings.get("preserve_webgui_app_js", True)))
             v_reboot.set(bool(settings.get("reboot_after_deployment", True)))
             v_watchdog.set(bool(settings.get("watchdog_enabled", True)))
             v_auto_restart.set(bool(settings.get("auto_restart_dcs", True)))
@@ -1864,11 +1865,15 @@ def execute_deployment_pipeline():
     config = load_node_settings()
     main_folder = config.get("dcs_main_folder", "").strip()
     preserve_lua = config.get("preserve_mission_scripting", True)
+    preserve_app_js = config.get("preserve_webgui_app_js", True)
     reboot_after_deployment = config.get("reboot_after_deployment", True)
     bin_folder = os.path.join(main_folder, "bin")
     scripts_folder = os.path.join(main_folder, "Scripts")
+    webgui_js_folder = os.path.join(main_folder, "WebGUI", "js")
     active_lua_file = os.path.join(scripts_folder, "MissionScripting.lua")
     backup_lua_file = os.path.join(application_path, "MissionScripting.lua.bak")
+    active_app_js_file = os.path.join(webgui_js_folder, "app.js")
+    backup_app_js_file = os.path.join(application_path, "app.js.bak")
     
     node_state["active_task"] = "Updating"
     append_activity_log("\n[PROCESS] Starting update sequence...")
@@ -1880,6 +1885,14 @@ def execute_deployment_pipeline():
             append_activity_log(" [PROCESS] Active script backup secured ✅ successfully.")
         except Exception as e:
             append_activity_log(f" [PROCESS] Backup failed, file might be ⚠️ locked: {e}")
+
+    if preserve_app_js and os.path.exists(active_app_js_file):
+        append_activity_log("[PROCESS] Preserving active WebGUI js/app.js to node directory...")
+        try:
+            shutil.copy(active_app_js_file, backup_app_js_file)
+            append_activity_log(" [PROCESS] Active WebGUI app.js backup secured ✅ successfully.")
+        except Exception as e:
+            append_activity_log(f" [PROCESS] WebGUI app.js backup failed, file might be ⚠️ locked: {e}")
             
     force_kill_core_dcs()
     append_activity_log("[PROCESS] Verifying DCS cleanup status...")
@@ -1896,6 +1909,7 @@ def execute_deployment_pipeline():
     append_activity_log(" [PROCESS] DCS processes are verified DEAD. ✅ Proceeding.")
     node_state["active_task"] = "Downloading"
     
+    update_succeeded = False
     try:
         if not os.path.exists(bin_folder):
             append_activity_log(f" ERROR: Could not find the bin folder at: ❌ {bin_folder}")
@@ -1911,24 +1925,37 @@ def execute_deployment_pipeline():
             **_hidden_subprocess_kwargs(capture_output=False),
         )
         append_activity_log(" [PROCESS] DCS core update finished. ✅")
+        append_activity_log("[PROCESS] Re-scanning local configuration matrices...")
+        get_dcs_versions_local()
+        update_succeeded = True
     except Exception as e:
         append_activity_log(f" ERROR during DCS update: ❌ {e}")
         node_state["active_task"] = "Idle"
         return
-        
-    append_activity_log("[PROCESS] Re-scanning local configuration matrices...")
-    get_dcs_versions_local()
-    
-    if preserve_lua and os.path.exists(backup_lua_file):
-        append_activity_log("[PROCESS] Restoring preserved MissionScripting.lua back to DCS cluster...")
-        try:
-            os.makedirs(scripts_folder, exist_ok=True)
-            shutil.copy(backup_lua_file, active_lua_file)
-            append_activity_log(" [PROCESS] Success! MissionScripting.lua has ✅ been completely restored.")
-            os.remove(backup_lua_file)
-        except Exception as e:
-            append_activity_log(f" ERROR during file restoration: ❌ {e}")
-            
+    finally:
+        if preserve_lua and os.path.exists(backup_lua_file):
+            append_activity_log("[PROCESS] Restoring preserved MissionScripting.lua back to DCS cluster...")
+            try:
+                os.makedirs(scripts_folder, exist_ok=True)
+                shutil.copy(backup_lua_file, active_lua_file)
+                append_activity_log(" [PROCESS] Success! MissionScripting.lua has ✅ been completely restored.")
+                os.remove(backup_lua_file)
+            except Exception as e:
+                append_activity_log(f" ERROR during file restoration: ❌ {e}")
+
+        if preserve_app_js and os.path.exists(backup_app_js_file):
+            append_activity_log("[PROCESS] Restoring preserved WebGUI js/app.js back to DCS cluster...")
+            try:
+                os.makedirs(webgui_js_folder, exist_ok=True)
+                shutil.copy(backup_app_js_file, active_app_js_file)
+                append_activity_log(" [PROCESS] Success! WebGUI js/app.js has ✅ been completely restored.")
+                os.remove(backup_app_js_file)
+            except Exception as e:
+                append_activity_log(f" ERROR during WebGUI app.js restoration: ❌ {e}")
+
+    if not update_succeeded:
+        return
+
     if reboot_after_deployment:
         append_activity_log(" [PROCESS] Windows reboot is enabled.")
         time.sleep(5)
@@ -2399,6 +2426,7 @@ def show_settings_frame():
         opt_update_var.set(github_interval_label(saved_seconds))
         
         v_preserve.set(bool(cfg.get("preserve_mission_scripting", True)))
+        v_preserve_app_js.set(bool(cfg.get("preserve_webgui_app_js", True)))
         v_reboot.set(bool(cfg.get("reboot_after_deployment", True)))
         v_watchdog.set(bool(cfg.get("watchdog_enabled", True)))
         v_auto_restart.set(bool(cfg.get("auto_restart_dcs", True)))
@@ -2415,6 +2443,7 @@ def save_settings_to_file():
         "dcs_main_folder": ent_dcs.get(),
         "srs_install_folder": ent_srs.get().strip(),
         "preserve_mission_scripting": v_preserve.get(),
+        "preserve_webgui_app_js": v_preserve_app_js.get(),
         "network_port": ent_port.get(),
         "bind_address": ent_bind.get().strip() or "0.0.0.0",
         "auth_token": ent_auth.get().strip(),
@@ -2634,6 +2663,9 @@ btn_force_update.pack(anchor="w", pady=(5, 10))
 
 v_preserve = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Preserve current MissionScripting.lua?", variable=v_preserve, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=(5, 5))
+
+v_preserve_app_js = tk.BooleanVar()
+tk.Checkbutton(frame_settings, text="Preserve current WebGUI js/app.js?", variable=v_preserve_app_js, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=(5, 5))
 
 v_reboot = tk.BooleanVar()
 tk.Checkbutton(frame_settings, text="Reboot Windows automatically after update completes", variable=v_reboot, fg="white", bg="#1C1C1F", selectcolor="#1C1C1F", activebackground="#1C1C1F", activeforeground="white").pack(anchor="w", pady=5)

@@ -74,6 +74,7 @@ DEFAULT_MASTER_CONFIG: dict[str, Any] = {
 NODE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "dcs_main_folder": r"D:\DCS",
     "preserve_mission_scripting": True,
+    "preserve_webgui_app_js": True,
     "network_port": "1015",
     "bind_address": "0.0.0.0",
     "auth_token": "",
@@ -149,6 +150,7 @@ def sanitize_node_settings(
 
     bool_keys = {
         "preserve_mission_scripting",
+        "preserve_webgui_app_js",
         "reboot_after_deployment",
         "watchdog_enabled",
         "auto_restart_dcs",
