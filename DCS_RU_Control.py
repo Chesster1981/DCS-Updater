@@ -60,7 +60,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.2.4"
+CONTROL_PANEL_VERSION = "2.2.5"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -1160,11 +1160,12 @@ class MainWindow(QMainWindow):
         self.spn_watchdog_interval.setStyleSheet(self._dialog_input_style())
 
         self.chk_preserve = QCheckBox("Preserve current MissionScripting.lua")
+        self.chk_preserve_app_js = QCheckBox("Preserve current WebGUI js/app.js")
         self.chk_reboot = QCheckBox("Reboot Windows after DCS update completes")
         self.chk_watchdog = QCheckBox("Watch DCS server health (process + port)")
         self.chk_auto_restart = QCheckBox("Auto-restart DCS only after it was previously running")
         self.chk_defer_rdp = QCheckBox("Block Windows reboot while RustDesk is connected (someone is working)")
-        for chk in (self.chk_preserve, self.chk_reboot, self.chk_watchdog, self.chk_auto_restart, self.chk_defer_rdp):
+        for chk in (self.chk_preserve, self.chk_preserve_app_js, self.chk_reboot, self.chk_watchdog, self.chk_auto_restart, self.chk_defer_rdp):
             chk.setChecked(True)
 
         node_form.addRow("Bind Address:", self.ent_node_bind)
@@ -1172,6 +1173,7 @@ class MainWindow(QMainWindow):
         node_form.addRow("GitHub app updates:", self.cmb_github_interval)
         node_form.addRow("Watchdog interval:", self.spn_watchdog_interval)
         node_form.addRow(self.chk_preserve)
+        node_form.addRow(self.chk_preserve_app_js)
         node_form.addRow(self.chk_reboot)
         node_form.addRow(self.chk_watchdog)
         node_form.addRow(self.chk_auto_restart)
@@ -1222,6 +1224,7 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             self.spn_watchdog_interval.setValue(300)
         self.chk_preserve.setChecked(bool(data.get("preserve_mission_scripting", True)))
+        self.chk_preserve_app_js.setChecked(bool(data.get("preserve_webgui_app_js", True)))
         self.chk_reboot.setChecked(bool(data.get("reboot_after_deployment", True)))
         self.chk_watchdog.setChecked(bool(data.get("watchdog_enabled", True)))
         self.chk_auto_restart.setChecked(bool(data.get("auto_restart_dcs", True)))
@@ -1239,6 +1242,7 @@ class MainWindow(QMainWindow):
             "auto_restart_dcs": self.chk_auto_restart.isChecked(),
             "defer_reboot_for_rdp": self.chk_defer_rdp.isChecked(),
             "preserve_mission_scripting": self.chk_preserve.isChecked(),
+            "preserve_webgui_app_js": self.chk_preserve_app_js.isChecked(),
         }
 
     def _on_node_settings_loaded(self, answer):
