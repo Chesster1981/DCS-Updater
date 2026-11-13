@@ -7,6 +7,7 @@ import sys
 import json
 import time
 import socket
+import queue
 import threading
 import logging
 import subprocess
@@ -76,7 +77,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.6"
+CURRENT_NODE_VERSION = "2.2.7"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -159,6 +160,7 @@ _status_worker = None
 _status_worker_started = 0.0
 _status_worker_stuck_logged = False
 _cached_rustdesk_sessions = 0
+_ui_queue = queue.Queue()
 _TRANSIENT_ACCEPT_WINERRORS = frozenset({10004, 10035, 10053, 10054})
 
 appdata_dir = os.environ.get('APPDATA')
@@ -258,13 +260,7 @@ def sync_settings_widgets(settings: dict):
         except Exception:
             pass
 
-    try:
-        if "root" in globals() and root.winfo_exists():
-            root.after(0, _apply)
-            return
-    except Exception:
-        pass
-    _apply()
+    call_on_ui_thread(_apply)
 
 
 def apply_node_settings(incoming: dict, source="ui"):
@@ -370,8 +366,6 @@ def _execute_silent_node_binary_swap(download_url):
             server_socket.close()
         if tray_icon: 
             tray_icon.stop()
-            
-        root.after(0, root.destroy)
         os._exit(0)
     except Exception as e:
         logging.error(f"Silent node swap crashed: {e}")
@@ -2422,8 +2416,7 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
                     server_socket.close()
                 if tray_icon:
                     tray_icon.stop()
-                root.after(0, root.destroy)
-                sys.exit(0)
+                os._exit(0)
             else:
                 conn.send(b"UNKNOWN_COMMAND\n")
                 conn.close()
@@ -2525,6 +2518,27 @@ def browse_srs_folder(entry_field):
         entry_field.delete(0, tk.END)
         entry_field.insert(0, os.path.normpath(folder))
 
+def call_on_ui_thread(fn):
+    """Queue work for the Tk main thread. Tray and status threads must not call Tk themselves."""
+    _ui_queue.put(fn)
+
+
+def _pump_ui_queue():
+    try:
+        while True:
+            fn = _ui_queue.get_nowait()
+            try:
+                fn()
+            except Exception:
+                logging.exception("UI task failed")
+    except queue.Empty:
+        pass
+    try:
+        root.after(100, _pump_ui_queue)
+    except Exception:
+        pass
+
+
 def append_activity_log(text):
     """Write to file/console always; update the Tk log from the GUI thread only."""
     logging.info(text)
@@ -2537,13 +2551,7 @@ def append_activity_log(text):
         except Exception:
             pass
 
-    try:
-        if "root" in globals() and root.winfo_exists():
-            root.after(0, _write_to_widget)
-            return
-    except Exception:
-        pass
-    _write_to_widget()
+    call_on_ui_thread(_write_to_widget)
 
 def trigger_local_update():
     if messagebox.askyesno("Confirm", "Update DCS on this machine now?"):
@@ -2664,10 +2672,21 @@ def create_tray_image():
     d.rectangle([(8, 8), (56, 56)], fill='#0A84FF')
     return img
 
+def _show_node_window():
+    root.deiconify()
+    root.lift()
+    root.focus_force()
+
+
+def _exit_node_from_tray(icon, _item):
+    call_on_ui_thread(root.destroy)
+    icon.stop()
+
+
 def setup_tray_icon():
     menu = pystray.Menu(
-        pystray.MenuItem('Show Node Window', lambda icon, item: root.after(0, lambda: (root.deiconify(), root.lift(), root.focus_force())), default=True), 
-        pystray.MenuItem('Exit Node', lambda icon, item: (icon.stop(), root.after(0, root.destroy)))
+        pystray.MenuItem('Show Node Window', lambda icon, item: call_on_ui_thread(_show_node_window), default=True),
+        pystray.MenuItem('Exit Node', _exit_node_from_tray)
     )
     global tray_icon
     try:
@@ -2903,6 +2922,7 @@ threading.Thread(target=listener_supervisor_loop, daemon=True, name="listener-su
 threading.Thread(target=lambda: get_srs_latest_version_cached(allow_fetch=True), daemon=True).start()
 refresh_dcs_health_state()
 
+root.after(0, _pump_ui_queue)
 root.after(100, lambda: root.withdraw())
 root.mainloop()
 
