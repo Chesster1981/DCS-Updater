@@ -76,7 +76,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.5"
+CURRENT_NODE_VERSION = "2.2.6"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -111,6 +111,10 @@ RDP_SESSION_POLL_SECONDS = 30
 DCS_PORT_BASE = 10300
 WEBGUI_PLAYERS_CACHE_SECONDS = 5
 WEBGUI_PLAYERS_TIMEOUT = 1.5
+LISTENER_CLIENT_TIMEOUT = 8.0
+LISTENER_ACCEPT_TIMEOUT = 2.0
+STATUS_CACHE_INTERVAL = 8.0
+STATUS_SNAPSHOT_STUCK_SECONDS = 45.0
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 SRS_PROCESS_IMAGES = ("SR-Server.exe", "SRS-Server.exe", "SR_Server.exe")
 SRS_PRESERVE_FILENAMES = ("server.cfg", "banned.txt")
@@ -146,6 +150,16 @@ _webgui_players_cache = {
 }
 
 _watchdog_restart_times = []
+_health_lock = threading.Lock()
+_listener_lock = threading.Lock()
+_status_cache_lock = threading.Lock()
+_status_cache = {}
+_status_cache_at = 0.0
+_status_worker = None
+_status_worker_started = 0.0
+_status_worker_stuck_logged = False
+_cached_rustdesk_sessions = 0
+_TRANSIENT_ACCEPT_WINERRORS = frozenset({10004, 10035, 10053, 10054})
 
 appdata_dir = os.environ.get('APPDATA')
 if appdata_dir:
@@ -364,6 +378,18 @@ def _execute_silent_node_binary_swap(download_url):
         append_activity_log(f" [SYSTEM] Binary swap critical failure: ❌ {e}")
         is_swapping = False  # Reset flag if the initialization crashed
 
+def _version_tuple(version_str: str):
+    parts = []
+    for chunk in str(version_str or "").strip().lstrip("vV").split("."):
+        if not chunk:
+            continue
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
 def check_for_github_node_updates_silent():
     if is_swapping: return  # Safety check
     try:
@@ -384,7 +410,9 @@ def check_for_github_node_updates_silent():
             latest_version = data.get("tag_name", "").replace("v", "").strip()
             append_activity_log(f"[SYSTEM] GitHub comparison: Local version is v{CURRENT_NODE_VERSION} | GitHub latest is v{latest_version}")
             
-            if latest_version and latest_version != CURRENT_NODE_VERSION:
+            remote_v = _version_tuple(latest_version)
+            local_v = _version_tuple(CURRENT_NODE_VERSION)
+            if latest_version and remote_v > local_v:
                 assets = data.get("assets", [])
                 download_url = None
                 append_activity_log(f"[SYSTEM] Found {len(assets)} assets on GitHub release. Scanning...")
@@ -398,6 +426,10 @@ def check_for_github_node_updates_silent():
                     _execute_silent_node_binary_swap(download_url)
                 else:
                     append_activity_log(" [SYSTEM] Version mismatch found, but no asset match on GitHub!")
+            elif latest_version and remote_v < local_v:
+                append_activity_log(
+                    f"[SYSTEM] Local v{CURRENT_NODE_VERSION} is newer than GitHub v{latest_version}. Skipping downgrade."
+                )
             else:
                 append_activity_log("[SYSTEM] Node is already running the latest version.")
     except urllib.error.HTTPError as he:
@@ -605,12 +637,15 @@ def is_dcs_server_process_stem(stem: str, extra_names=None) -> bool:
 def iter_tasklist_processes():
     """Yield (image_name, pid) from Windows tasklist."""
     try:
-        output = subprocess.check_output(
+        proc = subprocess.run(
             ["tasklist", "/FO", "CSV", "/NH"],
+            capture_output=True,
             text=True,
+            timeout=8,
             errors="ignore",
-            **_hidden_subprocess_kwargs(),
+            **_hidden_subprocess_kwargs(capture_output=True),
         )
+        output = proc.stdout or ""
     except Exception:
         return
     for line in output.splitlines():
@@ -720,13 +755,16 @@ def get_pids_listening_on_port(port: int) -> list[int]:
     """Return PIDs with a TCP listener on the given local port."""
     pids = []
     try:
-        output = subprocess.check_output(
+        proc = subprocess.run(
             f'netstat -ano -p tcp | findstr ":{port} "',
             shell=True,
+            capture_output=True,
             text=True,
+            timeout=8,
             errors="ignore",
-            **_hidden_subprocess_kwargs(),
+            **_hidden_subprocess_kwargs(capture_output=True),
         )
+        output = proc.stdout or ""
         for line in output.splitlines():
             upper = line.upper()
             if "LISTENING" not in upper:
@@ -952,21 +990,22 @@ def evaluate_dcs_health(node_port) -> str:
 
 def refresh_dcs_health_state(node_port=None):
     """Refresh node_state from process + port health checks."""
-    if node_port is None:
-        node_port = load_node_settings().get("network_port", "1015")
-    health = evaluate_dcs_health(node_port)
-    if health == DCS_HEALTH_HEALTHY:
-        node_state["dcs_ever_healthy"] = True
-        node_state["dcs_down_since"] = None
-    elif health in (DCS_HEALTH_UNHEALTHY, DCS_HEALTH_DEAD) and node_state.get("dcs_ever_healthy"):
-        if node_state.get("dcs_down_since") is None:
-            node_state["dcs_down_since"] = time.time()
-    else:
-        node_state["dcs_down_since"] = None
-    node_state["dcs_health"] = health
-    node_state["dcs_running"] = health == DCS_HEALTH_HEALTHY
-    node_state["mission_list_empty"] = read_mission_list_empty()
-    return health
+    with _health_lock:
+        if node_port is None:
+            node_port = load_node_settings().get("network_port", "1015")
+        health = evaluate_dcs_health(node_port)
+        if health == DCS_HEALTH_HEALTHY:
+            node_state["dcs_ever_healthy"] = True
+            node_state["dcs_down_since"] = None
+        elif health in (DCS_HEALTH_UNHEALTHY, DCS_HEALTH_DEAD) and node_state.get("dcs_ever_healthy"):
+            if node_state.get("dcs_down_since") is None:
+                node_state["dcs_down_since"] = time.time()
+        else:
+            node_state["dcs_down_since"] = None
+        node_state["dcs_health"] = health
+        node_state["dcs_running"] = health == DCS_HEALTH_HEALTHY
+        node_state["mission_list_empty"] = read_mission_list_empty()
+        return health
 
 
 def dcs_down_grace_elapsed() -> bool:
@@ -1631,10 +1670,10 @@ def count_active_rustdesk_sessions() -> int:
 
 def has_active_rustdesk_session() -> bool:
     """
-    True when RustDesk Connection Manager is running.
-    RustDesk starts `rustdesk.exe --cm` / `--cm-no-ui` only while a remote client is connected.
+    True when the background scan has seen a RustDesk Connection Manager session.
+    Callers on the status port must not start a new WMIC/PowerShell scan.
     """
-    return count_active_rustdesk_sessions() > 0
+    return _cached_rustdesk_sessions > 0
 
 
 def has_active_rdp_session() -> bool:
@@ -1644,11 +1683,13 @@ def has_active_rdp_session() -> bool:
 
 def rustdesk_session_monitor_loop():
     """Log RustDesk connect/disconnect so operators can verify detection without rebooting."""
+    global _cached_rustdesk_sessions
     last_count = None
     poll = max(15, RDP_SESSION_POLL_SECONDS)
     while node_state.get("is_running", True):
         try:
             count = count_active_rustdesk_sessions()
+            _cached_rustdesk_sessions = count
             if last_count is None:
                 if count:
                     append_activity_log(
@@ -1968,6 +2009,130 @@ def execute_deployment_pipeline():
         append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
         node_state["active_task"] = "Idle"
 
+def _accept_error_is_transient(err: BaseException) -> bool:
+    """Client aborted while the handshake was still in progress. Keep listening."""
+    if isinstance(err, (ConnectionAbortedError, ConnectionResetError, TimeoutError, InterruptedError)):
+        return True
+    winerror = getattr(err, "winerror", None)
+    if winerror in _TRANSIENT_ACCEPT_WINERRORS:
+        return True
+    err_no = getattr(err, "errno", None)
+    return err_no in _TRANSIENT_ACCEPT_WINERRORS or err_no in (4, 11, 35)
+
+
+def build_status_payload() -> dict:
+    """Collect DCS/SRS/WebGUI/RustDesk state. Never call this on the TCP listener thread."""
+    inst_v, cloud_v = get_dcs_versions_local()
+    settings = load_node_settings()
+    node_port = settings.get("network_port", "1015")
+    dcs_health = refresh_dcs_health_state(node_port)
+    srs_configured = bool(str(settings.get("srs_install_folder") or "").strip())
+    rd_count = _cached_rustdesk_sessions
+    dcs_players, dcs_player_names, dcs_max_players = read_dcs_player_snapshot(
+        node_port, dcs_health
+    )
+    return {
+        "status": "ACK",
+        "installed_version": inst_v,
+        "latest_cloud_version": cloud_v,
+        "active_task": node_state["active_task"],
+        "node_version": CURRENT_NODE_VERSION,
+        "dcs_running": dcs_health == DCS_HEALTH_HEALTHY,
+        "dcs_health": dcs_health,
+        "mission_list_empty": node_state.get("mission_list_empty"),
+        "srs_configured": srs_configured,
+        "srs_running": is_srs_process_running() if srs_configured else False,
+        "srs_installed_version": get_srs_installed_version(),
+        "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
+        "rdp_session_active": rd_count > 0,
+        "rdp_session_count": rd_count,
+        "dcs_players": dcs_players,
+        "dcs_max_players": dcs_max_players,
+        "dcs_player_names": dcs_player_names,
+    }
+
+
+def _refresh_status_cache_once():
+    global _status_cache_at
+    try:
+        payload = build_status_payload()
+    except Exception as err:
+        logging.error("Status snapshot failed: %s", err)
+        return
+    with _status_cache_lock:
+        _status_cache.clear()
+        _status_cache.update(payload)
+        _status_cache_at = time.time()
+
+
+def status_cache_loop():
+    """Refresh the status cache off the TCP thread so a slow scan cannot block replies."""
+    global _status_worker, _status_worker_started, _status_worker_stuck_logged
+    while node_state.get("is_running", True):
+        try:
+            if is_swapping:
+                time.sleep(2)
+                continue
+            worker = _status_worker
+            if worker is not None and worker.is_alive():
+                stuck_for = time.time() - _status_worker_started
+                if stuck_for >= STATUS_SNAPSHOT_STUCK_SECONDS and not _status_worker_stuck_logged:
+                    _status_worker_stuck_logged = True
+                    logging.warning(
+                        "Status snapshot still running after %.0fs. Serving the last cache.",
+                        stuck_for,
+                    )
+                    append_activity_log(
+                        "[STATUS] Health scan is stuck. Status requests are still being answered."
+                    )
+            else:
+                _status_worker_stuck_logged = False
+                _status_worker_started = time.time()
+                _status_worker = threading.Thread(
+                    target=_refresh_status_cache_once,
+                    name="status-snapshot",
+                    daemon=True,
+                )
+                _status_worker.start()
+        except Exception as err:
+            logging.error("Status cache loop error: %s", err)
+        time.sleep(STATUS_CACHE_INTERVAL)
+
+
+def status_payload_for_client() -> dict:
+    """Return the latest cached status immediately. Overlay fields that change between scans."""
+    with _status_cache_lock:
+        payload = dict(_status_cache) if _status_cache else None
+    rd_count = _cached_rustdesk_sessions
+    if payload is None:
+        health = node_state.get("dcs_health", DCS_HEALTH_NEVER_STARTED)
+        payload = {
+            "status": "ACK",
+            "installed_version": node_state.get("installed_version", "Unknown"),
+            "latest_cloud_version": node_state.get("latest_cloud_version", "Unknown"),
+            "active_task": node_state.get("active_task", "Idle"),
+            "node_version": CURRENT_NODE_VERSION,
+            "dcs_running": health == DCS_HEALTH_HEALTHY,
+            "dcs_health": health,
+            "mission_list_empty": node_state.get("mission_list_empty"),
+            "srs_configured": bool(str(load_node_settings().get("srs_install_folder") or "").strip()),
+            "srs_running": False,
+            "srs_installed_version": "—",
+            "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
+            "rdp_session_active": rd_count > 0,
+            "rdp_session_count": rd_count,
+            "dcs_players": None,
+            "dcs_max_players": None,
+            "dcs_player_names": [],
+        }
+        return payload
+    payload["active_task"] = node_state.get("active_task", "Idle")
+    payload["node_version"] = CURRENT_NODE_VERSION
+    payload["rdp_session_active"] = rd_count > 0
+    payload["rdp_session_count"] = rd_count
+    return payload
+
+
 def network_socket_listener(port, bind_address="0.0.0.0"):
     global server_socket, is_listening
     config = load_node_settings()
@@ -1978,7 +2143,8 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         server_socket.bind((bind_host, port))
-        server_socket.listen(5)
+        server_socket.listen(32)
+        server_socket.settimeout(LISTENER_ACCEPT_TIMEOUT)
         is_listening = True
     except Exception as e:
         logging.error("Could not bind network listener to %s:%s: %s", bind_host, port, e)
@@ -1994,288 +2160,301 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
     while is_listening:
         try:
             conn, addr = server_socket.accept()
+        except TimeoutError:
+            continue
+        except OSError as err:
             if not is_listening:
                 break
-
+            if _accept_error_is_transient(err):
+                logging.warning("Listener ignored aborted connection: %s", err)
+                continue
+            logging.error("Listener accept failed: %s", err)
+            append_activity_log(
+                f"[LISTENER] Status port stopped accepting connections ({err}). It will be restarted."
+            )
+            is_listening = False
             try:
-                # Reload token so settings changes apply without full restart of process
-                live_token = str(load_node_settings().get("auth_token", "")).strip()
-                data = conn.recv(65536)
-                if not data:
-                    conn.close()
-                    continue
-                raw_message = data.decode("utf-8").strip()
-                command, authorized = parse_authenticated_command(raw_message, live_token)
+                server_socket.close()
+            except Exception:
+                pass
+            break
+        if not is_listening:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            break
 
-                if not authorized or not command:
-                    append_activity_log(f" [SECURITY] Rejected unauthorized command from {addr[0]}")
+        try:
+            conn.settimeout(LISTENER_CLIENT_TIMEOUT)
+            # Reload token so settings changes apply without full restart of process
+            live_token = str(load_node_settings().get("auth_token", "")).strip()
+            data = conn.recv(65536)
+            if not data:
+                conn.close()
+                continue
+            raw_message = data.decode("utf-8").strip()
+            command, authorized = parse_authenticated_command(raw_message, live_token)
+
+            if not authorized or not command:
+                append_activity_log(f" [SECURITY] Rejected unauthorized command from {addr[0]}")
+                conn.send((json.dumps({"status": "UNAUTHORIZED"}) + "\n").encode("utf-8"))
+                conn.close()
+                continue
+
+            if command == "PING_STATUS":
+                response = status_payload_for_client()
+                conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                conn.close()
+            elif command == "GET_SETTINGS":
+                response = {
+                    "status": "ACK",
+                    "settings": load_node_settings(),
+                }
+                conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                conn.close()
+            elif command.startswith("SET_SETTINGS"):
+                if is_swapping:
+                    conn.send((json.dumps({
+                        "status": "REJECTED_BUSY",
+                        "task": "Updating",
+                    }) + "\n").encode("utf-8"))
+                    conn.close()
+                else:
+                    raw_payload = command[len("SET_SETTINGS"):].strip()
+                    try:
+                        incoming = json.loads(raw_payload) if raw_payload else {}
+                        if not isinstance(incoming, dict):
+                            raise ValueError("settings payload must be a JSON object")
+                    except Exception as e:
+                        conn.send((json.dumps({
+                            "status": "ERROR",
+                            "message": f"Invalid settings JSON: {e}",
+                        }) + "\n").encode("utf-8"))
+                        conn.close()
+                    else:
+                        existing = load_node_settings()
+                        merged = sanitize_node_settings(incoming, existing, remote=True)
+                        old_port = str(existing.get("network_port", "1015"))
+                        old_bind = str(existing.get("bind_address", "0.0.0.0"))
+                        write_node_settings_file(merged)
+                        listener_restart = (
+                            str(merged.get("network_port", "1015")) != old_port
+                            or str(merged.get("bind_address", "0.0.0.0")) != old_bind
+                        )
+                        conn.send((json.dumps({
+                            "status": "ACK",
+                            "settings": merged,
+                            "listener_restart": listener_restart,
+                        }) + "\n").encode("utf-8"))
+                        conn.close()
+                        append_activity_log("[REMOTE] Node settings updated from Control Panel.")
+                        sync_settings_widgets(merged)
+                        if listener_restart:
+                            def _restart_after_settings():
+                                time.sleep(0.2)
+                                start_or_restart_listener(
+                                    merged.get("network_port"),
+                                    merged.get("bind_address"),
+                                )
+                            threading.Thread(target=_restart_after_settings, daemon=True).start()
+            elif command == "TRIGGER_SRS_UPDATE":
+                if is_swapping or node_state["active_task"] != "Idle":
+                    response = {
+                        "status": "REJECTED_BUSY",
+                        "task": node_state["active_task"],
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                elif not str(load_node_settings().get("srs_install_folder") or "").strip():
+                    conn.send((json.dumps({
+                        "status": "ERROR",
+                        "message": "SRS install folder is not set on this Node.",
+                    }) + "\n").encode("utf-8"))
+                    conn.close()
+                else:
+                    response = {"status": "OK_STARTING"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log("[REMOTE] Control Panel requested SRS Server update.")
+                    threading.Thread(target=execute_srs_update_pipeline, daemon=True).start()
+            elif command == "TRIGGER_DCS_UPDATE":
+                if node_state["active_task"] == "Idle":
+                    response = {"status": "OK_STARTING"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log(" Remote signal authorized! Starting 🚀 update...")
+                    threading.Thread(target=execute_deployment_pipeline, daemon=True).start()
+                else:
+                    response = {"status": "REJECTED_BUSY", "task": node_state["active_task"]}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+            elif command == "CHECK_NODE_UPDATE":
+                if is_swapping:
+                    response = {"status": "REJECTED_BUSY", "task": "Updating node"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                else:
+                    response = {"status": "OK_STARTING"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log(
+                        "[REMOTE] Control Panel requested an immediate GitHub Node update check."
+                    )
+                    force_github_update_check(silent=True)
+            elif command == "RESTART_DCS":
+                if is_swapping or node_state["active_task"] != "Idle":
+                    response = {
+                        "status": "REJECTED_BUSY",
+                        "task": node_state["active_task"],
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                elif not can_auto_restart_dcs():
+                    response = {"status": "REJECTED_LIMIT"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log(
+                        "[REMOTE] Discord bot asked for DCS restart, but the hourly limit is reached."
+                    )
+                else:
+                    node_state["active_task"] = "Restarting DCS"
+                    response = {"status": "OK_STARTING"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log("[REMOTE] Discord bot requested DCS restart.")
+                    threading.Thread(
+                        target=execute_dcs_restart,
+                        kwargs={
+                            "node_port": load_node_settings().get("network_port", "1015"),
+                            "source": "remote",
+                        },
+                        daemon=True,
+                    ).start()
+            elif command == "OPERATOR_RESTART_DCS":
+                if is_swapping or node_state["active_task"] != "Idle":
+                    response = {
+                        "status": "REJECTED_BUSY",
+                        "task": node_state["active_task"],
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                else:
+                    node_state["active_task"] = "Restarting DCS"
+                    response = {"status": "OK_STARTING"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log("[REMOTE] Operator requested DCS restart.")
+                    threading.Thread(
+                        target=execute_dcs_restart,
+                        kwargs={
+                            "node_port": load_node_settings().get("network_port", "1015"),
+                            "source": "remote",
+                        },
+                        daemon=True,
+                    ).start()
+            elif command == "RESTART_SRS":
+                if is_swapping or node_state["active_task"] != "Idle":
+                    response = {
+                        "status": "REJECTED_BUSY",
+                        "task": node_state["active_task"],
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                elif not str(load_node_settings().get("srs_install_folder") or "").strip():
+                    conn.send((json.dumps({
+                        "status": "ERROR",
+                        "message": "SRS install folder is not set on this Node.",
+                    }) + "\n").encode("utf-8"))
+                    conn.close()
+                else:
+                    response = {"status": "OK_STARTING"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log("[REMOTE] Operator requested SRS restart.")
+                    threading.Thread(
+                        target=execute_srs_restart,
+                        kwargs={"source": "remote"},
+                        daemon=True,
+                    ).start()
+            elif command == "REBOOT_WINDOWS":
+                if is_swapping or node_state["active_task"] != "Idle":
+                    response = {
+                        "status": "REJECTED_BUSY",
+                        "task": node_state["active_task"],
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                elif reboot_blocked_by_rdp():
+                    response = {
+                        "status": "REJECTED_RDP",
+                        "message": (
+                            "Active RustDesk session — reboot refused while "
+                            "someone is working on the server."
+                        ),
+                    }
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log(
+                        "[REMOTE] Windows reboot refused — active RustDesk session."
+                    )
+                else:
+                    response = {"status": "OK_STARTING"}
+                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
+                    conn.close()
+                    append_activity_log("[REMOTE] Operator requested Windows reboot.")
+                    threading.Thread(
+                        target=execute_windows_reboot,
+                        kwargs={"source": "remote", "delay_seconds": 10},
+                        daemon=True,
+                    ).start()
+            elif command == "EXIT_NODE":
+                # Local takeover only: require loopback when auth is enabled
+                if live_token and addr[0] not in ("127.0.0.1", "::1"):
                     conn.send((json.dumps({"status": "UNAUTHORIZED"}) + "\n").encode("utf-8"))
                     conn.close()
                     continue
-
-                if command == "PING_STATUS":
-                    inst_v, cloud_v = get_dcs_versions_local()
-                    node_port = load_node_settings().get("network_port", "1015")
-                    dcs_health = refresh_dcs_health_state(node_port)
-                    srs_configured = bool(
-                        str(load_node_settings().get("srs_install_folder") or "").strip()
-                    )
-                    rd_count = count_active_rustdesk_sessions()
-                    dcs_players, dcs_player_names, dcs_max_players = read_dcs_player_snapshot(
-                        node_port, dcs_health
-                    )
-                    response = {
-                        "status": "ACK",
-                        "installed_version": inst_v,
-                        "latest_cloud_version": cloud_v,
-                        "active_task": node_state["active_task"],
-                        "node_version": CURRENT_NODE_VERSION,
-                        "dcs_running": dcs_health == DCS_HEALTH_HEALTHY,
-                        "dcs_health": dcs_health,
-                        "mission_list_empty": node_state.get("mission_list_empty"),
-                        "srs_configured": srs_configured,
-                        "srs_running": is_srs_process_running() if srs_configured else False,
-                        "srs_installed_version": get_srs_installed_version(),
-                        "srs_latest_version": get_srs_latest_version_cached(allow_fetch=False),
-                        "rdp_session_active": rd_count > 0,
-                        "rdp_session_count": rd_count,
-                        "dcs_players": dcs_players,
-                        "dcs_max_players": dcs_max_players,
-                        "dcs_player_names": dcs_player_names,
-                    }
-                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                    conn.close()
-                elif command == "GET_SETTINGS":
-                    response = {
-                        "status": "ACK",
-                        "settings": load_node_settings(),
-                    }
-                    conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                    conn.close()
-                elif command.startswith("SET_SETTINGS"):
-                    if is_swapping:
-                        conn.send((json.dumps({
-                            "status": "REJECTED_BUSY",
-                            "task": "Updating",
-                        }) + "\n").encode("utf-8"))
-                        conn.close()
-                    else:
-                        raw_payload = command[len("SET_SETTINGS"):].strip()
-                        try:
-                            incoming = json.loads(raw_payload) if raw_payload else {}
-                            if not isinstance(incoming, dict):
-                                raise ValueError("settings payload must be a JSON object")
-                        except Exception as e:
-                            conn.send((json.dumps({
-                                "status": "ERROR",
-                                "message": f"Invalid settings JSON: {e}",
-                            }) + "\n").encode("utf-8"))
-                            conn.close()
-                        else:
-                            existing = load_node_settings()
-                            merged = sanitize_node_settings(incoming, existing, remote=True)
-                            old_port = str(existing.get("network_port", "1015"))
-                            old_bind = str(existing.get("bind_address", "0.0.0.0"))
-                            write_node_settings_file(merged)
-                            listener_restart = (
-                                str(merged.get("network_port", "1015")) != old_port
-                                or str(merged.get("bind_address", "0.0.0.0")) != old_bind
-                            )
-                            conn.send((json.dumps({
-                                "status": "ACK",
-                                "settings": merged,
-                                "listener_restart": listener_restart,
-                            }) + "\n").encode("utf-8"))
-                            conn.close()
-                            append_activity_log("[REMOTE] Node settings updated from Control Panel.")
-                            sync_settings_widgets(merged)
-                            if listener_restart:
-                                def _restart_after_settings():
-                                    time.sleep(0.2)
-                                    start_or_restart_listener(
-                                        merged.get("network_port"),
-                                        merged.get("bind_address"),
-                                    )
-                                threading.Thread(target=_restart_after_settings, daemon=True).start()
-                elif command == "TRIGGER_SRS_UPDATE":
-                    if is_swapping or node_state["active_task"] != "Idle":
-                        response = {
-                            "status": "REJECTED_BUSY",
-                            "task": node_state["active_task"],
-                        }
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                    elif not str(load_node_settings().get("srs_install_folder") or "").strip():
-                        conn.send((json.dumps({
-                            "status": "ERROR",
-                            "message": "SRS install folder is not set on this Node.",
-                        }) + "\n").encode("utf-8"))
-                        conn.close()
-                    else:
-                        response = {"status": "OK_STARTING"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log("[REMOTE] Control Panel requested SRS Server update.")
-                        threading.Thread(target=execute_srs_update_pipeline, daemon=True).start()
-                elif command == "TRIGGER_DCS_UPDATE":
-                    if node_state["active_task"] == "Idle":
-                        response = {"status": "OK_STARTING"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log(" Remote signal authorized! Starting 🚀 update...")
-                        threading.Thread(target=execute_deployment_pipeline, daemon=True).start()
-                    else:
-                        response = {"status": "REJECTED_BUSY", "task": node_state["active_task"]}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                elif command == "CHECK_NODE_UPDATE":
-                    if is_swapping:
-                        response = {"status": "REJECTED_BUSY", "task": "Updating node"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                    else:
-                        response = {"status": "OK_STARTING"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log(
-                            "[REMOTE] Control Panel requested an immediate GitHub Node update check."
-                        )
-                        force_github_update_check(silent=True)
-                elif command == "RESTART_DCS":
-                    if is_swapping or node_state["active_task"] != "Idle":
-                        response = {
-                            "status": "REJECTED_BUSY",
-                            "task": node_state["active_task"],
-                        }
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                    elif not can_auto_restart_dcs():
-                        response = {"status": "REJECTED_LIMIT"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log(
-                            "[REMOTE] Discord bot asked for DCS restart, but the hourly limit is reached."
-                        )
-                    else:
-                        node_state["active_task"] = "Restarting DCS"
-                        response = {"status": "OK_STARTING"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log("[REMOTE] Discord bot requested DCS restart.")
-                        threading.Thread(
-                            target=execute_dcs_restart,
-                            kwargs={
-                                "node_port": load_node_settings().get("network_port", "1015"),
-                                "source": "remote",
-                            },
-                            daemon=True,
-                        ).start()
-                elif command == "OPERATOR_RESTART_DCS":
-                    if is_swapping or node_state["active_task"] != "Idle":
-                        response = {
-                            "status": "REJECTED_BUSY",
-                            "task": node_state["active_task"],
-                        }
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                    else:
-                        node_state["active_task"] = "Restarting DCS"
-                        response = {"status": "OK_STARTING"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log("[REMOTE] Operator requested DCS restart.")
-                        threading.Thread(
-                            target=execute_dcs_restart,
-                            kwargs={
-                                "node_port": load_node_settings().get("network_port", "1015"),
-                                "source": "remote",
-                            },
-                            daemon=True,
-                        ).start()
-                elif command == "RESTART_SRS":
-                    if is_swapping or node_state["active_task"] != "Idle":
-                        response = {
-                            "status": "REJECTED_BUSY",
-                            "task": node_state["active_task"],
-                        }
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                    elif not str(load_node_settings().get("srs_install_folder") or "").strip():
-                        conn.send((json.dumps({
-                            "status": "ERROR",
-                            "message": "SRS install folder is not set on this Node.",
-                        }) + "\n").encode("utf-8"))
-                        conn.close()
-                    else:
-                        response = {"status": "OK_STARTING"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log("[REMOTE] Operator requested SRS restart.")
-                        threading.Thread(
-                            target=execute_srs_restart,
-                            kwargs={"source": "remote"},
-                            daemon=True,
-                        ).start()
-                elif command == "REBOOT_WINDOWS":
-                    if is_swapping or node_state["active_task"] != "Idle":
-                        response = {
-                            "status": "REJECTED_BUSY",
-                            "task": node_state["active_task"],
-                        }
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                    elif reboot_blocked_by_rdp():
-                        response = {
-                            "status": "REJECTED_RDP",
-                            "message": (
-                                "Active RustDesk session — reboot refused while "
-                                "someone is working on the server."
-                            ),
-                        }
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log(
-                            "[REMOTE] Windows reboot refused — active RustDesk session."
-                        )
-                    else:
-                        response = {"status": "OK_STARTING"}
-                        conn.send((json.dumps(response) + "\n").encode("utf-8"))
-                        conn.close()
-                        append_activity_log("[REMOTE] Operator requested Windows reboot.")
-                        threading.Thread(
-                            target=execute_windows_reboot,
-                            kwargs={"source": "remote", "delay_seconds": 10},
-                            daemon=True,
-                        ).start()
-                elif command == "EXIT_NODE":
-                    # Local takeover only: require loopback when auth is enabled
-                    if live_token and addr[0] not in ("127.0.0.1", "::1"):
-                        conn.send((json.dumps({"status": "UNAUTHORIZED"}) + "\n").encode("utf-8"))
-                        conn.close()
-                        continue
-                    append_activity_log(" Remote exit commanded by newer takeover 🛑 node instance.")
-                    conn.send(b"ACK_EXIT\n")
-                    conn.close()
-                    is_listening = False
-                    if server_socket:
-                        server_socket.close()
-                    if tray_icon:
-                        tray_icon.stop()
-                    root.after(0, root.destroy)
-                    sys.exit(0)
-                else:
-                    conn.send(b"UNKNOWN_COMMAND\n")
-                    conn.close()
-            except Exception as inner_err:
-                logging.error(f"Active transaction broken mid-stream: {inner_err}")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                continue
-        except Exception as outer_err:
-            logging.error(f"Critical socket acceptor loop crash: {outer_err}")
-            break
+                append_activity_log(" Remote exit commanded by newer takeover 🛑 node instance.")
+                conn.send(b"ACK_EXIT\n")
+                conn.close()
+                is_listening = False
+                if server_socket:
+                    server_socket.close()
+                if tray_icon:
+                    tray_icon.stop()
+                root.after(0, root.destroy)
+                sys.exit(0)
+            else:
+                conn.send(b"UNKNOWN_COMMAND\n")
+                conn.close()
+        except TimeoutError:
+            logging.info("Listener dropped a client that sent no command in time.")
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+        except OSError as inner_err:
+            winerror = getattr(inner_err, "winerror", None)
+            if winerror == 10054 or isinstance(inner_err, ConnectionResetError):
+                logging.warning(
+                    "Client closed the connection before the node finished answering: %s",
+                    inner_err,
+                )
+            else:
+                logging.error("Active transaction broken mid-stream: %s", inner_err)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
+        except Exception as inner_err:
+            logging.error("Active transaction broken mid-stream: %s", inner_err)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            continue
 
 
 
@@ -2283,6 +2462,11 @@ def network_socket_listener(port, bind_address="0.0.0.0"):
 # BLOCK 4 OF 6: USER INTERACTION MESSAGES, FILE BROWSER & SYSTEM TRAY ENGINE
 # =========================================================================
 def start_or_restart_listener(port_str=None, bind_address=None):
+    with _listener_lock:
+        _start_or_restart_listener_locked(port_str, bind_address)
+
+
+def _start_or_restart_listener_locked(port_str=None, bind_address=None):
     global server_socket, is_listening, listener_thread
     config = load_node_settings()
     if port_str is None:
@@ -2294,21 +2478,39 @@ def start_or_restart_listener(port_str=None, bind_address=None):
     except ValueError:
         return
 
-    if is_listening and server_socket:
+    if server_socket is not None:
+        was_listening = is_listening
         is_listening = False
         try:
             server_socket.close()
         except Exception:
             pass
-        append_activity_log(" Previous listener terminated. 🛑")
+        server_socket = None
+        if was_listening:
+            append_activity_log(" Previous listener terminated. 🛑")
 
     time.sleep(0.3)
     listener_thread = threading.Thread(
         target=network_socket_listener,
         args=(new_port, str(bind_address).strip() or "0.0.0.0"),
         daemon=True,
+        name="status-listener",
     )
     listener_thread.start()
+
+
+def listener_supervisor_loop():
+    """Bring the status port back if its thread exits. The window and watchdog keep running either way."""
+    while node_state.get("is_running", True):
+        time.sleep(5)
+        if is_swapping:
+            continue
+        thread = listener_thread
+        if thread is None or thread.is_alive():
+            continue
+        append_activity_log("[LISTENER] Status port thread stopped. Restarting it.")
+        logging.error("Listener thread exited; restarting")
+        start_or_restart_listener()
 
 def browse_dcs_folder(entry_field):
     folder = filedialog.askdirectory(title="Select DCS Installation Folder (Main Root)")
@@ -2696,6 +2898,8 @@ get_dcs_versions_local()
 threading.Thread(target=github_update_monitor_loop, daemon=True).start()
 threading.Thread(target=dcs_watchdog_loop, daemon=True).start()
 threading.Thread(target=rustdesk_session_monitor_loop, daemon=True).start()
+threading.Thread(target=status_cache_loop, daemon=True, name="status-cache").start()
+threading.Thread(target=listener_supervisor_loop, daemon=True, name="listener-supervisor").start()
 threading.Thread(target=lambda: get_srs_latest_version_cached(allow_fetch=True), daemon=True).start()
 refresh_dcs_health_state()
 
