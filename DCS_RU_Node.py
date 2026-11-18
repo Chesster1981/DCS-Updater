@@ -77,7 +77,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.7"
+CURRENT_NODE_VERSION = "2.2.8"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -115,7 +115,8 @@ WEBGUI_PLAYERS_TIMEOUT = 1.5
 LISTENER_CLIENT_TIMEOUT = 8.0
 LISTENER_ACCEPT_TIMEOUT = 2.0
 STATUS_CACHE_INTERVAL = 8.0
-STATUS_SNAPSHOT_STUCK_SECONDS = 45.0
+STATUS_SNAPSHOT_STUCK_SECONDS = 20.0
+HEALTH_SCAN_STEP_TIMEOUT = 8.0
 WATCHDOG_MAX_RESTARTS_PER_HOUR = 3
 SRS_PROCESS_IMAGES = ("SR-Server.exe", "SRS-Server.exe", "SR_Server.exe")
 SRS_PRESERVE_FILENAMES = ("server.cfg", "banned.txt")
@@ -172,13 +173,46 @@ else:
 os.makedirs(application_path, exist_ok=True)
 log_file_absolute_path = os.path.join(application_path, "dcs_node_updater.log")
 
+
+class NonBlockingFileHandler(logging.Handler):
+    """Queue log lines so a locked log file cannot freeze the GUI or worker threads."""
+
+    def __init__(self, path, max_queue=5000):
+        super().__init__()
+        self._path = path
+        self._queue = queue.Queue(maxsize=max_queue)
+        self._writer = threading.Thread(
+            target=self._write_loop, name="log-writer", daemon=True
+        )
+        self._writer.start()
+
+    def emit(self, record):
+        try:
+            self._queue.put_nowait(self.format(record))
+        except Exception:
+            pass
+
+    def _write_loop(self):
+        while True:
+            try:
+                line = self._queue.get()
+            except Exception:
+                time.sleep(0.5)
+                continue
+            try:
+                with open(self._path, "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except Exception:
+                time.sleep(0.5)
+
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(log_file_absolute_path, encoding="utf-8")
-    ]
+        NonBlockingFileHandler(log_file_absolute_path),
+    ],
 )
 
 def handle_single_instance_takeover():
@@ -716,7 +750,7 @@ def iter_windows_processes():
         yield image, pid, ""
 
 
-def list_running_dcs_server_processes(config=None):
+def _list_running_dcs_server_processes_blocking(config=None):
     """
     Return [(task_manager_label, pid, kill_image), ...].
     kill_image is the real exe filename used by taskkill (e.g. DCS_server.exe).
@@ -738,6 +772,17 @@ def list_running_dcs_server_processes(config=None):
         kill_image = exe_file or image
         matches.append((label, pid, kill_image))
     return matches
+
+
+def list_running_dcs_server_processes(config=None):
+    """Timed wrapper so a hung OpenProcess/Toolhelp scan cannot block health forever."""
+    result = _call_with_timeout(
+        lambda: _list_running_dcs_server_processes_blocking(config),
+        HEALTH_SCAN_STEP_TIMEOUT,
+        default=[],
+        name="dcs-process-scan",
+    )
+    return result if isinstance(result, list) else []
 
 
 def is_dcs_server_process_running(config=None) -> bool:
@@ -819,47 +864,76 @@ def describe_running_dcs_server_processes(config=None) -> str:
     )
 
 
-def has_dcs_crash_dialog() -> bool:
-    """Detect Eagle Dynamics crash/report dialogs while the process may still be alive."""
+def _call_with_timeout(fn, timeout, default=None, name="timed-call"):
+    """Run fn on a daemon thread; return default if it exceeds timeout."""
+    box = {"value": default, "error": None}
+
+    def _runner():
+        try:
+            box["value"] = fn()
+        except Exception as err:
+            box["error"] = err
+
+    worker = threading.Thread(target=_runner, name=name, daemon=True)
+    worker.start()
+    worker.join(max(0.1, float(timeout)))
+    if worker.is_alive():
+        logging.warning("%s exceeded %.1fs; using fallback result", name, timeout)
+        return default
+    if box["error"] is not None:
+        logging.debug("%s failed: %s", name, box["error"])
+        return default
+    return box["value"]
+
+
+def _scan_dcs_crash_dialog() -> bool:
+    """Blocking EnumWindows scan for Eagle Dynamics crash/report dialogs."""
     if sys.platform != "win32":
         return False
-    try:
-        import ctypes
-        from ctypes import wintypes
+    from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
-        found = False
-        keywords = (
-            "crash",
-            "problem",
-            "eagle dynamics",
-            "error report",
-            "stopped working",
-            "send report",
-        )
+    user32 = ctypes.windll.user32
+    found = False
+    keywords = (
+        "crash",
+        "problem",
+        "eagle dynamics",
+        "error report",
+        "stopped working",
+        "send report",
+    )
 
-        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        def callback(hwnd, _lparam):
-            nonlocal found
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            length = user32.GetWindowTextLengthW(hwnd) + 1
-            if length <= 1:
-                return True
-            buf = ctypes.create_unicode_buffer(length)
-            user32.GetWindowTextW(hwnd, buf, length)
-            title = buf.value.lower()
-            if any(keyword in title for keyword in keywords):
-                if "dcs" in title or "digital combat simulator" in title:
-                    found = True
-                    return False
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _lparam):
+        nonlocal found
+        if not user32.IsWindowVisible(hwnd):
             return True
+        length = user32.GetWindowTextLengthW(hwnd) + 1
+        if length <= 1:
+            return True
+        buf = ctypes.create_unicode_buffer(length)
+        user32.GetWindowTextW(hwnd, buf, length)
+        title = buf.value.lower()
+        if any(keyword in title for keyword in keywords):
+            if "dcs" in title or "digital combat simulator" in title:
+                found = True
+                return False
+        return True
 
-        user32.EnumWindows(callback, 0)
-        return found
-    except Exception as e:
-        logging.debug("Crash dialog scan failed: %s", e)
-        return False
+    user32.EnumWindows(callback, 0)
+    return found
+
+
+def has_dcs_crash_dialog() -> bool:
+    """Detect Eagle Dynamics crash/report dialogs while the process may still be alive."""
+    return bool(
+        _call_with_timeout(
+            _scan_dcs_crash_dialog,
+            HEALTH_SCAN_STEP_TIMEOUT,
+            default=False,
+            name="crash-dialog-scan",
+        )
+    )
 
 
 def resolve_dcs_saved_games_roots(config=None) -> list[str]:
@@ -939,55 +1013,61 @@ def read_mission_list_empty(config=None) -> bool | None:
     return mission_list_is_empty(text)
 
 
-def evaluate_dcs_health(node_port) -> str:
+def evaluate_dcs_health(node_port, *, ever_healthy=None, process_seen_at=None) -> tuple[str, bool, bool | None]:
     """
-    Classify DCS server state on every scan (nothing is locked from the first check):
-    - HEALTHY: listening port (primary) and no crash dialog
-    - STARTING: process seen but port not open yet, and DCS was never healthy this boot
-    - PAUSED: process up / port closed, and missionList is empty (intentional idle)
-    - UNHEALTHY: crash dialog, or process alive / port closed after a prior healthy run
-    - DEAD: process/port gone after having been healthy before
-    - NEVER_STARTED: never seen a dedicated-server process this boot
+    Classify DCS server state. Slow Windows I/O runs without holding _health_lock.
+    Returns (health, process_up, mission_empty).
     """
     config = load_node_settings()
+    if ever_healthy is None:
+        ever_healthy = bool(node_state.get("dcs_ever_healthy"))
+    if process_seen_at is None:
+        process_seen_at = node_state.get("dcs_process_seen_at")
+
     port_up = is_dcs_port_listening(node_port)
     crash_dialog = has_dcs_crash_dialog()
     process_up = is_dcs_server_process_running(config)
     mission_empty = read_mission_list_empty(config)
 
-    if process_up and node_state.get("dcs_process_seen_at") is None:
-        node_state["dcs_process_seen_at"] = time.time()
-
     if crash_dialog:
-        return DCS_HEALTH_UNHEALTHY
+        return DCS_HEALTH_UNHEALTHY, process_up, mission_empty
     if port_up:
-        return DCS_HEALTH_HEALTHY
+        return DCS_HEALTH_HEALTHY, process_up, mission_empty
     if process_up:
         # No mission loaded → intentional pause (port will not answer).
         if mission_empty is True:
-            return DCS_HEALTH_PAUSED
-        if node_state.get("dcs_ever_healthy"):
-            return DCS_HEALTH_UNHEALTHY
-        seen_at = node_state.get("dcs_process_seen_at") or time.time()
+            return DCS_HEALTH_PAUSED, process_up, mission_empty
+        if ever_healthy:
+            return DCS_HEALTH_UNHEALTHY, process_up, mission_empty
+        seen_at = process_seen_at or time.time()
         if time.time() - seen_at < DCS_STARTUP_GRACE_SECONDS:
-            return DCS_HEALTH_STARTING
-        return DCS_HEALTH_UNHEALTHY
+            return DCS_HEALTH_STARTING, process_up, mission_empty
+        return DCS_HEALTH_UNHEALTHY, process_up, mission_empty
     # Process gone with an empty mission list after DCS has been seen = intentional idle.
-    if mission_empty is True and (
-        node_state.get("dcs_ever_healthy") or node_state.get("dcs_process_seen_at")
-    ):
-        return DCS_HEALTH_PAUSED
-    if node_state.get("dcs_ever_healthy"):
-        return DCS_HEALTH_DEAD
-    return DCS_HEALTH_NEVER_STARTED
+    if mission_empty is True and (ever_healthy or process_seen_at):
+        return DCS_HEALTH_PAUSED, process_up, mission_empty
+    if ever_healthy:
+        return DCS_HEALTH_DEAD, process_up, mission_empty
+    return DCS_HEALTH_NEVER_STARTED, process_up, mission_empty
 
 
 def refresh_dcs_health_state(node_port=None):
-    """Refresh node_state from process + port health checks."""
+    """Refresh node_state from process + port health checks without holding the lock during I/O."""
+    if node_port is None:
+        node_port = load_node_settings().get("network_port", "1015")
     with _health_lock:
-        if node_port is None:
-            node_port = load_node_settings().get("network_port", "1015")
-        health = evaluate_dcs_health(node_port)
+        ever_healthy = bool(node_state.get("dcs_ever_healthy"))
+        process_seen_at = node_state.get("dcs_process_seen_at")
+
+    health, process_up, mission_empty = evaluate_dcs_health(
+        node_port,
+        ever_healthy=ever_healthy,
+        process_seen_at=process_seen_at,
+    )
+
+    with _health_lock:
+        if process_up and node_state.get("dcs_process_seen_at") is None:
+            node_state["dcs_process_seen_at"] = time.time()
         if health == DCS_HEALTH_HEALTHY:
             node_state["dcs_ever_healthy"] = True
             node_state["dcs_down_since"] = None
@@ -998,7 +1078,7 @@ def refresh_dcs_health_state(node_port=None):
             node_state["dcs_down_since"] = None
         node_state["dcs_health"] = health
         node_state["dcs_running"] = health == DCS_HEALTH_HEALTHY
-        node_state["mission_list_empty"] = read_mission_list_empty()
+        node_state["mission_list_empty"] = mission_empty
         return health
 
 
@@ -1184,9 +1264,15 @@ def dcs_watchdog_loop():
 
             health = refresh_dcs_health_state(node_port)
             dcs_port = derive_dcs_port(node_port)
+            process_desc = _call_with_timeout(
+                lambda: describe_running_dcs_server_processes(cfg),
+                HEALTH_SCAN_STEP_TIMEOUT,
+                default="process scan timed out",
+                name="watchdog-process-desc",
+            )
             if health == DCS_HEALTH_HEALTHY:
                 append_activity_log(
-                    f"[WATCHDOG] DCS healthy (port {dcs_port}, {describe_running_dcs_server_processes(cfg)}) ✅"
+                    f"[WATCHDOG] DCS healthy (port {dcs_port}, {process_desc}) ✅"
                 )
             elif health == DCS_HEALTH_NEVER_STARTED:
                 append_activity_log(
@@ -1194,7 +1280,7 @@ def dcs_watchdog_loop():
                 )
             elif health == DCS_HEALTH_STARTING:
                 append_activity_log(
-                    f"[WATCHDOG] DCS starting — {describe_running_dcs_server_processes(cfg)}; "
+                    f"[WATCHDOG] DCS starting — {process_desc}; "
                     f"waiting for port {dcs_port}."
                 )
             elif health == DCS_HEALTH_PAUSED:
@@ -1204,7 +1290,7 @@ def dcs_watchdog_loop():
                 )
             elif health == DCS_HEALTH_UNHEALTHY:
                 append_activity_log(
-                    f"[WATCHDOG] DCS unhealthy — {describe_running_dcs_server_processes(cfg)} "
+                    f"[WATCHDOG] DCS unhealthy — {process_desc} "
                     f"but port {dcs_port} not responding."
                 )
                 if bool(cfg.get("auto_restart_dcs", True)):
@@ -2070,16 +2156,21 @@ def status_cache_loop():
             worker = _status_worker
             if worker is not None and worker.is_alive():
                 stuck_for = time.time() - _status_worker_started
-                if stuck_for >= STATUS_SNAPSHOT_STUCK_SECONDS and not _status_worker_stuck_logged:
-                    _status_worker_stuck_logged = True
-                    logging.warning(
-                        "Status snapshot still running after %.0fs. Serving the last cache.",
-                        stuck_for,
-                    )
-                    append_activity_log(
-                        "[STATUS] Health scan is stuck. Status requests are still being answered."
-                    )
-            else:
+                if stuck_for >= STATUS_SNAPSHOT_STUCK_SECONDS:
+                    if not _status_worker_stuck_logged:
+                        _status_worker_stuck_logged = True
+                        logging.warning(
+                            "Status snapshot still running after %.0fs. Abandoning it and serving the last cache.",
+                            stuck_for,
+                        )
+                        append_activity_log(
+                            "[STATUS] Health scan is stuck. Starting a fresh scan; status requests still use the last snapshot."
+                        )
+                    # Drop the reference so a new scan can start. The old daemon may
+                    # finish later, but it no longer holds _health_lock during I/O.
+                    _status_worker = None
+                    _status_worker_started = 0.0
+            if _status_worker is None or not _status_worker.is_alive():
                 _status_worker_stuck_logged = False
                 _status_worker_started = time.time()
                 _status_worker = threading.Thread(
@@ -2920,7 +3011,7 @@ threading.Thread(target=rustdesk_session_monitor_loop, daemon=True).start()
 threading.Thread(target=status_cache_loop, daemon=True, name="status-cache").start()
 threading.Thread(target=listener_supervisor_loop, daemon=True, name="listener-supervisor").start()
 threading.Thread(target=lambda: get_srs_latest_version_cached(allow_fetch=True), daemon=True).start()
-refresh_dcs_health_state()
+threading.Thread(target=refresh_dcs_health_state, daemon=True, name="boot-health").start()
 
 root.after(0, _pump_ui_queue)
 root.after(100, lambda: root.withdraw())
