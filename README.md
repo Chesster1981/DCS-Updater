@@ -98,11 +98,19 @@ In the Control Panel: right-click a server row for **Start / Restart DCS**, **St
 - Periodic Node GitHub polling defaults to **Disabled** (optional local fallback remains in settings).
 - The **Discord bot** (every few minutes) and **Control Panel** (on its GitHub check) compare `node_version` from `PING_STATUS` to the latest release and send `CHECK_NODE_UPDATE` to outdated nodes. Busy nodes are retried briefly, then again on the next loop.
 
+### DCS update queue (download vs unpack)
+
+During `DCS_updater.exe` download and unpack run in parallel. Mid-download UI looks like `Downloaded: 3282.1 of 19652.5 MBytes Speed: 50.6 MB/s`; when the network part is done it flips to `Downloaded: 100.0% of …` with `Speed: 0.0 KB/s` while Unpacking continues. The Node only then sets `active_task` to `Unpacking` / `dcs_download_complete: true`. Discord/Control advance the sequential queue at that point so the next server can use bandwidth.
+
+Node self-update is blocked while a DCS deploy is active. If the Node process still restarts mid-deploy, startup resumes by detecting `DCS_updater.exe` / preserve backups / a deploy marker and finishes MissionScripting restore + reboot.
+
+If DCS Updater asks what to do with leftover files under `_downloads` (`Delete` / `Exit`), the Node auto-clicks **Delete** so unattended deploy does not hang.
+
 ## TCP protocol
 
 | Command | Response |
 |---------|----------|
-| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_running`, `srs_running`, SRS fields, `dcs_players`, `dcs_player_names` (admin/host slot excluded) |
+| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_download_complete`, `dcs_running`, `srs_running`, SRS fields, `dcs_players`, `dcs_player_names` (admin/host slot excluded) |
 | `TRIGGER_DCS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `UNAUTHORIZED` |
 | `TRIGGER_SRS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `ERROR` / `UNAUTHORIZED` |
 | `CHECK_NODE_UPDATE` | Force immediate GitHub Node self-update check |

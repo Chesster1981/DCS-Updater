@@ -30,7 +30,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.10"
+CURRENT_BOT_VERSION = "2.2.15"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -286,6 +286,24 @@ class DCSClusterBot(commands.Bot):
         self._panel_alerts_need_sweep = True
         # (ip, port, target_version) -> last successful CHECK_NODE_UPDATE timestamp
         self._node_update_push_cooldown = {}
+        # Live deploy/queue status messages must survive panel channel purge.
+        self._purge_protected_message_ids = set()
+
+    def protect_status_message(self, message):
+        """Keep a live queue/status message from being deleted by panel purge."""
+        try:
+            mid = int(getattr(message, "id", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if mid:
+            self._purge_protected_message_ids.add(mid)
+
+    def unprotect_status_message(self, message):
+        try:
+            mid = int(getattr(message, "id", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        self._purge_protected_message_ids.discard(mid)
 
     def dismiss_status_message_later(self, message, after_seconds=None):
         """Delete a transient Discord status message after a short delay."""
@@ -311,6 +329,7 @@ class DCSClusterBot(commands.Bot):
                     e,
                 )
             finally:
+                self.unprotect_status_message(message)
                 self._pending_dismiss_tasks.discard(task)
 
         try:
@@ -734,10 +753,17 @@ class DCSClusterBot(commands.Bot):
                     continue
                 if message.id in keep_ids:
                     continue
+                if int(message.id) in self._purge_protected_message_ids:
+                    continue
                 content = message.content or ""
                 if PANEL_CHANNEL_GUIDE_MARKER in content:
                     continue
                 if self._is_panel_action_alert(content):
+                    continue
+                # Keep live deploy queue lines (otherwise monitor edit fails and the queue stalls).
+                if "[QUEUE]" in content or "DCS update in progress" in content:
+                    continue
+                if "DCS download complete" in content or "Downloading patch payload" in content:
                     continue
                 # Delete embeds/components and plain status text (update/restart notices, logs).
                 try:
@@ -1494,6 +1520,51 @@ class DCSClusterBot(commands.Bot):
             self.deployment_queue.task_done()
             self.is_processing_queue = False
 
+    async def _safe_status_edit(self, status_msg, content: str, *, timeout=8.0):
+        """Best-effort edit; never stall the deploy queue on Discord API hangs."""
+        if status_msg is None:
+            return False
+
+        async def _edit():
+            await status_msg.edit(content=content)
+
+        try:
+            await asyncio.wait_for(_edit(), timeout=max(1.0, float(timeout)))
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Status message edit timed out (%s)",
+                getattr(status_msg, "id", "?"),
+            )
+            return False
+        except discord.NotFound:
+            return False
+        except Exception as e:
+            logger.warning(
+                "Status message edit failed (%s): %s",
+                getattr(status_msg, "id", "?"),
+                e,
+            )
+            return False
+
+    @staticmethod
+    def _deploy_task_is_done(
+        task: str,
+        *,
+        download_done: bool,
+        done_tasks,
+        accept_download_complete: bool,
+    ) -> bool:
+        normalized = str(task or "Idle").strip()
+        if normalized in done_tasks:
+            return True
+        if not accept_download_complete:
+            return False
+        if download_done:
+            return True
+        # Node may report Unpacking with or without the flag.
+        return normalized.lower().startswith("unpacking")
+
     async def _monitor_node_task_until_idle(
         self,
         node,
@@ -1503,63 +1574,168 @@ class DCSClusterBot(commands.Bot):
         success_text,
         timeout_seconds=900,
         done_tasks=("Rebooting", "Idle"),
+        accept_download_complete=False,
+        progress_text=None,
     ):
+        self.protect_status_message(status_msg)
         start_time = asyncio.get_event_loop().time()
+        last_task = None
+        last_heartbeat = 0.0
         while True:
-            if asyncio.get_event_loop().time() - start_time > timeout_seconds:
-                await status_msg.edit(
-                    content=f"⏰ **[{name}]** Update exceeded {timeout_seconds // 60} minutes (Timeout reached)."
+            now = asyncio.get_event_loop().time()
+            if now - start_time > timeout_seconds:
+                await self._safe_status_edit(
+                    status_msg,
+                    (
+                        f"⏰ **[{name}]** Update exceeded {timeout_seconds // 60} minutes "
+                        "(Timeout reached) — continuing queue."
+                    ),
                 )
+                logger.warning("[%s] Deploy monitor timeout after %ss", name, timeout_seconds)
                 return False
 
-            chk = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
+            try:
+                chk = await asyncio.wait_for(
+                    self.send_socket_command(node["ip"], node["port"], "PING_STATUS"),
+                    timeout=max(6.0, float(self.socket_timeout) + 2.0),
+                )
+            except asyncio.TimeoutError:
+                chk = None
+                logger.warning("[%s] Deploy monitor PING timed out", name)
+
             if chk is None:
-                await status_msg.edit(content=f"🎉 **[{name}]** Connection closed. Server completed sequence!")
+                # Node often drops the socket when reboot starts after deploy.
+                await self._safe_status_edit(
+                    status_msg,
+                    f"🎉 **[{name}]** Connection closed. Server completed sequence!",
+                )
                 return True
 
             if chk.startswith("{"):
                 try:
                     res = json.loads(chk)
-                    if res.get("active_task", "Idle") in done_tasks:
-                        await status_msg.edit(content=success_text)
-                        return True
                 except Exception:
-                    pass
+                    res = None
+                if isinstance(res, dict):
+                    task = str(res.get("active_task", "Idle") or "Idle").strip()
+                    download_done = bool(res.get("dcs_download_complete"))
+                    done = self._deploy_task_is_done(
+                        task,
+                        download_done=download_done,
+                        done_tasks=done_tasks,
+                        accept_download_complete=accept_download_complete,
+                    )
+                    # Done check BEFORE Discord edits — never let UI I/O block advancement.
+                    if done:
+                        logger.info(
+                            "[%s] Deploy monitor done (task=%s download_complete=%s)",
+                            name,
+                            task,
+                            download_done,
+                        )
+                        await self._safe_status_edit(status_msg, success_text)
+                        return True
+                    if task != last_task and progress_text:
+                        last_task = task
+                        await self._safe_status_edit(
+                            status_msg,
+                            progress_text.replace("{task}", str(task)),
+                        )
+                    elif now - last_heartbeat >= 60:
+                        last_heartbeat = now
+                        logger.info(
+                            "[%s] Deploy monitor waiting (task=%s download_complete=%s elapsed=%ss)",
+                            name,
+                            task,
+                            download_done,
+                            int(now - start_time),
+                        )
             await asyncio.sleep(4)
 
     async def _run_dcs_update(self, node, channel, status_msg, name):
+        """Trigger DCS update and advance once download is complete (Unpacking OK)."""
+        self.protect_status_message(status_msg)
         ans = await self.send_socket_command(node["ip"], node["port"], "TRIGGER_DCS_UPDATE")
 
         if not ans:
-            await status_msg.edit(content=f"❌ **[{name}]** Connection timeout. Node did not respond.")
+            await self._safe_status_edit(
+                status_msg,
+                f"❌ **[{name}]** Connection timeout. Node did not respond.",
+            )
             return False
 
+        busy_task = None
         try:
             res_json = json.loads(ans)
-            if res_json.get("status") == "UNAUTHORIZED":
-                await status_msg.edit(
-                    content=f"🔐 **[{name}]** Unauthorized — check shared auth_token on Bot and Node."
+            status = res_json.get("status")
+            if status == "UNAUTHORIZED":
+                await self._safe_status_edit(
+                    status_msg,
+                    f"🔐 **[{name}]** Unauthorized — check shared auth_token on Bot and Node.",
                 )
                 return False
-            if res_json.get("status") == "REJECTED_BUSY":
-                await status_msg.edit(content=f"⚠️ **[{name}]** Server busy executing: `{res_json.get('task')}`.")
-                return False
-            if res_json.get("status") != "OK_STARTING":
-                await status_msg.edit(content=f"❌ **[{name}]** Rejected with status: `{res_json.get('status')}`.")
+            if status == "REJECTED_BUSY":
+                busy_task = str(res_json.get("task") or "")
+            elif status != "OK_STARTING":
+                await self._safe_status_edit(
+                    status_msg,
+                    f"❌ **[{name}]** Rejected with status: `{status}`.",
+                )
                 return False
         except Exception:
-            await status_msg.edit(content=f"❌ **[{name}]** Error parsing JSON response payload.")
+            await self._safe_status_edit(
+                status_msg,
+                f"❌ **[{name}]** Error parsing JSON response payload.",
+            )
             return False
 
-        await status_msg.edit(content=f"🚀 **[{name}]** DCS update authorized! Downloading patch payload...")
-        await asyncio.sleep(15)
+        # Already past download (or still downloading from an earlier trigger):
+        # do not block the cluster queue — wait only until download-complete.
+        if busy_task:
+            if busy_task in ("Unpacking",) or busy_task.startswith("Unpacking"):
+                await self._safe_status_edit(
+                    status_msg,
+                    (
+                        f"✅ **[{name}]** Already unpacking (download done earlier). "
+                        "Bandwidth free for the next server."
+                    ),
+                )
+                logger.info("[%s] TRIGGER rejected busy=%s — treating download as done", name, busy_task)
+                return True
+            if busy_task in ("Downloading", "Updating"):
+                await self._safe_status_edit(
+                    status_msg,
+                    f"⏳ **[{name}]** DCS update already running (`{busy_task}`) — waiting for download complete…",
+                )
+            else:
+                await self._safe_status_edit(
+                    status_msg,
+                    f"⚠️ **[{name}]** Server busy executing: `{busy_task}`.",
+                )
+                return False
+        else:
+            await self._safe_status_edit(
+                status_msg,
+                f"🚀 **[{name}]** DCS update authorized! Downloading patch payload...",
+            )
+            await asyncio.sleep(15)
+
+        # Advance the cluster queue once download hits 100% so the next node can
+        # use bandwidth while this node keeps unpacking locally.
         return await self._monitor_node_task_until_idle(
             node,
             status_msg,
             name,
-            success_text=f"🎉 **[{name}]** DCS update successfully completed and verified!",
-            timeout_seconds=900,
-            done_tasks=("Rebooting", "Idle"),
+            success_text=(
+                f"✅ **[{name}]** DCS download complete — unpacking continues on this node. "
+                "Bandwidth free for the next server."
+            ),
+            # Large patches can download for hours; Unpacking/download_complete
+            # must release the queue earlier. Timeout is only a safety net.
+            timeout_seconds=6 * 3600,
+            done_tasks=("Rebooting", "Idle", "Unpacking"),
+            accept_download_complete=True,
+            progress_text=f"⏳ **[{name}]** DCS update in progress (`{{task}}`)…",
         )
 
     async def _run_srs_update(self, node, channel, status_msg, name):
@@ -1617,6 +1793,7 @@ class DCSClusterBot(commands.Bot):
             f"⏳ **[QUEUE]** Connecting to `{name}` for **{action}**..."
         )
         status_messages = [status_msg]
+        self.protect_status_message(status_msg)
         if action == "reboot":
             # Reboot can drop the TCP socket before a reply; start the 10s dismiss
             # now so the connecting line cannot linger if the exchange hangs.
@@ -1624,11 +1801,12 @@ class DCSClusterBot(commands.Bot):
         try:
             ping = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
             if self.ping_has_active_rdp(ping):
-                await status_msg.edit(
-                    content=(
+                await self._safe_status_edit(
+                    status_msg,
+                    (
                         f"⚠️ **[{name}]** Action suspended — RustDesk session active "
                         "(someone is working on the server)."
-                    )
+                    ),
                 )
                 return
 
@@ -1643,39 +1821,72 @@ class DCSClusterBot(commands.Bot):
 
                 if action == "update_dcs":
                     if not needs_dcs:
-                        await status_msg.edit(
-                            content=f"✅ **[{name}]** DCS already up to date — nothing to deploy."
+                        await self._safe_status_edit(
+                            status_msg,
+                            f"✅ **[{name}]** DCS already up to date — nothing to deploy.",
                         )
                         return
-                    await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
+                    await self._safe_status_edit(
+                        status_msg,
+                        f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...",
+                    )
                     await self._run_dcs_update(node, channel, status_msg, name)
                 elif action == "update_srs":
                     if not needs_srs:
-                        await status_msg.edit(
-                            content=f"✅ **[{name}]** SRS already up to date — nothing to deploy."
+                        await self._safe_status_edit(
+                            status_msg,
+                            f"✅ **[{name}]** SRS already up to date — nothing to deploy.",
                         )
                         return
-                    await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                    await self._safe_status_edit(
+                        status_msg,
+                        f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...",
+                    )
                     await self._run_srs_update(node, channel, status_msg, name)
                 else:
-                    # Legacy combined update
+                    # Legacy combined update — always free bandwidth on DCS download
+                    # complete. SRS is small; if the node is still unpacking, re-queue SRS.
                     if not needs_dcs and not needs_srs:
-                        await status_msg.edit(
-                            content=f"✅ **[{name}]** Already up to date — nothing to deploy."
+                        await self._safe_status_edit(
+                            status_msg,
+                            f"✅ **[{name}]** Already up to date — nothing to deploy.",
                         )
                         return
 
                     if needs_dcs:
-                        await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
+                        await self._safe_status_edit(
+                            status_msg,
+                            f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...",
+                        )
                         await self._run_dcs_update(node, channel, status_msg, name)
 
                     if needs_srs:
                         if needs_dcs:
-                            srs_msg = await channel.send(f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                            srs_msg = await channel.send(
+                                f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update..."
+                            )
                             status_messages.append(srs_msg)
-                            await self._run_srs_update(node, channel, srs_msg, name)
+                            self.protect_status_message(srs_msg)
+                            srs_ok = await self._run_srs_update(node, channel, srs_msg, name)
+                            if not srs_ok:
+                                await self.deployment_queue.put(
+                                    {
+                                        "node": node,
+                                        "channel": channel,
+                                        "action": "update_srs",
+                                    }
+                                )
+                                await self._safe_status_edit(
+                                    srs_msg,
+                                    (
+                                        f"⏳ **[{name}]** SRS queued for retry after DCS unpack/reboot."
+                                    ),
+                                )
                         else:
-                            await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...")
+                            await self._safe_status_edit(
+                                status_msg,
+                                f"⏳ **[QUEUE]** Connecting to `{name}` for SRS update...",
+                            )
                             await self._run_srs_update(node, channel, status_msg, name)
 
             elif action == "restart_dcs":
