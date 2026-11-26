@@ -98,11 +98,15 @@ In the Control Panel: right-click a server row for **Start / Restart DCS**, **St
 - Periodic Node GitHub polling defaults to **Disabled** (optional local fallback remains in settings).
 - The **Discord bot** (every few minutes) and **Control Panel** (on its GitHub check) compare `node_version` from `PING_STATUS` to the latest release and send `CHECK_NODE_UPDATE` to outdated nodes. Busy nodes are retried briefly, then again on the next loop.
 
+### DCS update queue (download vs unpack)
+
+During `DCS_updater.exe` the Node watches the updater UI for `Downloaded: 100%` (and `autoupdate_log.txt` post-download STATUS lines). When the network download is done it sets `active_task` to `Unpacking` and `dcs_download_complete: true` in `PING_STATUS`. Discord/Control then advance the sequential queue to the next server so bandwidth is not idle while unpacking continues.
+
 ## TCP protocol
 
 | Command | Response |
 |---------|----------|
-| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_running`, `srs_running`, SRS fields, `dcs_players`, `dcs_player_names` (admin/host slot excluded) |
+| `PING_STATUS` | JSON with version, `active_task`, `node_version`, `dcs_download_complete`, `dcs_running`, `srs_running`, SRS fields, `dcs_players`, `dcs_player_names` (admin/host slot excluded) |
 | `TRIGGER_DCS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `UNAUTHORIZED` |
 | `TRIGGER_SRS_UPDATE` | `OK_STARTING` / `REJECTED_BUSY` / `ERROR` / `UNAUTHORIZED` |
 | `CHECK_NODE_UPDATE` | Force immediate GitHub Node self-update check |

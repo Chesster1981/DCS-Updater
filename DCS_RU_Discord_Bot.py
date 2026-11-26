@@ -30,7 +30,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.10"
+CURRENT_BOT_VERSION = "2.2.11"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1503,8 +1503,11 @@ class DCSClusterBot(commands.Bot):
         success_text,
         timeout_seconds=900,
         done_tasks=("Rebooting", "Idle"),
+        accept_download_complete=False,
+        progress_text=None,
     ):
         start_time = asyncio.get_event_loop().time()
+        last_task = None
         while True:
             if asyncio.get_event_loop().time() - start_time > timeout_seconds:
                 await status_msg.edit(
@@ -1520,14 +1523,24 @@ class DCSClusterBot(commands.Bot):
             if chk.startswith("{"):
                 try:
                     res = json.loads(chk)
-                    if res.get("active_task", "Idle") in done_tasks:
+                    task = res.get("active_task", "Idle")
+                    download_done = bool(res.get("dcs_download_complete"))
+                    if task != last_task and progress_text and task not in done_tasks:
+                        last_task = task
+                        await status_msg.edit(
+                            content=progress_text.replace("{task}", str(task))
+                        )
+                    if task in done_tasks or (
+                        accept_download_complete
+                        and (download_done or task == "Unpacking")
+                    ):
                         await status_msg.edit(content=success_text)
                         return True
                 except Exception:
                     pass
             await asyncio.sleep(4)
 
-    async def _run_dcs_update(self, node, channel, status_msg, name):
+    async def _run_dcs_update(self, node, channel, status_msg, name, *, wait_for_full=False):
         ans = await self.send_socket_command(node["ip"], node["port"], "TRIGGER_DCS_UPDATE")
 
         if not ans:
@@ -1553,13 +1566,30 @@ class DCSClusterBot(commands.Bot):
 
         await status_msg.edit(content=f"🚀 **[{name}]** DCS update authorized! Downloading patch payload...")
         await asyncio.sleep(15)
+        if wait_for_full:
+            return await self._monitor_node_task_until_idle(
+                node,
+                status_msg,
+                name,
+                success_text=f"🎉 **[{name}]** DCS update successfully completed and verified!",
+                timeout_seconds=1800,
+                done_tasks=("Rebooting", "Idle"),
+                progress_text=f"⏳ **[{name}]** DCS update in progress (`{{task}}`)…",
+            )
+        # Advance the cluster queue once download hits 100% so the next node can
+        # use bandwidth while this node keeps unpacking locally.
         return await self._monitor_node_task_until_idle(
             node,
             status_msg,
             name,
-            success_text=f"🎉 **[{name}]** DCS update successfully completed and verified!",
-            timeout_seconds=900,
-            done_tasks=("Rebooting", "Idle"),
+            success_text=(
+                f"✅ **[{name}]** DCS download complete — unpacking continues on this node. "
+                "Bandwidth free for the next server."
+            ),
+            timeout_seconds=1800,
+            done_tasks=("Rebooting", "Idle", "Unpacking"),
+            accept_download_complete=True,
+            progress_text=f"⏳ **[{name}]** DCS update in progress (`{{task}}`)…",
         )
 
     async def _run_srs_update(self, node, channel, status_msg, name):
@@ -1667,7 +1697,15 @@ class DCSClusterBot(commands.Bot):
 
                     if needs_dcs:
                         await status_msg.edit(content=f"⏳ **[QUEUE]** Connecting to `{name}` for DCS update...")
-                        await self._run_dcs_update(node, channel, status_msg, name)
+                        # If SRS follows on the same node, wait for full DCS finish
+                        # (files still locked while unpacking).
+                        await self._run_dcs_update(
+                            node,
+                            channel,
+                            status_msg,
+                            name,
+                            wait_for_full=bool(needs_srs),
+                        )
 
                     if needs_srs:
                         if needs_dcs:

@@ -63,7 +63,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.2.10"
+CONTROL_PANEL_VERSION = "2.2.11"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -1954,7 +1954,8 @@ class MainWindow(QMainWindow):
                     
                     while not download_finished:
                         start_time = time.time()
-                        while time.time() - start_time < 900:
+                        # Large DCS patches: allow long download before asking the operator.
+                        while time.time() - start_time < 1800:
                             chk = send_socket_command(ip, p, "PING_STATUS")
                             if chk and chk.startswith("{"):
                                 response_json = json.loads(chk)
@@ -1971,8 +1972,19 @@ class MainWindow(QMainWindow):
                                     format_live_services(response_json),
                                 )
                                 
-                                if local_task in ["Rebooting", "Idle"]:
-                                    global_signals.append_log.emit(f" [ 🎉 {n}] Download complete! Bandwidth released for next server.")
+                                download_done = bool(response_json.get("dcs_download_complete"))
+                                if local_task in ("Rebooting", "Idle", "Unpacking") or download_done:
+                                    if local_task == "Unpacking" or (
+                                        download_done and local_task not in ("Rebooting", "Idle")
+                                    ):
+                                        global_signals.append_log.emit(
+                                            f" [ 🎉 {n}] DCS download 100% — unpacking continues. "
+                                            "Bandwidth released for next server."
+                                        )
+                                    else:
+                                        global_signals.append_log.emit(
+                                            f" [ 🎉 {n}] Download complete! Bandwidth released for next server."
+                                        )
                                     download_finished = True
                                     break
                                     

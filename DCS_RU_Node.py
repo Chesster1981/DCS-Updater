@@ -77,7 +77,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.10"
+CURRENT_NODE_VERSION = "2.2.11"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -140,6 +140,8 @@ node_state = {
     "dcs_process_seen_at": None,
     "dcs_down_since": None,
     "mission_list_empty": None,
+    # True once DCS_updater network download hits 100% (unpacking may still run).
+    "dcs_download_complete": False,
 }
 
 _webgui_players_lock = threading.Lock()
@@ -936,6 +938,165 @@ def has_dcs_crash_dialog() -> bool:
             name="crash-dialog-scan",
         )
     )
+
+
+_DCS_UPDATER_DOWNLOAD_PCT_RE = re.compile(
+    r"Downloaded:\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+    re.IGNORECASE,
+)
+_DCS_AUTOUPDATE_DOWNLOAD_DONE_STATUS = (
+    "removing obsolete files",
+    "installing new files",
+    "cleaning up",
+    "successfully updated",
+)
+
+
+def _collect_hwnd_text_tree(root_hwnd) -> str:
+    """Gather title + visible child control text from a Win32 window tree."""
+    if sys.platform != "win32":
+        return ""
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    chunks: list[str] = []
+
+    def _read(hwnd) -> str:
+        length = user32.GetWindowTextLengthW(hwnd) + 1
+        if length <= 1:
+            return ""
+        buf = ctypes.create_unicode_buffer(length)
+        user32.GetWindowTextW(hwnd, buf, length)
+        return str(buf.value or "").strip()
+
+    root_text = _read(root_hwnd)
+    if root_text:
+        chunks.append(root_text)
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def child_cb(hwnd, _lparam):
+        text = _read(hwnd)
+        if text:
+            chunks.append(text)
+        return True
+
+    user32.EnumChildWindows(root_hwnd, child_cb, 0)
+    return "\n".join(chunks)
+
+
+def _scan_dcs_updater_ui_progress() -> dict:
+    """Read DCS Updater progress UI (Downloaded % / Unpacking) via EnumWindows."""
+    result = {
+        "found": False,
+        "downloaded_pct": None,
+        "unpacking": False,
+        "raw_text": "",
+    }
+    if sys.platform != "win32":
+        return result
+
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    blobs: list[str] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def callback(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd) + 1
+        if length <= 1:
+            return True
+        buf = ctypes.create_unicode_buffer(length)
+        user32.GetWindowTextW(hwnd, buf, length)
+        title = str(buf.value or "")
+        title_l = title.lower()
+        if "dcs updater" not in title_l and "dcs_updater" not in title_l:
+            return True
+        blob = _collect_hwnd_text_tree(hwnd)
+        if blob:
+            blobs.append(blob)
+        return True
+
+    user32.EnumWindows(callback, 0)
+    if not blobs:
+        return result
+
+    raw = "\n".join(blobs)
+    result["found"] = True
+    result["raw_text"] = raw
+    result["unpacking"] = "unpacking" in raw.lower()
+    match = _DCS_UPDATER_DOWNLOAD_PCT_RE.search(raw)
+    if match:
+        try:
+            result["downloaded_pct"] = float(match.group(1))
+        except ValueError:
+            result["downloaded_pct"] = None
+    return result
+
+
+def read_dcs_updater_ui_progress() -> dict:
+    """Timeout-guarded DCS Updater UI progress snapshot."""
+    default = {
+        "found": False,
+        "downloaded_pct": None,
+        "unpacking": False,
+        "raw_text": "",
+    }
+    return _call_with_timeout(
+        _scan_dcs_updater_ui_progress,
+        HEALTH_SCAN_STEP_TIMEOUT,
+        default=default,
+        name="dcs-updater-ui-scan",
+    )
+
+
+def read_autoupdate_log_download_complete(main_folder: str) -> bool:
+    """True when autoupdate_log.txt shows post-download install phases."""
+    path = os.path.join(str(main_folder or "").strip(), "autoupdate_log.txt")
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 65536), os.SEEK_SET)
+            tail = handle.read().lower()
+    except Exception:
+        return False
+
+    # Prefer the latest STATUS line in the tail.
+    latest_status = ""
+    for line in tail.splitlines():
+        if "status:" in line:
+            latest_status = line.split("status:", 1)[-1].strip()
+    if latest_status:
+        for marker in _DCS_AUTOUPDATE_DOWNLOAD_DONE_STATUS:
+            if marker in latest_status:
+                return True
+
+    # Zero-byte updates never show Downloaded: 100% in the UI.
+    if "to download: 0 bytes" in tail and "status: downloading update" in tail:
+        # Only treat as done once unpacking/install has clearly started.
+        if "unpacking" in tail or "installing new files" in tail or "removing obsolete" in tail:
+            return True
+    return False
+
+
+def dcs_updater_ui_indicates_download_complete(ui: dict | None) -> bool:
+    """True when the updater UI shows download finished (unpack may continue)."""
+    if not isinstance(ui, dict):
+        return False
+    pct = ui.get("downloaded_pct")
+    if pct is None:
+        return False
+    try:
+        value = float(pct)
+    except (TypeError, ValueError):
+        return False
+    if value >= 99.9:
+        return True
+    return bool(ui.get("unpacking")) and value >= 99.0
 
 
 def resolve_dcs_saved_games_roots(config=None) -> list[str]:
@@ -2031,29 +2192,85 @@ def execute_deployment_pipeline():
         
     append_activity_log(" [PROCESS] DCS processes are verified DEAD. ✅ Proceeding.")
     node_state["active_task"] = "Downloading"
-    
+    node_state["dcs_download_complete"] = False
+
     update_succeeded = False
     try:
         if not os.path.exists(bin_folder):
             append_activity_log(f" ERROR: Could not find the bin folder at: ❌ {bin_folder}")
             node_state["active_task"] = "Idle"
             return
-            
+
         append_activity_log("[PROCESS] Launching DCS_updater.exe with elevated credentials pipeline...")
         updater_path = os.path.join(bin_folder, "DCS_updater.exe")
-        ps_cmd = f"Start-Process -FilePath '{updater_path}' -ArgumentList '--quiet update' -WorkingDirectory '{bin_folder}' -Verb RunAs -Wait"
-        
-        subprocess.run(
-            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
-            **_hidden_subprocess_kwargs(capture_output=False),
+        ps_cmd = (
+            f"Start-Process -FilePath '{updater_path}' -ArgumentList '--quiet update' "
+            f"-WorkingDirectory '{bin_folder}' -Verb RunAs -Wait"
         )
+
+        updater_result = {"done": False, "error": None}
+
+        def _run_dcs_updater():
+            try:
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_cmd],
+                    **_hidden_subprocess_kwargs(capture_output=False),
+                )
+            except Exception as err:
+                updater_result["error"] = err
+            finally:
+                updater_result["done"] = True
+
+        updater_thread = threading.Thread(
+            target=_run_dcs_updater,
+            name="dcs-updater-wait",
+            daemon=True,
+        )
+        updater_thread.start()
+
+        last_logged_pct = None
+        download_complete_hits = 0
+        while not updater_result["done"]:
+            if not node_state.get("dcs_download_complete"):
+                ui = read_dcs_updater_ui_progress()
+                pct = ui.get("downloaded_pct")
+                if pct is not None:
+                    rounded = int(pct)
+                    if last_logged_pct is None or rounded >= last_logged_pct + 5 or rounded >= 100:
+                        append_activity_log(
+                            f"[PROCESS] DCS updater download: {pct:.1f}%"
+                            + (" (unpacking)" if ui.get("unpacking") else "")
+                        )
+                        last_logged_pct = rounded
+                if dcs_updater_ui_indicates_download_complete(ui):
+                    download_complete_hits += 1
+                elif read_autoupdate_log_download_complete(main_folder):
+                    download_complete_hits = 2
+                else:
+                    download_complete_hits = 0
+                # Two consecutive polls (~4s) avoids a brief 100% flicker mid-batch.
+                if download_complete_hits >= 2:
+                    node_state["dcs_download_complete"] = True
+                    node_state["active_task"] = "Unpacking"
+                    append_activity_log(
+                        "[PROCESS] DCS download complete (100%). Unpacking continues — "
+                        "bandwidth is free for the next node."
+                    )
+            time.sleep(2.0)
+
+        updater_thread.join(timeout=5)
+        if updater_result["error"] is not None:
+            raise updater_result["error"]
+
         append_activity_log(" [PROCESS] DCS core update finished. ✅")
         append_activity_log("[PROCESS] Re-scanning local configuration matrices...")
         get_dcs_versions_local()
         update_succeeded = True
+        node_state["dcs_download_complete"] = True
     except Exception as e:
         append_activity_log(f" ERROR during DCS update: ❌ {e}")
         node_state["active_task"] = "Idle"
+        node_state["dcs_download_complete"] = False
         return
     finally:
         if preserve_lua and os.path.exists(backup_lua_file):
@@ -2087,9 +2304,11 @@ def execute_deployment_pipeline():
                 " [PROCESS] Finished without reboot (blocked by active RustDesk session)."
             )
             node_state["active_task"] = "Idle"
+            node_state["dcs_download_complete"] = False
     else:
         append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
         node_state["active_task"] = "Idle"
+        node_state["dcs_download_complete"] = False
 
 def _accept_error_is_transient(err: BaseException) -> bool:
     """Client aborted while the handshake was still in progress. Keep listening."""
@@ -2131,6 +2350,7 @@ def build_status_payload() -> dict:
         "dcs_players": dcs_players,
         "dcs_max_players": dcs_max_players,
         "dcs_player_names": dcs_player_names,
+        "dcs_download_complete": bool(node_state.get("dcs_download_complete")),
     }
 
 
@@ -2211,12 +2431,14 @@ def status_payload_for_client() -> dict:
             "dcs_players": None,
             "dcs_max_players": None,
             "dcs_player_names": [],
+            "dcs_download_complete": bool(node_state.get("dcs_download_complete")),
         }
         return payload
     payload["active_task"] = node_state.get("active_task", "Idle")
     payload["node_version"] = CURRENT_NODE_VERSION
     payload["rdp_session_active"] = rd_count > 0
     payload["rdp_session_count"] = rd_count
+    payload["dcs_download_complete"] = bool(node_state.get("dcs_download_complete"))
     return payload
 
 
