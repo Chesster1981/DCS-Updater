@@ -17,9 +17,11 @@ from dcs_ru_common import (
     VERSION_PATTERNS,
     get_discord_bot_token,
     github_api_headers,
+    github_release_has_node_asset,
     load_master_config,
     resolve_master_config_path,
     save_master_config,
+    version_tuple,
     wrap_command,
     fetch_latest_srs_release,
 )
@@ -28,12 +30,17 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.9"
+CURRENT_BOT_VERSION = "2.2.10"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
 BOT_GITHUB_CHECK_DELAY_SECONDS = 20
 BOT_GITHUB_CHECK_MINUTES = 5
+# Avoid re-pushing CHECK_NODE_UPDATE to the same node for the same release.
+NODE_UPDATE_PUSH_COOLDOWN_SEC = 30 * 60
+# When a node is busy, retry a few times before waiting for the next loop.
+NODE_UPDATE_BUSY_RETRY_ATTEMPTS = 3
+NODE_UPDATE_BUSY_RETRY_DELAY_SEC = 60
 PANEL_CHANNEL_GUIDE_MARKER = "<!-- dcs-panel-guide -->"
 PANEL_CHANNEL_GUIDE = """**DCS Norway — update panel**
 
@@ -277,6 +284,8 @@ class DCSClusterBot(commands.Bot):
         self._last_panel_chatter_purge = 0.0
         self._panel_alert_messages = []
         self._panel_alerts_need_sweep = True
+        # (ip, port, target_version) -> last successful CHECK_NODE_UPDATE timestamp
+        self._node_update_push_cooldown = {}
 
     def dismiss_status_message_later(self, message, after_seconds=None):
         """Delete a transient Discord status message after a short delay."""
@@ -1865,11 +1874,167 @@ class DCSClusterBot(commands.Bot):
     @tasks.loop(minutes=BOT_GITHUB_CHECK_MINUTES)
     async def github_self_update_loop(self):
         await self.check_github_self_update()
+        await self.push_node_updates_from_github()
 
     @github_self_update_loop.before_loop
     async def before_github_self_update_loop(self):
         await self.wait_until_ready()
         await asyncio.sleep(BOT_GITHUB_CHECK_DELAY_SECONDS)
+
+    async def _fetch_latest_github_release(self):
+        """Return (latest_version, assets_list) or (None, [])."""
+        headers = github_api_headers("DCS-Norway-Discord-Bot")
+        url = f"{URL_GITHUB_API}{GITHUB_REPO}/releases/latest"
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                    if response.status != 200:
+                        logger.warning(
+                            "GitHub Node update check HTTP %s", response.status
+                        )
+                        return None, []
+                    data = await response.json()
+            latest = str(data.get("tag_name", "")).lstrip("v").strip()
+            assets = data.get("assets") or []
+            return (latest or None), assets
+        except Exception as e:
+            logger.warning("GitHub Node update check failed: %s", e)
+            return None, []
+
+    async def _trigger_node_update_if_outdated(self, node, latest_version: str):
+        """PING one node; send CHECK_NODE_UPDATE when behind latest_version.
+
+        Returns one of: skipped_cooldown, offline, unauthorized, up_to_date,
+        triggered, busy, rejected, error.
+        """
+        name = str(node.get("name") or f"{node.get('ip')}:{node.get('port')}")
+        ip = node.get("ip")
+        port = node.get("port")
+        if not ip or port is None:
+            return "error"
+
+        key = (str(ip), str(port), latest_version)
+        now = time.time()
+        last = float(self._node_update_push_cooldown.get(key) or 0)
+        if now - last < NODE_UPDATE_PUSH_COOLDOWN_SEC:
+            return "skipped_cooldown"
+
+        ping = await self.send_socket_command(ip, port, "PING_STATUS")
+        if not ping:
+            return "offline"
+        if not str(ping).startswith("{"):
+            return "error"
+        try:
+            data = json.loads(ping)
+        except Exception:
+            return "error"
+        if data.get("status") == "UNAUTHORIZED":
+            logger.warning("[%s] Unauthorized during Node update push.", name)
+            return "unauthorized"
+
+        node_ver = str(data.get("node_version") or "0").lstrip("vV").strip()
+        if version_tuple(node_ver) >= version_tuple(latest_version):
+            return "up_to_date"
+
+        for attempt in range(1, NODE_UPDATE_BUSY_RETRY_ATTEMPTS + 1):
+            ans = await self.send_socket_command(ip, port, "CHECK_NODE_UPDATE")
+            if not ans:
+                return "offline"
+            status = None
+            if str(ans).startswith("{"):
+                try:
+                    status = json.loads(ans).get("status")
+                except Exception:
+                    status = None
+            else:
+                status = str(ans).strip()
+
+            if status == "OK_STARTING":
+                self._node_update_push_cooldown[key] = time.time()
+                logger.info(
+                    "[%s] Node update push: v%s → v%s (CHECK_NODE_UPDATE sent).",
+                    name,
+                    node_ver,
+                    latest_version,
+                )
+                return "triggered"
+            if status == "UNAUTHORIZED":
+                return "unauthorized"
+            if status == "REJECTED_BUSY":
+                if attempt < NODE_UPDATE_BUSY_RETRY_ATTEMPTS:
+                    logger.info(
+                        "[%s] Node busy during update push; retry %s/%s in %ss.",
+                        name,
+                        attempt,
+                        NODE_UPDATE_BUSY_RETRY_ATTEMPTS,
+                        NODE_UPDATE_BUSY_RETRY_DELAY_SEC,
+                    )
+                    await asyncio.sleep(NODE_UPDATE_BUSY_RETRY_DELAY_SEC)
+                    continue
+                logger.info("[%s] Node still busy; will retry on next GitHub loop.", name)
+                return "busy"
+            if status == "UNKNOWN_COMMAND":
+                logger.warning(
+                    "[%s] Node too old for CHECK_NODE_UPDATE — update manually once.",
+                    name,
+                )
+                return "rejected"
+            logger.warning("[%s] Node update push rejected: %s", name, status or ans)
+            return "rejected"
+        return "busy"
+
+    async def push_node_updates_from_github(self):
+        """When GitHub has a newer Node release, push CHECK_NODE_UPDATE to outdated nodes."""
+        latest, assets = await self._fetch_latest_github_release()
+        if not latest:
+            return
+        if not github_release_has_node_asset(assets):
+            logger.info(
+                "GitHub v%s has no Node.exe asset — skipping cluster Node update push.",
+                latest,
+            )
+            return
+
+        nodes = self.load_cluster_nodes() or []
+        if not nodes:
+            return
+
+        logger.info(
+            "Checking %s cluster node(s) against GitHub Node v%s…",
+            len(nodes),
+            latest,
+        )
+        counts = {
+            "triggered": 0,
+            "up_to_date": 0,
+            "offline": 0,
+            "busy": 0,
+            "skipped_cooldown": 0,
+            "unauthorized": 0,
+            "rejected": 0,
+            "error": 0,
+        }
+        for node in nodes:
+            try:
+                result = await self._trigger_node_update_if_outdated(node, latest)
+            except Exception as e:
+                logger.warning("Node update push failed for %s: %s", node, e)
+                result = "error"
+            counts[result] = counts.get(result, 0) + 1
+
+        logger.info(
+            "Node update push summary (GitHub v%s): triggered=%s up_to_date=%s "
+            "offline=%s busy=%s cooldown=%s unauthorized=%s rejected=%s error=%s",
+            latest,
+            counts["triggered"],
+            counts["up_to_date"],
+            counts["offline"],
+            counts["busy"],
+            counts["skipped_cooldown"],
+            counts["unauthorized"],
+            counts["rejected"],
+            counts["error"],
+        )
 
 
 bot = DCSClusterBot()

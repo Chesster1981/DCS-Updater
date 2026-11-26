@@ -79,7 +79,10 @@ NODE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "bind_address": "0.0.0.0",
     "auth_token": "",
     "reboot_after_deployment": True,
-    "github_check_interval": 43200,
+    # Periodic Node self-check is off by default; Discord Bot / Control Panel
+    # push CHECK_NODE_UPDATE when a newer GitHub release is available.
+    # Nodes still check once at startup.
+    "github_check_interval": -1,
     "watchdog_enabled": True,
     "watchdog_interval_seconds": 300,
     "auto_restart_dcs": True,
@@ -111,11 +114,11 @@ def github_interval_label(seconds: Any) -> str:
     try:
         value = int(seconds)
     except (TypeError, ValueError):
-        value = 43200
+        value = -1
     for choice, label in NODE_GITHUB_INTERVAL_CHOICES:
         if choice == value:
             return label
-    return "Every 12 Hours"
+    return "Disabled"
 
 
 def github_interval_seconds(label: str) -> int:
@@ -585,6 +588,27 @@ def github_api_headers(user_agent: str = "DCS-Norway-Remote-Updater") -> dict[st
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def version_tuple(version_str: Any) -> tuple:
+    """Parse dotted version strings like '2.2.10' / 'v2.2.10' into comparable tuples."""
+    parts = []
+    for chunk in str(version_str or "").strip().lstrip("vV").split("."):
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            digits = "".join(ch for ch in chunk if ch.isdigit())
+            parts.append(int(digits) if digits else 0)
+    return tuple(parts) if parts else (0,)
+
+
+def github_release_has_node_asset(assets: Any) -> bool:
+    """True when a GitHub release lists the Node.exe self-update asset."""
+    for asset in assets or []:
+        name = str((asset or {}).get("name") or "").lower()
+        if "remote.updater.node.exe" in name:
+            return True
+    return False
 
 
 def fetch_latest_srs_release(timeout: float = 15.0) -> Optional[dict[str, str]]:
