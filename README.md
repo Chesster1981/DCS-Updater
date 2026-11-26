@@ -102,6 +102,8 @@ In the Control Panel: right-click a server row for **Start / Restart DCS**, **St
 
 During `DCS_updater.exe` download and unpack run in parallel. Mid-download UI looks like `Downloaded: 3282.1 of 19652.5 MBytes Speed: 50.6 MB/s`; when the network part is done it flips to `Downloaded: 100.0% of …` with `Speed: 0.0 KB/s` while Unpacking continues. The Node only then sets `active_task` to `Unpacking` / `dcs_download_complete: true`. Discord/Control advance the sequential queue at that point so the next server can use bandwidth.
 
+Node self-update is blocked while a DCS deploy is active. If the Node process still restarts mid-deploy, startup resumes by detecting `DCS_updater.exe` / preserve backups / a deploy marker and finishes MissionScripting restore + reboot.
+
 ## TCP protocol
 
 | Command | Response |

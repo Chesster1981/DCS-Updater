@@ -77,7 +77,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.12"
+CURRENT_NODE_VERSION = "2.2.13"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -421,7 +421,20 @@ def _version_tuple(version_str: str):
 
 
 def check_for_github_node_updates_silent():
-    if is_swapping: return  # Safety check
+    if is_swapping:
+        return  # Safety check
+    # Never self-update mid DCS deploy — a binary swap would drop restore/reboot.
+    busy = str(node_state.get("active_task") or "Idle")
+    if busy not in ("Idle",):
+        append_activity_log(
+            f"[SYSTEM] Skipping Node self-update — busy with DCS task `{busy}`."
+        )
+        return
+    if os.path.isfile(_dcs_deploy_marker_path()):
+        append_activity_log(
+            "[SYSTEM] Skipping Node self-update — interrupted DCS deploy marker present."
+        )
+        return
     try:
         if "YOUR_GITHUB_USERNAME" in GITHUB_REPO:
             append_activity_log(" [SYSTEM] GitHub check skipped: Please set ⚠️ your GITHUB_REPO in Block 1!")
@@ -2269,23 +2282,235 @@ def execute_srs_update_pipeline():
 # =========================================================================
 # BLOCK 3 OF 6: DEPLOYMENT PIPELINE & EXTENDED NETWORK SOCKET INTERFACE
 # =========================================================================
+DCS_DEPLOY_MARKER_NAME = "dcs_deploy_in_progress.flag"
+
+
+def _dcs_deploy_marker_path() -> str:
+    return os.path.join(application_path, DCS_DEPLOY_MARKER_NAME)
+
+
+def _write_dcs_deploy_marker(main_folder: str) -> None:
+    payload = {
+        "started_at": time.time(),
+        "main_folder": str(main_folder or ""),
+        "node_version": CURRENT_NODE_VERSION,
+    }
+    try:
+        with open(_dcs_deploy_marker_path(), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except Exception as e:
+        logging.warning("Could not write DCS deploy marker: %s", e)
+
+
+def _clear_dcs_deploy_marker() -> None:
+    path = _dcs_deploy_marker_path()
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception as e:
+        logging.warning("Could not clear DCS deploy marker: %s", e)
+
+
+def _dcs_preserve_backup_paths():
+    return (
+        os.path.join(application_path, "MissionScripting.lua.bak"),
+        os.path.join(application_path, "app.js.bak"),
+    )
+
+
+def is_dcs_updater_process_running() -> bool:
+    """True when Eagle Dynamics DCS_updater.exe is still alive."""
+    for image, _pid, exe_path in iter_windows_processes():
+        name = (os.path.basename(exe_path) if exe_path else image) or ""
+        if name.lower() == "dcs_updater.exe":
+            return True
+    return False
+
+
+def _note_dcs_updater_progress_once(main_folder: str, state: dict) -> None:
+    """One UI/log progress sample; mutates state['last_logged_pct'] / ['hits']."""
+    if node_state.get("dcs_download_complete"):
+        return
+    ui = read_dcs_updater_ui_progress()
+    pct = ui.get("downloaded_pct")
+    got = ui.get("downloaded_mb")
+    total = ui.get("downloaded_total_mb")
+    speed = ui.get("speed_kbps")
+    last_logged_pct = state.get("last_logged_pct")
+    if pct is not None:
+        rounded = int(pct)
+        if last_logged_pct is None or rounded >= last_logged_pct + 5 or rounded >= 100:
+            if got is not None and total is not None and not ui.get("download_finished_format"):
+                detail = f"{got:.1f}/{total:.1f} MB"
+            else:
+                detail = f"{pct:.1f}%"
+            speed_txt = ""
+            if speed is not None:
+                if speed >= 1024:
+                    speed_txt = f", {speed / 1024.0:.1f} MB/s"
+                else:
+                    speed_txt = f", {speed:.1f} KB/s"
+            append_activity_log(
+                f"[PROCESS] DCS updater download: {detail}{speed_txt}"
+                + (" (also unpacking)" if ui.get("unpacking") else "")
+            )
+            state["last_logged_pct"] = rounded
+    if dcs_updater_ui_indicates_download_complete(ui):
+        state["hits"] = int(state.get("hits") or 0) + 1
+    elif (not ui.get("found")) and read_autoupdate_log_download_complete(main_folder):
+        state["hits"] = int(state.get("hits") or 0) + 1
+    else:
+        state["hits"] = 0
+    if int(state.get("hits") or 0) >= 3:
+        node_state["dcs_download_complete"] = True
+        node_state["active_task"] = "Unpacking"
+        append_activity_log(
+            "[PROCESS] DCS download complete (Downloaded 100%, speed 0). "
+            "Unpacking continues — bandwidth is free for the next node."
+        )
+
+
+def _wait_for_dcs_updater_to_exit(main_folder: str) -> None:
+    """Poll progress until DCS_updater.exe and its UI are gone."""
+    state = {"last_logged_pct": None, "hits": 0}
+    idle_rounds = 0
+    while True:
+        _note_dcs_updater_progress_once(main_folder, state)
+        running = is_dcs_updater_process_running()
+        ui_found = bool(read_dcs_updater_ui_progress().get("found"))
+        if running or ui_found:
+            idle_rounds = 0
+        else:
+            idle_rounds += 1
+            if idle_rounds >= 2:
+                return
+        time.sleep(2.0)
+
+
+def _restore_preserved_dcs_files(config: dict) -> None:
+    main_folder = str(config.get("dcs_main_folder") or "").strip()
+    scripts_folder = os.path.join(main_folder, "Scripts")
+    webgui_js_folder = os.path.join(main_folder, "WebGUI", "js")
+    active_lua_file = os.path.join(scripts_folder, "MissionScripting.lua")
+    active_app_js_file = os.path.join(webgui_js_folder, "app.js")
+    backup_lua_file, backup_app_js_file = _dcs_preserve_backup_paths()
+
+    if os.path.exists(backup_lua_file):
+        append_activity_log("[PROCESS] Restoring preserved MissionScripting.lua back to DCS cluster...")
+        try:
+            os.makedirs(scripts_folder, exist_ok=True)
+            shutil.copy(backup_lua_file, active_lua_file)
+            append_activity_log(" [PROCESS] Success! MissionScripting.lua has ✅ been completely restored.")
+            os.remove(backup_lua_file)
+        except Exception as e:
+            append_activity_log(f" ERROR during file restoration: ❌ {e}")
+
+    if os.path.exists(backup_app_js_file):
+        append_activity_log("[PROCESS] Restoring preserved WebGUI js/app.js back to DCS cluster...")
+        try:
+            os.makedirs(webgui_js_folder, exist_ok=True)
+            shutil.copy(backup_app_js_file, active_app_js_file)
+            append_activity_log(" [PROCESS] Success! WebGUI js/app.js has ✅ been completely restored.")
+            os.remove(backup_app_js_file)
+        except Exception as e:
+            append_activity_log(f" ERROR during WebGUI app.js restoration: ❌ {e}")
+
+
+def _finish_dcs_deployment(config: dict, *, update_succeeded: bool) -> None:
+    try:
+        _restore_preserved_dcs_files(config)
+    finally:
+        if not update_succeeded:
+            node_state["active_task"] = "Idle"
+            node_state["dcs_download_complete"] = False
+            _clear_dcs_deploy_marker()
+            return
+
+        reboot_after_deployment = bool(config.get("reboot_after_deployment", True))
+        if reboot_after_deployment:
+            append_activity_log(" [PROCESS] Windows reboot is enabled.")
+            time.sleep(5)
+            if not execute_windows_reboot(source="process", delay_seconds=0):
+                append_activity_log(
+                    " [PROCESS] Finished without reboot (blocked by active RustDesk session)."
+                )
+                node_state["active_task"] = "Idle"
+                node_state["dcs_download_complete"] = False
+                _clear_dcs_deploy_marker()
+            else:
+                # Marker cleared after reboot request; process may die shortly.
+                _clear_dcs_deploy_marker()
+        else:
+            append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
+            node_state["active_task"] = "Idle"
+            node_state["dcs_download_complete"] = False
+            _clear_dcs_deploy_marker()
+
+
+def resume_interrupted_dcs_deployment_if_needed() -> bool:
+    """After Node restart/self-update, adopt a still-running DCS_updater and finish restore/reboot."""
+    config = load_node_settings()
+    main_folder = str(config.get("dcs_main_folder") or "").strip()
+    backup_lua_file, backup_app_js_file = _dcs_preserve_backup_paths()
+    has_backups = os.path.isfile(backup_lua_file) or os.path.isfile(backup_app_js_file)
+    has_marker = os.path.isfile(_dcs_deploy_marker_path())
+    updater_running = is_dcs_updater_process_running()
+    ui_found = bool(read_dcs_updater_ui_progress().get("found"))
+
+    if not (has_marker or has_backups or updater_running or ui_found):
+        return False
+
+    append_activity_log(
+        "\n[PROCESS] Resuming interrupted DCS update after Node restart "
+        f"(marker={has_marker}, backups={has_backups}, updater={updater_running or ui_found})..."
+    )
+    _write_dcs_deploy_marker(main_folder)
+    node_state["dcs_download_complete"] = False
+    node_state["active_task"] = "Downloading"
+
+    update_succeeded = False
+    try:
+        if updater_running or ui_found:
+            # Do NOT relaunch updater — just wait for the existing process to finish.
+            ui = read_dcs_updater_ui_progress()
+            if dcs_updater_ui_indicates_download_complete(ui):
+                node_state["active_task"] = "Unpacking"
+                node_state["dcs_download_complete"] = True
+            _wait_for_dcs_updater_to_exit(main_folder)
+        elif has_marker or has_backups:
+            append_activity_log(
+                "[PROCESS] No live DCS_updater found — finishing restore/reboot from preserved backups."
+            )
+        append_activity_log(" [PROCESS] DCS core update finished. ✅")
+        append_activity_log("[PROCESS] Re-scanning local configuration matrices...")
+        get_dcs_versions_local()
+        update_succeeded = True
+        node_state["dcs_download_complete"] = True
+    except Exception as e:
+        append_activity_log(f" ERROR while resuming DCS update: ❌ {e}")
+        update_succeeded = False
+
+    _finish_dcs_deployment(config, update_succeeded=update_succeeded)
+    return True
+
+
 def execute_deployment_pipeline():
     config = load_node_settings()
     main_folder = config.get("dcs_main_folder", "").strip()
     preserve_lua = config.get("preserve_mission_scripting", True)
     preserve_app_js = config.get("preserve_webgui_app_js", True)
-    reboot_after_deployment = config.get("reboot_after_deployment", True)
     bin_folder = os.path.join(main_folder, "bin")
     scripts_folder = os.path.join(main_folder, "Scripts")
     webgui_js_folder = os.path.join(main_folder, "WebGUI", "js")
     active_lua_file = os.path.join(scripts_folder, "MissionScripting.lua")
-    backup_lua_file = os.path.join(application_path, "MissionScripting.lua.bak")
+    backup_lua_file, backup_app_js_file = _dcs_preserve_backup_paths()
     active_app_js_file = os.path.join(webgui_js_folder, "app.js")
-    backup_app_js_file = os.path.join(application_path, "app.js.bak")
-    
+
     node_state["active_task"] = "Updating"
+    node_state["dcs_download_complete"] = False
+    _write_dcs_deploy_marker(main_folder)
     append_activity_log("\n[PROCESS] Starting update sequence...")
-    
+
     if preserve_lua and os.path.exists(active_lua_file):
         append_activity_log("[PROCESS] Preserving active MissionScripting.lua to node directory...")
         try:
@@ -2301,29 +2526,27 @@ def execute_deployment_pipeline():
             append_activity_log(" [PROCESS] Active WebGUI app.js backup secured ✅ successfully.")
         except Exception as e:
             append_activity_log(f" [PROCESS] WebGUI app.js backup failed, file might be ⚠️ locked: {e}")
-            
+
     force_kill_core_dcs()
     append_activity_log("[PROCESS] Verifying DCS cleanup status...")
-    max_timeout_ticks = 15 
+    max_timeout_ticks = 15
     start_timer = time.time()
-    
+
     while check_active_processes_running():
         if time.time() - start_timer > max_timeout_ticks:
             append_activity_log(" ERROR: Forced termination timed out. Files ❌ might still be locked!")
             break
         append_activity_log("[PROCESS] DCS still releasing files... Waiting 2 seconds...")
         time.sleep(2)
-        
+
     append_activity_log(" [PROCESS] DCS processes are verified DEAD. ✅ Proceeding.")
     node_state["active_task"] = "Downloading"
-    node_state["dcs_download_complete"] = False
 
     update_succeeded = False
     try:
         if not os.path.exists(bin_folder):
             append_activity_log(f" ERROR: Could not find the bin folder at: ❌ {bin_folder}")
-            node_state["active_task"] = "Idle"
-            return
+            raise FileNotFoundError(bin_folder)
 
         append_activity_log("[PROCESS] Launching DCS_updater.exe with elevated credentials pipeline...")
         updater_path = os.path.join(bin_folder, "DCS_updater.exe")
@@ -2352,52 +2575,9 @@ def execute_deployment_pipeline():
         )
         updater_thread.start()
 
-        last_logged_pct = None
-        download_complete_hits = 0
+        progress_state = {"last_logged_pct": None, "hits": 0}
         while not updater_result["done"]:
-            if not node_state.get("dcs_download_complete"):
-                ui = read_dcs_updater_ui_progress()
-                pct = ui.get("downloaded_pct")
-                got = ui.get("downloaded_mb")
-                total = ui.get("downloaded_total_mb")
-                speed = ui.get("speed_kbps")
-                if pct is not None:
-                    rounded = int(pct)
-                    if last_logged_pct is None or rounded >= last_logged_pct + 5 or rounded >= 100:
-                        if got is not None and total is not None and not ui.get("download_finished_format"):
-                            detail = f"{got:.1f}/{total:.1f} MB"
-                        else:
-                            detail = f"{pct:.1f}%"
-                        speed_txt = ""
-                        if speed is not None:
-                            if speed >= 1024:
-                                speed_txt = f", {speed / 1024.0:.1f} MB/s"
-                            else:
-                                speed_txt = f", {speed:.1f} KB/s"
-                        append_activity_log(
-                            f"[PROCESS] DCS updater download: {detail}{speed_txt}"
-                            + (" (also unpacking)" if ui.get("unpacking") else "")
-                        )
-                        last_logged_pct = rounded
-                # UI is authoritative. Log fallback only after the session leaves
-                # "Downloading update" — never treat concurrent Unpacking as done.
-                if dcs_updater_ui_indicates_download_complete(ui):
-                    download_complete_hits += 1
-                elif (
-                    not ui.get("found")
-                    and read_autoupdate_log_download_complete(main_folder)
-                ):
-                    download_complete_hits += 1
-                else:
-                    download_complete_hits = 0
-                # Three consecutive polls (~6s) with idle speed / 100% form.
-                if download_complete_hits >= 3:
-                    node_state["dcs_download_complete"] = True
-                    node_state["active_task"] = "Unpacking"
-                    append_activity_log(
-                        "[PROCESS] DCS download complete (Downloaded 100%, speed 0). "
-                        "Unpacking continues — bandwidth is free for the next node."
-                    )
+            _note_dcs_updater_progress_once(main_folder, progress_state)
             time.sleep(2.0)
 
         updater_thread.join(timeout=5)
@@ -2411,46 +2591,9 @@ def execute_deployment_pipeline():
         node_state["dcs_download_complete"] = True
     except Exception as e:
         append_activity_log(f" ERROR during DCS update: ❌ {e}")
-        node_state["active_task"] = "Idle"
-        node_state["dcs_download_complete"] = False
-        return
-    finally:
-        if preserve_lua and os.path.exists(backup_lua_file):
-            append_activity_log("[PROCESS] Restoring preserved MissionScripting.lua back to DCS cluster...")
-            try:
-                os.makedirs(scripts_folder, exist_ok=True)
-                shutil.copy(backup_lua_file, active_lua_file)
-                append_activity_log(" [PROCESS] Success! MissionScripting.lua has ✅ been completely restored.")
-                os.remove(backup_lua_file)
-            except Exception as e:
-                append_activity_log(f" ERROR during file restoration: ❌ {e}")
+        update_succeeded = False
 
-        if preserve_app_js and os.path.exists(backup_app_js_file):
-            append_activity_log("[PROCESS] Restoring preserved WebGUI js/app.js back to DCS cluster...")
-            try:
-                os.makedirs(webgui_js_folder, exist_ok=True)
-                shutil.copy(backup_app_js_file, active_app_js_file)
-                append_activity_log(" [PROCESS] Success! WebGUI js/app.js has ✅ been completely restored.")
-                os.remove(backup_app_js_file)
-            except Exception as e:
-                append_activity_log(f" ERROR during WebGUI app.js restoration: ❌ {e}")
-
-    if not update_succeeded:
-        return
-
-    if reboot_after_deployment:
-        append_activity_log(" [PROCESS] Windows reboot is enabled.")
-        time.sleep(5)
-        if not execute_windows_reboot(source="process", delay_seconds=0):
-            append_activity_log(
-                " [PROCESS] Finished without reboot (blocked by active RustDesk session)."
-            )
-            node_state["active_task"] = "Idle"
-            node_state["dcs_download_complete"] = False
-    else:
-        append_activity_log(" [PROCESS] Finished! (PC Reboot was ✅ skipped).")
-        node_state["active_task"] = "Idle"
-        node_state["dcs_download_complete"] = False
+    _finish_dcs_deployment(config, update_succeeded=update_succeeded)
 
 def _accept_error_is_transient(err: BaseException) -> bool:
     """Client aborted while the handshake was still in progress. Keep listening."""
@@ -3037,6 +3180,17 @@ def force_github_update_check(silent=False):
         if not silent:
             messagebox.showwarning("Busy", "A node update sequence is already active.")
         return False
+    busy = str(node_state.get("active_task") or "Idle")
+    if busy not in ("Idle",) or os.path.isfile(_dcs_deploy_marker_path()):
+        if not silent:
+            messagebox.showwarning(
+                "Busy",
+                f"Cannot self-update the Node while DCS deploy is active ({busy}).",
+            )
+        append_activity_log(
+            f"[SYSTEM] Refusing Node self-update check — DCS deploy active (`{busy}`)."
+        )
+        return False
 
     append_activity_log("\n[SYSTEM] Manual GitHub update check requested by operator...")
     # Reset the loop timestamp so the background thread alignment stays correct
@@ -3383,6 +3537,12 @@ threading.Thread(target=status_cache_loop, daemon=True, name="status-cache").sta
 threading.Thread(target=listener_supervisor_loop, daemon=True, name="listener-supervisor").start()
 threading.Thread(target=lambda: get_srs_latest_version_cached(allow_fetch=True), daemon=True).start()
 threading.Thread(target=refresh_dcs_health_state, daemon=True, name="boot-health").start()
+# If Node self-updated (or crashed) mid DCS deploy, adopt DCS_updater and finish restore/reboot.
+threading.Thread(
+    target=resume_interrupted_dcs_deployment_if_needed,
+    daemon=True,
+    name="resume-dcs-deploy",
+).start()
 
 root.after(0, _pump_ui_queue)
 root.after(100, lambda: root.withdraw())
