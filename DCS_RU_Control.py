@@ -51,6 +51,7 @@ from dcs_ru_common import (
     save_master_config,
     wrap_command,
     scrape_dcs_latest_version,
+    fetch_latest_srs_release,
     github_api_headers,
     NODE_SETTINGS_DEFAULTS,
     NODE_GITHUB_INTERVAL_CHOICES,
@@ -60,7 +61,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.2.8"
+CONTROL_PANEL_VERSION = "2.2.9"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -70,6 +71,8 @@ WINDOW_MAX_SCREEN_HEIGHT_FRACTION = 0.75
 CELL_TEXT_PAD = 8
 CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS = 2500
 CONTROL_PANEL_UPDATE_INTERVAL_MS = 60 * 60 * 1000
+# Same cadence as the Discord bot's DCS/SRS release cache (15 minutes).
+CLOUD_VERSION_CHECK_INTERVAL_SEC = 15 * 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -516,19 +519,45 @@ def test_single_system_background(index, ip, port, window_ref=None):
     global is_deployment_running
     row_id_str = str(index)
     answer = send_socket_command(ip, port, "PING_STATUS")
-    status, local_ver, cloud_ver, active_task, node_ver, live_services = parse_socket_response(answer)
+    status, local_ver, _cloud_ver, active_task, node_ver, live_services = parse_socket_response(answer)
     srs_installed, srs_latest = parse_srs_from_ping(answer)
-    if status == "ONLINE" and cloud_ver not in ("Unknown", "Fetching..."):
-        global_signals.cloud_version_updated.emit(cloud_ver)
-    # Still accept cloud version when DCS is down — node agent is alive
-    if status == "DCS DOWN" and cloud_ver not in ("Unknown", "Fetching..."):
-        global_signals.cloud_version_updated.emit(cloud_ver)
-    if srs_latest not in ("Unknown", "Fetching...", "—", ""):
-        global_signals.srs_cloud_version_updated.emit(srs_latest)
+    # Cloud / SRS "latest" versions come only from central_cloud_version_monitor —
+    # never overwrite the shared cache from a per-node scrape (avoids staggered
+    # UPDATE READY across the cluster).
     global_signals.node_updated.emit(
         row_id_str, status, local_ver, active_task, node_ver, live_services
     )
     global_signals.srs_versions_updated.emit(row_id_str, srs_installed, srs_latest)
+
+def refresh_central_cloud_versions():
+    """Scrape ED + SRS once for the whole cluster; keep prior cache on failure."""
+    try:
+        dcs_version = scrape_dcs_latest_version(timeout=10.0)
+        if dcs_version:
+            global_signals.cloud_version_updated.emit(dcs_version)
+            logging.info("Central DCS cloud version: %s", dcs_version)
+        else:
+            logging.warning("Central DCS scrape returned no version; keeping prior cache.")
+    except Exception as e:
+        logging.warning("Central DCS scrape failed: %s", e)
+
+    try:
+        release = fetch_latest_srs_release(timeout=15.0)
+        tag = str((release or {}).get("tag") or "").strip()
+        if tag:
+            global_signals.srs_cloud_version_updated.emit(tag)
+            logging.info("Central SRS release version: %s", tag)
+        else:
+            logging.warning("Central SRS GitHub fetch returned no tag; keeping prior cache.")
+    except Exception as e:
+        logging.warning("Central SRS GitHub fetch failed: %s", e)
+
+
+def central_cloud_version_monitor():
+    while True:
+        refresh_central_cloud_versions()
+        time.sleep(CLOUD_VERSION_CHECK_INTERVAL_SEC)
+
 
 def automatic_status_monitor(window_ref=None):
     while True:
@@ -1711,22 +1740,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str, str)
     def slot_srs_versions_updated(self, row_id_str, srs_installed, srs_latest):
-        global cached_latest_srs_version
         idx = int(row_id_str)
         if idx >= self.table.rowCount():
             return
-        latest_clean = str(srs_latest or "").strip()
-        if latest_clean not in ("", "Unknown", "Fetching...", "—"):
-            cached_latest_srs_version = latest_clean
+        # Color against the central SRS cache only — ignore per-node latest.
+        cloud_clean = str(cached_latest_srs_version or "").strip()
         inst_clean = str(srs_installed or "").strip()
         vc = self.table.cellWidget(idx, 6)
         if vc and (lbl := vc.findChild(QLabel, "srs_ver_text")):
             lbl.setText(inst_clean or "—")
             if inst_clean in ("UNKNOWN", "FETCHING...", "Missing", "Not set", "—", ""):
                 cv = STYLE_STATUS_WARN
-            elif latest_clean in ("Fetching...", "Unknown", "", "—"):
+            elif cloud_clean in ("Fetching...", "Unknown", "", "—"):
                 cv = STYLE_STATUS_GREEN
-            elif inst_clean != latest_clean:
+            elif inst_clean != cloud_clean:
                 cv = STYLE_STATUS_RED
             else:
                 cv = STYLE_STATUS_GREEN
@@ -2004,5 +2031,6 @@ if __name__ == "__main__":
     window = MainWindow()
     window.show()
 
+    threading.Thread(target=central_cloud_version_monitor, daemon=True).start()
     threading.Thread(target=automatic_status_monitor, args=(window,), daemon=True).start()
     sys.exit(app.exec())

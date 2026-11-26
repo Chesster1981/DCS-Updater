@@ -28,7 +28,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.8"
+CURRENT_BOT_VERSION = "2.2.9"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1601,6 +1601,7 @@ class DCSClusterBot(commands.Bot):
         channel = task_data["channel"]
         name = node["name"]
         action = str(task_data.get("action") or "update").strip().lower()
+        dcs_latest = await self.fetch_latest_dcs_release()
         srs_latest = await self.fetch_latest_srs_release_cached()
 
         status_msg = await channel.send(
@@ -1623,7 +1624,11 @@ class DCSClusterBot(commands.Bot):
                 return
 
             if action in ("update", "update_dcs", "update_srs"):
-                classified = classify_node_answer(ping, srs_latest_release=srs_latest)
+                classified = classify_node_answer(
+                    ping,
+                    srs_latest_release=srs_latest,
+                    dcs_latest_release=dcs_latest,
+                )
                 needs_dcs = classified.get("needs_dcs_update", False)
                 needs_srs = classified.get("needs_srs_update", False)
 
@@ -2081,7 +2086,7 @@ def is_srs_outdated(installed: str, latest: str) -> bool:
     return inst != lat
 
 
-def classify_node_answer(answer, srs_latest_release=None):
+def classify_node_answer(answer, srs_latest_release=None, dcs_latest_release=None):
     status_text = STATUS_UP_TO_DATE
     ver_info = "Unknown"
     srs_info = "—"
@@ -2109,7 +2114,16 @@ def classify_node_answer(answer, srs_latest_release=None):
                 icon = "🔐"
             else:
                 installed_ver = res.get("installed_version", "Unknown")
-                latest_ver = res.get("latest_cloud_version", installed_ver)
+                node_latest = str(res.get("latest_cloud_version") or "").strip()
+                bot_latest = str(dcs_latest_release or "").strip()
+                # Prefer the bot's central ED scrape so every server flips UPDATE READY together.
+                # Fall back to the node's value only when the bot cache is still Unknown.
+                if bot_latest and bot_latest not in ("Unknown", "Fetching..."):
+                    latest_ver = bot_latest
+                elif node_latest and node_latest not in ("Unknown", "Fetching...", ""):
+                    latest_ver = node_latest
+                else:
+                    latest_ver = installed_ver
                 dcs_health = str(res.get("dcs_health", "")).strip().upper()
                 dcs_running = res.get("dcs_running", True)
                 active_task = res.get("active_task", "Idle")
@@ -2143,8 +2157,8 @@ def classify_node_answer(answer, srs_latest_release=None):
                     srs_latest_release or res.get("srs_latest_version") or ""
                 ).strip()
                 needs_dcs_update = (
-                    str(installed_ver).strip() != str(latest_ver).strip()
-                    and latest_ver != "Unknown"
+                    not _versions_match(installed_ver, latest_ver)
+                    and str(latest_ver).strip() not in ("Unknown", "Fetching...", "")
                 )
                 needs_srs_update = srs_configured and is_srs_outdated(
                     srs_installed_raw, srs_latest
@@ -2722,7 +2736,11 @@ class LiveControlPanelView(discord.ui.View):
         selected_set = set(self._selection_names())
 
         for idx, (node, answer) in enumerate(zip(nodes, responses)):
-            classified = classify_node_answer(answer, srs_latest_release=srs_latest_release)
+            classified = classify_node_answer(
+                answer,
+                srs_latest_release=srs_latest_release,
+                dcs_latest_release=dcs_latest_release,
+            )
             status_text = classified["status_text"]
             ver_info = classified["ver_info"]
             task_info = classified["task_info"]
