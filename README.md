@@ -100,7 +100,7 @@ In the Control Panel: right-click a server row for **Start / Restart DCS**, **St
 
 ### DCS update queue (download vs unpack)
 
-During `DCS_updater.exe` the Node watches the updater UI for `Downloaded: 100%` (and `autoupdate_log.txt` post-download STATUS lines). When the network download is done it sets `active_task` to `Unpacking` and `dcs_download_complete: true` in `PING_STATUS`. Discord/Control then advance the sequential queue to the next server so bandwidth is not idle while unpacking continues.
+During `DCS_updater.exe` download and unpack run in parallel. Mid-download UI looks like `Downloaded: 3282.1 of 19652.5 MBytes Speed: 50.6 MB/s`; when the network part is done it flips to `Downloaded: 100.0% of …` with `Speed: 0.0 KB/s` while Unpacking continues. The Node only then sets `active_task` to `Unpacking` / `dcs_download_complete: true`. Discord/Control advance the sequential queue at that point so the next server can use bandwidth.
 
 ## TCP protocol
 

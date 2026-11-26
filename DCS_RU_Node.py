@@ -77,7 +77,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.11"
+CURRENT_NODE_VERSION = "2.2.12"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -940,8 +940,19 @@ def has_dcs_crash_dialog() -> bool:
     )
 
 
+# Mid-download UI:  "Downloaded: 3282.1 of 19652.5 MBytes Speed: 50.6 MB/s"
+# Download-done UI: "Downloaded: 100.0% of 50059.2 MBytes" + "Speed: 0.0 KB/s"
+# Unpacking runs concurrently — its presence alone must NEVER mean download done.
 _DCS_UPDATER_DOWNLOAD_PCT_RE = re.compile(
     r"Downloaded:\s*([0-9]+(?:\.[0-9]+)?)\s*%",
+    re.IGNORECASE,
+)
+_DCS_UPDATER_DOWNLOAD_OF_RE = re.compile(
+    r"Downloaded:\s*([0-9]+(?:\.[0-9]+)?)\s+of\s+([0-9]+(?:\.[0-9]+)?)\s*MBytes",
+    re.IGNORECASE,
+)
+_DCS_UPDATER_SPEED_RE = re.compile(
+    r"Speed:\s*([0-9]+(?:\.[0-9]+)?)\s*(KB|MB|GB)/s",
     re.IGNORECASE,
 )
 _DCS_AUTOUPDATE_DOWNLOAD_DONE_STATUS = (
@@ -950,6 +961,8 @@ _DCS_AUTOUPDATE_DOWNLOAD_DONE_STATUS = (
     "cleaning up",
     "successfully updated",
 )
+_WM_GETTEXT = 0x000D
+_WM_GETTEXTLENGTH = 0x000E
 
 
 def _collect_hwnd_text_tree(root_hwnd) -> str:
@@ -962,10 +975,24 @@ def _collect_hwnd_text_tree(root_hwnd) -> str:
     chunks: list[str] = []
 
     def _read(hwnd) -> str:
-        length = user32.GetWindowTextLengthW(hwnd) + 1
+        # Prefer WM_GETTEXT — some static labels return empty via GetWindowTextW.
+        try:
+            length = int(user32.SendMessageW(hwnd, _WM_GETTEXTLENGTH, 0, 0)) + 1
+        except Exception:
+            length = 0
+        if length <= 1:
+            length = user32.GetWindowTextLengthW(hwnd) + 1
         if length <= 1:
             return ""
+        length = min(length, 4096)
         buf = ctypes.create_unicode_buffer(length)
+        try:
+            user32.SendMessageW(hwnd, _WM_GETTEXT, length, buf)
+            text = str(buf.value or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
         user32.GetWindowTextW(hwnd, buf, length)
         return str(buf.value or "").strip()
 
@@ -984,16 +1011,92 @@ def _collect_hwnd_text_tree(root_hwnd) -> str:
     return "\n".join(chunks)
 
 
-def _scan_dcs_updater_ui_progress() -> dict:
-    """Read DCS Updater progress UI (Downloaded % / Unpacking) via EnumWindows."""
+def _parse_dcs_updater_progress_text(raw: str) -> dict:
+    """Parse Downloaded / Speed / Unpacking lines from updater UI text."""
+    text = str(raw or "")
     result = {
+        "found": bool(text.strip()),
+        "downloaded_pct": None,
+        "downloaded_mb": None,
+        "downloaded_total_mb": None,
+        "download_finished_format": False,
+        "speed_kbps": None,
+        "unpacking": "unpacking" in text.lower(),
+        "raw_text": text,
+    }
+    pct_match = _DCS_UPDATER_DOWNLOAD_PCT_RE.search(text)
+    of_match = _DCS_UPDATER_DOWNLOAD_OF_RE.search(text)
+    # Prefer absolute "X of Y MBytes" while downloading — the done state flips to "100.0% of Y".
+    if of_match and not pct_match:
+        try:
+            got = float(of_match.group(1))
+            total = float(of_match.group(2))
+            result["downloaded_mb"] = got
+            result["downloaded_total_mb"] = total
+            if total > 0:
+                result["downloaded_pct"] = min(100.0, (got / total) * 100.0)
+        except ValueError:
+            pass
+    elif pct_match:
+        try:
+            result["downloaded_pct"] = float(pct_match.group(1))
+            result["download_finished_format"] = float(pct_match.group(1)) >= 99.9
+        except ValueError:
+            pass
+        # Optional trailing "of N MBytes" after the percent form.
+        of_after_pct = re.search(
+            r"Downloaded:\s*[0-9]+(?:\.[0-9]+)?\s*%\s*of\s*([0-9]+(?:\.[0-9]+)?)\s*MBytes",
+            text,
+            re.IGNORECASE,
+        )
+        if of_after_pct:
+            try:
+                result["downloaded_total_mb"] = float(of_after_pct.group(1))
+                result["downloaded_mb"] = result["downloaded_total_mb"]
+            except ValueError:
+                pass
+    elif of_match:
+        # Both matched oddly; still record absolute numbers.
+        try:
+            got = float(of_match.group(1))
+            total = float(of_match.group(2))
+            result["downloaded_mb"] = got
+            result["downloaded_total_mb"] = total
+            if total > 0:
+                result["downloaded_pct"] = min(100.0, (got / total) * 100.0)
+        except ValueError:
+            pass
+
+    speed_match = _DCS_UPDATER_SPEED_RE.search(text)
+    if speed_match:
+        try:
+            value = float(speed_match.group(1))
+            unit = speed_match.group(2).upper()
+            if unit == "GB":
+                result["speed_kbps"] = value * 1024.0 * 1024.0
+            elif unit == "MB":
+                result["speed_kbps"] = value * 1024.0
+            else:
+                result["speed_kbps"] = value
+        except ValueError:
+            result["speed_kbps"] = None
+    return result
+
+
+def _scan_dcs_updater_ui_progress() -> dict:
+    """Read DCS Updater progress UI (Downloaded / Speed / Unpacking) via EnumWindows."""
+    empty = {
         "found": False,
         "downloaded_pct": None,
+        "downloaded_mb": None,
+        "downloaded_total_mb": None,
+        "download_finished_format": False,
+        "speed_kbps": None,
         "unpacking": False,
         "raw_text": "",
     }
     if sys.platform != "win32":
-        return result
+        return empty
 
     from ctypes import wintypes
 
@@ -1020,19 +1123,8 @@ def _scan_dcs_updater_ui_progress() -> dict:
 
     user32.EnumWindows(callback, 0)
     if not blobs:
-        return result
-
-    raw = "\n".join(blobs)
-    result["found"] = True
-    result["raw_text"] = raw
-    result["unpacking"] = "unpacking" in raw.lower()
-    match = _DCS_UPDATER_DOWNLOAD_PCT_RE.search(raw)
-    if match:
-        try:
-            result["downloaded_pct"] = float(match.group(1))
-        except ValueError:
-            result["downloaded_pct"] = None
-    return result
+        return empty
+    return _parse_dcs_updater_progress_text("\n".join(blobs))
 
 
 def read_dcs_updater_ui_progress() -> dict:
@@ -1040,6 +1132,10 @@ def read_dcs_updater_ui_progress() -> dict:
     default = {
         "found": False,
         "downloaded_pct": None,
+        "downloaded_mb": None,
+        "downloaded_total_mb": None,
+        "download_finished_format": False,
+        "speed_kbps": None,
         "unpacking": False,
         "raw_text": "",
     }
@@ -1052,7 +1148,12 @@ def read_dcs_updater_ui_progress() -> dict:
 
 
 def read_autoupdate_log_download_complete(main_folder: str) -> bool:
-    """True when autoupdate_log.txt shows post-download install phases."""
+    """True when the *current* autoupdate session has left the download phase.
+
+    Only inspects text after the last 'Log opened' marker so a previous
+    'Successfully updated' cannot false-trigger while a new download runs.
+    Concurrent PACK/Unpacking lines during download are ignored.
+    """
     path = os.path.join(str(main_folder or "").strip(), "autoupdate_log.txt")
     if not path or not os.path.isfile(path):
         return False
@@ -1060,43 +1161,66 @@ def read_autoupdate_log_download_complete(main_folder: str) -> bool:
         with open(path, "r", encoding="utf-8", errors="ignore") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
-            handle.seek(max(0, size - 65536), os.SEEK_SET)
-            tail = handle.read().lower()
+            # Current ED updates can write large logs; keep a generous tail.
+            handle.seek(max(0, size - 512_000), os.SEEK_SET)
+            tail = handle.read()
     except Exception:
         return False
 
-    # Prefer the latest STATUS line in the tail.
-    latest_status = ""
-    for line in tail.splitlines():
-        if "status:" in line:
-            latest_status = line.split("status:", 1)[-1].strip()
-    if latest_status:
-        for marker in _DCS_AUTOUPDATE_DOWNLOAD_DONE_STATUS:
-            if marker in latest_status:
-                return True
+    lower = tail.lower()
+    marker = "=== log opened"
+    idx = lower.rfind(marker)
+    session = lower[idx:] if idx >= 0 else lower
 
-    # Zero-byte updates never show Downloaded: 100% in the UI.
-    if "to download: 0 bytes" in tail and "status: downloading update" in tail:
-        # Only treat as done once unpacking/install has clearly started.
-        if "unpacking" in tail or "installing new files" in tail or "removing obsolete" in tail:
-            return True
+    latest_status = ""
+    saw_downloading_update = False
+    for line in session.splitlines():
+        if "status:" not in line:
+            continue
+        status = line.split("status:", 1)[-1].strip()
+        latest_status = status
+        if status.startswith("downloading update"):
+            saw_downloading_update = True
+
+    if not latest_status:
+        return False
+    for done in _DCS_AUTOUPDATE_DOWNLOAD_DONE_STATUS:
+        if done in latest_status:
+            # Require that this session actually entered download, otherwise a
+            # short repair/self-update session can look "done" immediately.
+            return saw_downloading_update or "to download: 0 bytes" in session
     return False
 
 
 def dcs_updater_ui_indicates_download_complete(ui: dict | None) -> bool:
-    """True when the updater UI shows download finished (unpack may continue)."""
-    if not isinstance(ui, dict):
+    """True only when network download is finished (unpack may still run).
+
+    Mid-download UI uses 'Downloaded: X of Y MBytes' with a non-zero speed.
+    Done UI uses 'Downloaded: 100.0% of Y MBytes' and 'Speed: 0.0 KB/s'.
+    The word Unpacking alone is NOT enough — it appears during download too.
+    """
+    if not isinstance(ui, dict) or not ui.get("found"):
         return False
+
+    speed = ui.get("speed_kbps")
+    speed_idle = speed is None or float(speed) <= 0.05
+
+    if ui.get("download_finished_format"):
+        # Explicit percent-complete form from ED — require idle speed when present.
+        return speed_idle if speed is not None else True
+
     pct = ui.get("downloaded_pct")
-    if pct is None:
-        return False
+    got = ui.get("downloaded_mb")
+    total = ui.get("downloaded_total_mb")
     try:
-        value = float(pct)
+        if got is not None and total is not None and float(total) > 0:
+            if float(got) >= float(total) * 0.999 and speed_idle:
+                return True
+        if pct is not None and float(pct) >= 99.9 and speed_idle:
+            return True
     except (TypeError, ValueError):
         return False
-    if value >= 99.9:
-        return True
-    return bool(ui.get("unpacking")) and value >= 99.0
+    return False
 
 
 def resolve_dcs_saved_games_roots(config=None) -> list[str]:
@@ -2234,27 +2358,45 @@ def execute_deployment_pipeline():
             if not node_state.get("dcs_download_complete"):
                 ui = read_dcs_updater_ui_progress()
                 pct = ui.get("downloaded_pct")
+                got = ui.get("downloaded_mb")
+                total = ui.get("downloaded_total_mb")
+                speed = ui.get("speed_kbps")
                 if pct is not None:
                     rounded = int(pct)
                     if last_logged_pct is None or rounded >= last_logged_pct + 5 or rounded >= 100:
+                        if got is not None and total is not None and not ui.get("download_finished_format"):
+                            detail = f"{got:.1f}/{total:.1f} MB"
+                        else:
+                            detail = f"{pct:.1f}%"
+                        speed_txt = ""
+                        if speed is not None:
+                            if speed >= 1024:
+                                speed_txt = f", {speed / 1024.0:.1f} MB/s"
+                            else:
+                                speed_txt = f", {speed:.1f} KB/s"
                         append_activity_log(
-                            f"[PROCESS] DCS updater download: {pct:.1f}%"
-                            + (" (unpacking)" if ui.get("unpacking") else "")
+                            f"[PROCESS] DCS updater download: {detail}{speed_txt}"
+                            + (" (also unpacking)" if ui.get("unpacking") else "")
                         )
                         last_logged_pct = rounded
+                # UI is authoritative. Log fallback only after the session leaves
+                # "Downloading update" — never treat concurrent Unpacking as done.
                 if dcs_updater_ui_indicates_download_complete(ui):
                     download_complete_hits += 1
-                elif read_autoupdate_log_download_complete(main_folder):
-                    download_complete_hits = 2
+                elif (
+                    not ui.get("found")
+                    and read_autoupdate_log_download_complete(main_folder)
+                ):
+                    download_complete_hits += 1
                 else:
                     download_complete_hits = 0
-                # Two consecutive polls (~4s) avoids a brief 100% flicker mid-batch.
-                if download_complete_hits >= 2:
+                # Three consecutive polls (~6s) with idle speed / 100% form.
+                if download_complete_hits >= 3:
                     node_state["dcs_download_complete"] = True
                     node_state["active_task"] = "Unpacking"
                     append_activity_log(
-                        "[PROCESS] DCS download complete (100%). Unpacking continues — "
-                        "bandwidth is free for the next node."
+                        "[PROCESS] DCS download complete (Downloaded 100%, speed 0). "
+                        "Unpacking continues — bandwidth is free for the next node."
                     )
             time.sleep(2.0)
 
