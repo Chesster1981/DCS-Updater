@@ -30,7 +30,7 @@ from dcs_ru_common import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DCS_Discord_Bot")
 
-CURRENT_BOT_VERSION = "2.2.14"
+CURRENT_BOT_VERSION = "2.2.15"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 BOT_SELF_UPDATE_FILES = ("DCS_RU_Discord_Bot.py", "dcs_ru_common.py")
@@ -1520,13 +1520,23 @@ class DCSClusterBot(commands.Bot):
             self.deployment_queue.task_done()
             self.is_processing_queue = False
 
-    async def _safe_status_edit(self, status_msg, content: str):
-        """Best-effort edit; never fail the deploy queue if the message was purged."""
+    async def _safe_status_edit(self, status_msg, content: str, *, timeout=8.0):
+        """Best-effort edit; never stall the deploy queue on Discord API hangs."""
         if status_msg is None:
             return False
-        try:
+
+        async def _edit():
             await status_msg.edit(content=content)
+
+        try:
+            await asyncio.wait_for(_edit(), timeout=max(1.0, float(timeout)))
             return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Status message edit timed out (%s)",
+                getattr(status_msg, "id", "?"),
+            )
+            return False
         except discord.NotFound:
             return False
         except Exception as e:
@@ -1536,6 +1546,24 @@ class DCSClusterBot(commands.Bot):
                 e,
             )
             return False
+
+    @staticmethod
+    def _deploy_task_is_done(
+        task: str,
+        *,
+        download_done: bool,
+        done_tasks,
+        accept_download_complete: bool,
+    ) -> bool:
+        normalized = str(task or "Idle").strip()
+        if normalized in done_tasks:
+            return True
+        if not accept_download_complete:
+            return False
+        if download_done:
+            return True
+        # Node may report Unpacking with or without the flag.
+        return normalized.lower().startswith("unpacking")
 
     async def _monitor_node_task_until_idle(
         self,
@@ -1552,16 +1580,31 @@ class DCSClusterBot(commands.Bot):
         self.protect_status_message(status_msg)
         start_time = asyncio.get_event_loop().time()
         last_task = None
+        last_heartbeat = 0.0
         while True:
-            if asyncio.get_event_loop().time() - start_time > timeout_seconds:
+            now = asyncio.get_event_loop().time()
+            if now - start_time > timeout_seconds:
                 await self._safe_status_edit(
                     status_msg,
-                    f"⏰ **[{name}]** Update exceeded {timeout_seconds // 60} minutes (Timeout reached).",
+                    (
+                        f"⏰ **[{name}]** Update exceeded {timeout_seconds // 60} minutes "
+                        "(Timeout reached) — continuing queue."
+                    ),
                 )
+                logger.warning("[%s] Deploy monitor timeout after %ss", name, timeout_seconds)
                 return False
 
-            chk = await self.send_socket_command(node["ip"], node["port"], "PING_STATUS")
+            try:
+                chk = await asyncio.wait_for(
+                    self.send_socket_command(node["ip"], node["port"], "PING_STATUS"),
+                    timeout=max(6.0, float(self.socket_timeout) + 2.0),
+                )
+            except asyncio.TimeoutError:
+                chk = None
+                logger.warning("[%s] Deploy monitor PING timed out", name)
+
             if chk is None:
+                # Node often drops the socket when reboot starts after deploy.
                 await self._safe_status_edit(
                     status_msg,
                     f"🎉 **[{name}]** Connection closed. Server completed sequence!",
@@ -1574,32 +1617,39 @@ class DCSClusterBot(commands.Bot):
                 except Exception:
                     res = None
                 if isinstance(res, dict):
-                    task = res.get("active_task", "Idle")
+                    task = str(res.get("active_task", "Idle") or "Idle").strip()
                     download_done = bool(res.get("dcs_download_complete"))
-                    done = task in done_tasks or (
-                        accept_download_complete
-                        and (download_done or task == "Unpacking")
+                    done = self._deploy_task_is_done(
+                        task,
+                        download_done=download_done,
+                        done_tasks=done_tasks,
+                        accept_download_complete=accept_download_complete,
                     )
-                    if (
-                        not done
-                        and task != last_task
-                        and progress_text
-                    ):
-                        last_task = task
-                        await self._safe_status_edit(
-                            status_msg,
-                            progress_text.replace("{task}", str(task)),
-                        )
+                    # Done check BEFORE Discord edits — never let UI I/O block advancement.
                     if done:
-                        # Always advance the queue even if Discord edit/purge failed.
-                        await self._safe_status_edit(status_msg, success_text)
                         logger.info(
                             "[%s] Deploy monitor done (task=%s download_complete=%s)",
                             name,
                             task,
                             download_done,
                         )
+                        await self._safe_status_edit(status_msg, success_text)
                         return True
+                    if task != last_task and progress_text:
+                        last_task = task
+                        await self._safe_status_edit(
+                            status_msg,
+                            progress_text.replace("{task}", str(task)),
+                        )
+                    elif now - last_heartbeat >= 60:
+                        last_heartbeat = now
+                        logger.info(
+                            "[%s] Deploy monitor waiting (task=%s download_complete=%s elapsed=%ss)",
+                            name,
+                            task,
+                            download_done,
+                            int(now - start_time),
+                        )
             await asyncio.sleep(4)
 
     async def _run_dcs_update(self, node, channel, status_msg, name):
@@ -1680,7 +1730,9 @@ class DCSClusterBot(commands.Bot):
                 f"✅ **[{name}]** DCS download complete — unpacking continues on this node. "
                 "Bandwidth free for the next server."
             ),
-            timeout_seconds=1800,
+            # Large patches can download for hours; Unpacking/download_complete
+            # must release the queue earlier. Timeout is only a safety net.
+            timeout_seconds=6 * 3600,
             done_tasks=("Rebooting", "Idle", "Unpacking"),
             accept_download_complete=True,
             progress_text=f"⏳ **[{name}]** DCS update in progress (`{{task}}`)…",
