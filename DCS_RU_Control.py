@@ -53,6 +53,8 @@ from dcs_ru_common import (
     scrape_dcs_latest_version,
     fetch_latest_srs_release,
     github_api_headers,
+    github_release_has_node_asset,
+    version_tuple,
     NODE_SETTINGS_DEFAULTS,
     NODE_GITHUB_INTERVAL_CHOICES,
     NODE_LOCAL_ONLY_SETTING_KEYS,
@@ -61,7 +63,7 @@ from dcs_ru_common import (
     sanitize_node_settings,
 )
 
-CONTROL_PANEL_VERSION = "2.2.9"
+CONTROL_PANEL_VERSION = "2.2.10"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 TABLE_MAX_VISIBLE_ROWS = 10
@@ -73,6 +75,10 @@ CONTROL_PANEL_STARTUP_UPDATE_DELAY_MS = 2500
 CONTROL_PANEL_UPDATE_INTERVAL_MS = 60 * 60 * 1000
 # Same cadence as the Discord bot's DCS/SRS release cache (15 minutes).
 CLOUD_VERSION_CHECK_INTERVAL_SEC = 15 * 60
+# Avoid re-pushing CHECK_NODE_UPDATE to the same node for the same release.
+NODE_UPDATE_PUSH_COOLDOWN_SEC = 30 * 60
+NODE_UPDATE_BUSY_RETRY_ATTEMPTS = 3
+NODE_UPDATE_BUSY_RETRY_DELAY_SEC = 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -514,6 +520,110 @@ def send_socket_command(ip, port, command_str):
     except Exception as e:
         logging.debug(f"Network connection broken to {ip}:{port} -> {e}")
         return None
+
+
+# (ip, port, target_version) -> last successful CHECK_NODE_UPDATE timestamp
+_node_update_push_cooldown = {}
+
+
+def _parse_socket_json_status(answer):
+    if not answer:
+        return None, None
+    text = str(answer).strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            return data, data.get("status")
+        except Exception:
+            return None, None
+    return None, text
+
+
+def push_node_updates_from_github(latest_version: str):
+    """Send CHECK_NODE_UPDATE to cluster nodes whose node_version is behind latest_version."""
+    global _node_update_push_cooldown
+    latest = str(latest_version or "").lstrip("vV").strip()
+    if not latest:
+        return
+
+    servers = list(global_servers or [])
+    if not servers:
+        return
+
+    global_signals.append_log.emit(
+        f"[SYSTEM] Checking {len(servers)} node(s) against GitHub Node v{latest}…"
+    )
+    triggered = 0
+    for server in servers:
+        name = str(server.get("name") or f"{server.get('ip')}:{server.get('port')}")
+        ip = server.get("ip")
+        port = server.get("port")
+        if not ip or port is None:
+            continue
+
+        key = (str(ip), str(port), latest)
+        now = time.time()
+        last = float(_node_update_push_cooldown.get(key) or 0)
+        if now - last < NODE_UPDATE_PUSH_COOLDOWN_SEC:
+            continue
+
+        ping = send_socket_command(ip, port, "PING_STATUS")
+        data, status = _parse_socket_json_status(ping)
+        if not data:
+            continue
+        if status == "UNAUTHORIZED":
+            global_signals.append_log.emit(
+                f" [ 🔐 {name}] Unauthorized during Node update push."
+            )
+            continue
+
+        node_ver = str(data.get("node_version") or "0").lstrip("vV").strip()
+        if version_tuple(node_ver) >= version_tuple(latest):
+            continue
+
+        result = None
+        for attempt in range(1, NODE_UPDATE_BUSY_RETRY_ATTEMPTS + 1):
+            ans = send_socket_command(ip, port, "CHECK_NODE_UPDATE")
+            _payload, result = _parse_socket_json_status(ans)
+            if result == "OK_STARTING":
+                _node_update_push_cooldown[key] = time.time()
+                triggered += 1
+                global_signals.append_log.emit(
+                    f" [ ✅ {name}] Node update push: v{node_ver} → v{latest}"
+                )
+                break
+            if result == "UNAUTHORIZED":
+                global_signals.append_log.emit(
+                    f" [ 🔐 {name}] Unauthorized — check auth_token."
+                )
+                break
+            if result == "REJECTED_BUSY":
+                if attempt < NODE_UPDATE_BUSY_RETRY_ATTEMPTS:
+                    time.sleep(NODE_UPDATE_BUSY_RETRY_DELAY_SEC)
+                    continue
+                global_signals.append_log.emit(
+                    f" [ ⚠️ {name}] Busy during Node update push; will retry later."
+                )
+                break
+            if result == "UNKNOWN_COMMAND" or (ans and "UNKNOWN_COMMAND" in str(ans)):
+                global_signals.append_log.emit(
+                    f" [ ❌ {name}] Node too old for CHECK_NODE_UPDATE."
+                )
+                break
+            global_signals.append_log.emit(
+                f" [ ❌ {name}] Node update push rejected: {result or ans}"
+            )
+            break
+
+    if triggered:
+        global_signals.append_log.emit(
+            f"[SYSTEM] Node update push complete — triggered {triggered} node(s)."
+        )
+    else:
+        global_signals.append_log.emit(
+            "[SYSTEM] Node update push: no outdated online nodes needed an update."
+        )
+
 
 def test_single_system_background(index, ip, port, window_ref=None):
     global is_deployment_running
@@ -969,17 +1079,6 @@ class MainWindow(QMainWindow):
         global_signals.append_log.emit("[SYSTEM] Checking GitHub for Control Panel updates…")
         threading.Thread(target=self._check_for_updates_worker, daemon=True).start()
 
-    @staticmethod
-    def _version_tuple(version_str: str):
-        parts = []
-        for chunk in str(version_str or "").strip().lstrip("vV").split("."):
-            try:
-                parts.append(int(chunk))
-            except ValueError:
-                digits = "".join(ch for ch in chunk if ch.isdigit())
-                parts.append(int(digits) if digits else 0)
-        return tuple(parts) if parts else (0,)
-
     def _check_for_updates_worker(self):
         import urllib.request
 
@@ -993,12 +1092,22 @@ class MainWindow(QMainWindow):
                 f"[SYSTEM] Control Panel v{CONTROL_PANEL_VERSION} | GitHub latest v{latest or '?'}"
             )
             download_url = ""
-            for asset in data.get("assets", []):
+            assets = data.get("assets", [])
+            for asset in assets:
                 name = str(asset.get("name", "")).lower()
                 if "remote.updater.control.panel.exe" in name:
                     download_url = str(asset.get("browser_download_url") or "")
                     break
             global_signals.control_update_check_finished.emit(latest, download_url)
+            # Always push Node updates for outdated servers when Node.exe is on the release,
+            # even if this Control Panel is already current.
+            if latest and github_release_has_node_asset(assets):
+                try:
+                    push_node_updates_from_github(latest)
+                except Exception as push_err:
+                    global_signals.append_log.emit(
+                        f"[SYSTEM] Node update push failed: {push_err}"
+                    )
         except Exception as e:
             global_signals.append_log.emit(f"[SYSTEM] GitHub check failed: {e}")
             global_signals.control_update_check_failed.emit()
@@ -1013,8 +1122,8 @@ class MainWindow(QMainWindow):
         if not latest or not download_url:
             return
 
-        local_v = self._version_tuple(CONTROL_PANEL_VERSION)
-        remote_v = self._version_tuple(latest)
+        local_v = version_tuple(CONTROL_PANEL_VERSION)
+        remote_v = version_tuple(latest)
         if remote_v <= local_v:
             return
 
@@ -1199,7 +1308,10 @@ class MainWindow(QMainWindow):
 
         node_form.addRow("Bind Address:", self.ent_node_bind)
         node_form.addRow("Auth Token:", self.ent_node_auth)
-        node_form.addRow("GitHub app updates:", self.cmb_github_interval)
+        node_form.addRow(
+            "Local GitHub check (optional):",
+            self.cmb_github_interval,
+        )
         node_form.addRow("Watchdog interval:", self.spn_watchdog_interval)
         node_form.addRow(self.chk_preserve)
         node_form.addRow(self.chk_preserve_app_js)

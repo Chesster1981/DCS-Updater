@@ -77,7 +77,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.9"
+CURRENT_NODE_VERSION = "2.2.10"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -284,7 +284,7 @@ def sync_settings_widgets(settings: dict):
             ent_bind.insert(0, str(settings.get("bind_address", "0.0.0.0")))
             ent_auth.delete(0, tk.END)
             ent_auth.insert(0, str(settings.get("auth_token", "")))
-            opt_update_var.set(github_interval_label(settings.get("github_check_interval", 43200)))
+            opt_update_var.set(github_interval_label(settings.get("github_check_interval", -1)))
             v_preserve.set(bool(settings.get("preserve_mission_scripting", True)))
             v_preserve_app_js.set(bool(settings.get("preserve_webgui_app_js", True)))
             v_reboot.set(bool(settings.get("reboot_after_deployment", True)))
@@ -479,15 +479,17 @@ def github_update_monitor_loop():
             continue
             
         cfg = load_node_settings()
-        interval = int(cfg.get("github_check_interval", 43200))
+        # Optional local fallback. Default is Disabled (-1); Discord Bot /
+        # Control Panel push CHECK_NODE_UPDATE when a release is available.
+        interval = int(cfg.get("github_check_interval", -1))
         get_srs_latest_version_cached(allow_fetch=True)
-        
+
         if interval <= 0:
             continue
-            
+
         current_time = time.time()
         elapsed_seconds = current_time - last_github_node_check_timestamp
-        
+
         if elapsed_seconds >= interval:
             check_for_github_node_updates_silent()
             last_github_node_check_timestamp = time.time()
@@ -2723,7 +2725,7 @@ def show_settings_frame():
         ent_auth.delete(0, tk.END)
         ent_auth.insert(0, str(cfg.get("auth_token", "")))
 
-        saved_seconds = int(cfg.get("github_check_interval", 43200))
+        saved_seconds = int(cfg.get("github_check_interval", -1))
         opt_update_var.set(github_interval_label(saved_seconds))
         
         v_preserve.set(bool(cfg.get("preserve_mission_scripting", True)))
@@ -2950,7 +2952,12 @@ tk.Label(grid_f, text="Auth Token:", fg="white", bg="#1C1C1F").grid(row=4, colum
 ent_auth = tk.Entry(grid_f, width=28, bg="#252529", fg="white", insertbackground="white", relief="solid", bd=1, show="*")
 ent_auth.grid(row=4, column=1, columnspan=2, sticky="w", pady=6, padx=5)
 
-tk.Label(frame_settings, text="Check for GitHub app updates:", fg="white", bg="#1C1C1F").pack(anchor="w", pady=(10, 2))
+tk.Label(
+    frame_settings,
+    text="Local GitHub app check (optional; Discord/Control push by default):",
+    fg="white",
+    bg="#1C1C1F",
+).pack(anchor="w", pady=(10, 2))
 
 opt_update_var = tk.StringVar()
 opt_update_menu = tk.OptionMenu(frame_settings, opt_update_var, "Every 10 minutes", "Every 1 Hour", "Every 12 Hours", "Disabled")

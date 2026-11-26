@@ -92,6 +92,12 @@ In Discord: `/dcs-panel-init` pins the live panel. On every bot restart the pane
 
 In the Control Panel: right-click a server row for **Start / Restart DCS**, **Start / Restart SRS**, **Check for Node Update**, or **Reboot Windows**. Live Status shows DCS, SRS, connected clients (`4/16`), and **RD Active (n)** when RustDesk is connected.
 
+### Node.exe self-update
+
+- Each Node checks GitHub **once at startup**.
+- Periodic Node GitHub polling defaults to **Disabled** (optional local fallback remains in settings).
+- The **Discord bot** (every few minutes) and **Control Panel** (on its GitHub check) compare `node_version` from `PING_STATUS` to the latest release and send `CHECK_NODE_UPDATE` to outdated nodes. Busy nodes are retried briefly, then again on the next loop.
+
 ## TCP protocol
 
 | Command | Response |
