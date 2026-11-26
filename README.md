@@ -104,6 +104,8 @@ During `DCS_updater.exe` download and unpack run in parallel. Mid-download UI lo
 
 Node self-update is blocked while a DCS deploy is active. If the Node process still restarts mid-deploy, startup resumes by detecting `DCS_updater.exe` / preserve backups / a deploy marker and finishes MissionScripting restore + reboot.
 
+If DCS Updater asks what to do with leftover files under `_downloads` (`Delete` / `Exit`), the Node auto-clicks **Delete** so unattended deploy does not hang.
+
 ## TCP protocol
 
 | Command | Response |

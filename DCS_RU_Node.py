@@ -77,7 +77,7 @@ def _clean_child_env():
 CONFIG_FILE = "dcs_node_config.json"
 
 # --- GLOBAL URL & GITHUB CONFIGURATION (NODE) ---
-CURRENT_NODE_VERSION = "2.2.13"
+CURRENT_NODE_VERSION = "2.2.14"
 GITHUB_REPO = "Chesster1981/DCS-Updater"
 URL_GITHUB_API = "https://api.github.com/repos/"
 NODE_MAIN_WINDOW_SIZE = "560x580"
@@ -976,6 +976,12 @@ _DCS_AUTOUPDATE_DOWNLOAD_DONE_STATUS = (
 )
 _WM_GETTEXT = 0x000D
 _WM_GETTEXTLENGTH = 0x000E
+_BM_CLICK = 0x00F5
+_DCS_UPDATER_EXTRA_FILES_HINTS = (
+    "not needed for the current operation",
+    "what should i do with the found extra files",
+    "found extra files",
+)
 
 
 def _collect_hwnd_text_tree(root_hwnd) -> str:
@@ -1022,6 +1028,126 @@ def _collect_hwnd_text_tree(root_hwnd) -> str:
 
     user32.EnumChildWindows(root_hwnd, child_cb, 0)
     return "\n".join(chunks)
+
+
+def _click_button_hwnd(hwnd) -> bool:
+    """Send BM_CLICK to a Win32 button; fall back to PostMessage if needed."""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    user32 = ctypes.windll.user32
+    try:
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    try:
+        # BM_CLICK = press + release on the button itself.
+        user32.SendMessageW(hwnd, _BM_CLICK, 0, 0)
+        return True
+    except Exception:
+        try:
+            user32.PostMessageW(hwnd, _BM_CLICK, 0, 0)
+            return True
+        except Exception:
+            return False
+
+
+def _scan_and_dismiss_dcs_updater_extra_files_dialog() -> bool:
+    """Auto-answer 'Delete' on DCS Updater leftover _downloads prompt.
+
+    Dialog text looks like:
+      Found N files ... in ...\\_downloads which are not needed...
+      What should I do with the found extra files?
+      [Delete]  [Exit]
+    Without this, unattended deploy hangs forever.
+    """
+    if sys.platform != "win32":
+        return False
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    clicked = False
+
+    def _control_text(hwnd) -> str:
+        try:
+            length = int(user32.SendMessageW(hwnd, _WM_GETTEXTLENGTH, 0, 0)) + 1
+        except Exception:
+            length = user32.GetWindowTextLengthW(hwnd) + 1
+        if length <= 1:
+            return ""
+        length = min(length, 4096)
+        buf = ctypes.create_unicode_buffer(length)
+        try:
+            user32.SendMessageW(hwnd, _WM_GETTEXT, length, buf)
+            text = str(buf.value or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+        user32.GetWindowTextW(hwnd, buf, length)
+        return str(buf.value or "").strip()
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_top(hwnd, _lparam):
+        nonlocal clicked
+        if clicked:
+            return False
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        title = _control_text(hwnd)
+        title_l = title.lower()
+        if "dcs updater" not in title_l and "dcs_updater" not in title_l:
+            return True
+
+        blob = _collect_hwnd_text_tree(hwnd).lower()
+        if not any(hint in blob for hint in _DCS_UPDATER_EXTRA_FILES_HINTS):
+            return True
+        if "delete" not in blob:
+            return True
+
+        delete_hwnd = None
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def enum_child(child, _lp):
+            nonlocal delete_hwnd
+            text = _control_text(child)
+            if text.strip().lower() == "delete":
+                # Prefer real button class when available.
+                cls = ctypes.create_unicode_buffer(64)
+                try:
+                    user32.GetClassNameW(child, cls, 64)
+                except Exception:
+                    cls.value = ""
+                class_name = str(cls.value or "").lower()
+                if (not class_name) or ("button" in class_name):
+                    delete_hwnd = child
+                    return False
+                if delete_hwnd is None:
+                    delete_hwnd = child
+            return True
+
+        user32.EnumChildWindows(hwnd, enum_child, 0)
+        if delete_hwnd and _click_button_hwnd(delete_hwnd):
+            clicked = True
+            append_activity_log(
+                "[PROCESS] DCS Updater asked about leftover _downloads files — clicked Delete."
+            )
+            return False
+        return True
+
+    user32.EnumWindows(enum_top, 0)
+    return clicked
+
+
+def dismiss_dcs_updater_extra_files_dialog() -> bool:
+    """Timeout-guarded auto-dismiss of leftover-download prompt (Delete)."""
+    return bool(
+        _call_with_timeout(
+            _scan_and_dismiss_dcs_updater_extra_files_dialog,
+            HEALTH_SCAN_STEP_TIMEOUT,
+            default=False,
+            name="dcs-updater-extra-files-dismiss",
+        )
+    )
 
 
 def _parse_dcs_updater_progress_text(raw: str) -> dict:
@@ -2329,6 +2455,13 @@ def is_dcs_updater_process_running() -> bool:
 
 def _note_dcs_updater_progress_once(main_folder: str, state: dict) -> None:
     """One UI/log progress sample; mutates state['last_logged_pct'] / ['hits']."""
+    # Unattended deploy must not hang on leftover _downloads prompt.
+    try:
+        dismiss_dcs_updater_extra_files_dialog()
+    except Exception as err:
+        logging.debug("Extra-files dialog dismiss failed: %s", err)
+
+    # Dismiss runs above even after download-complete (unpack may still show prompts).
     if node_state.get("dcs_download_complete"):
         return
     ui = read_dcs_updater_ui_progress()
